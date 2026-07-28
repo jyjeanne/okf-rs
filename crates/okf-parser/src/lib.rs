@@ -18,6 +18,7 @@ pub enum Language {
     JavaScript,
     Go,
     Java,
+    CSharp,
 }
 
 impl Language {
@@ -30,6 +31,7 @@ impl Language {
             Language::JavaScript => "JavaScript",
             Language::Go => "Go",
             Language::Java => "Java",
+            Language::CSharp => "C#",
         }
     }
 
@@ -42,6 +44,7 @@ impl Language {
             "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
             "go" => Some(Language::Go),
             "java" => Some(Language::Java),
+            "cs" => Some(Language::CSharp),
             _ => None,
         }
     }
@@ -56,6 +59,7 @@ impl Language {
             "JavaScript" => Some(Language::JavaScript),
             "Go" => Some(Language::Go),
             "Java" => Some(Language::Java),
+            "C#" => Some(Language::CSharp),
             _ => None,
         }
     }

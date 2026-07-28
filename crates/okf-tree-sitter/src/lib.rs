@@ -10,6 +10,7 @@
 //! `okf-analyzer`.
 
 mod common;
+mod csharp;
 mod go;
 mod java;
 mod javascript;
@@ -59,5 +60,6 @@ pub fn extract_file(file: &SourceFile) -> Result<FileExtraction> {
         Language::JavaScript => javascript::extract(&source, &file.relative_path),
         Language::Go => go::extract(&source, &file.relative_path),
         Language::Java => java::extract(&source, &file.relative_path),
+        Language::CSharp => csharp::extract(&source, &file.relative_path),
     }
 }
