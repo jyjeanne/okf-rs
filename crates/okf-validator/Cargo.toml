@@ -1,0 +1,17 @@
+[package]
+name = "okf-validator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OKF bundle validation for okf-rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_yaml.workspace = true
+serde.workspace = true
+walkdir.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

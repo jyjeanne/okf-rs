@@ -1,0 +1,17 @@
+[package]
+name = "okf-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Basic bundle search for okf-rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_yaml.workspace = true
+serde.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+

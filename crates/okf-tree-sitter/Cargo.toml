@@ -1,0 +1,19 @@
+[package]
+name = "okf-tree-sitter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tree-sitter based symbol and relationship extraction for okf-rs"
+
+[dependencies]
+okf-parser.workspace = true
+okf-core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-go = "0.25"

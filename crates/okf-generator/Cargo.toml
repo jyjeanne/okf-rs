@@ -1,0 +1,17 @@
+[package]
+name = "okf-generator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OKF bundle writer for okf-rs"
+
+[dependencies]
+okf-parser.workspace = true
+anyhow.workspace = true
+serde_yaml.workspace = true
+serde.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

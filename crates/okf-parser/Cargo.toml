@@ -1,0 +1,11 @@
+[package]
+name = "okf-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared OKF concept/relationship data model for okf-rs"
+
+[dependencies]
+serde.workspace = true
+chrono.workspace = true

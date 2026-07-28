@@ -315,19 +315,20 @@ bundle.write("./knowledge")?;
 
 ```
 okf-rs/
-├── okf-cli
-├── okf-core
-├── okf-parser
-├── okf-tree-sitter
-├── okf-lsp
-├── okf-analyzer
-├── okf-graph
-├── okf-generator
-├── okf-validator
-├── okf-search
-├── okf-mcp
-├── okf-server
-└── okf-watch
+└── crates/
+    ├── okf-cli
+    ├── okf-core
+    ├── okf-parser
+    ├── okf-tree-sitter
+    ├── okf-lsp
+    ├── okf-analyzer
+    ├── okf-graph
+    ├── okf-generator
+    ├── okf-validator
+    ├── okf-search
+    ├── okf-mcp
+    ├── okf-server
+    └── okf-watch
 ```
 
 | Crate | Responsibility |

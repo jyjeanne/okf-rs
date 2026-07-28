@@ -1,0 +1,15 @@
+[package]
+name = "okf-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Repository scanning and project loading for okf-rs"
+
+[dependencies]
+okf-parser.workspace = true
+anyhow.workspace = true
+ignore.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
