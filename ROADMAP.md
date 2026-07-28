@@ -7,7 +7,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase | Status |
 |---|---|
 | Phase 1 — Foundations | ✅ Complete |
-| Phase 2 — Depth & Integration | 🟡 In progress (5/11) |
+| Phase 2 — Depth & Integration | 🟡 In progress (6/11) |
 | Phase 3 — Intelligence & Extended Output | ⬜ Not started |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
@@ -40,7 +40,7 @@ Verified by dogfooding: running `okf-rs generate .` on this repository itself pr
 - [x] Bundle diffing (`okf-rs diff <ref-a> <ref-b> [path]`) — compares two git refs' concepts (added/removed/changed) using a non-destructive `git worktree` checkout of each ref, so it never touches the caller's working tree
 - [x] Agent entry-point generation: `CLAUDE.md`, `AGENTS.md`, `.github/copilot-instructions.md`, written/updated by `okf-rs init` (skip with `--no-agent-files`); idempotent via marker comments, so pre-existing content in those files is preserved and only the okf-rs section is replaced on re-run
 - [ ] LSP integration (`okf-lsp`) to enrich/disambiguate symbols beyond what Tree-sitter alone can resolve
-- [ ] Incremental indexing: content-hash-based re-analysis of only changed files
+- [x] Incremental indexing: content-hash-based re-analysis of only changed files — `okf-rs generate` persists a `.okf-cache.json` at the project root, keyed by each file's path and content hash (not mtime, which git checkouts/CI don't preserve reliably); a file whose hash still matches skips the tree-sitter parse entirely and reuses its cached extraction, while the project-wide call-graph resolution step still runs in full every time (it's cheap, and it's what keeps a changed file's *callers* correctly updated). `--no-cache` bypasses the cache entirely (rule out a stale cache, or verify output determinism independent of cache state)
 - [ ] Extended language coverage: Java, Kotlin, C#, C/C++, PHP, Swift
 - [ ] Multi-package workspace and monorepo aggregation
 - [x] MCP server (`okf-mcp`) exposing symbol, call-graph, and API-surface queries — a stdio JSON-RPC 2.0 server implementing MCP's `initialize`/`tools/list`/`tools/call`, wrapping `okf-search` and `okf-graph` (via `okf_parser::read_bundle`) as the `search`, `graph_callers`, `graph_callees`, `graph_api`, `graph_cycles`, `graph_modules`, and `graph_path` tools
@@ -53,8 +53,11 @@ Relationships (`Calls`/`CalledBy`/`Imports`/...) are now serialized into each co
 
 `okf-mcp` reuses that same bundle-reading path: each tool call re-reads the bundle fresh via `okf_parser::read_bundle`/`okf_search::SearchIndex::build`, so a running server always reflects the latest `generate` without needing a restart. Verified end-to-end with a hand-fed `initialize` → `notifications/initialized` → `tools/list` → `tools/call` sequence over stdio against this repo's own bundle, and with unit tests covering the JSON-RPC dispatch (unknown methods, notifications never getting a response) and each tool (missing bundle, unknown concept id, missing arguments).
 
+Verified by dogfooding: on this repository (22 source files), a cold `okf-rs generate .` reports "22 files parsed, 0 reused from cache"; re-running it immediately after with no source changes reports "0 files parsed, 22 reused from cache"; and the resulting bundle is byte-for-byte identical across the cold run, the warm (cached) run, and a `--no-cache` run (`diff -rq` on all three trees reports no differences) — confirming the cache changes performance, never output.
+
 **Known limitations:**
 - Public/private (`is_public`) detection is exact for Rust (`pub` modifier) and Go (capitalization, the language's real rule), but a naming-convention heuristic (leading underscore) for Python/JavaScript/TypeScript, pending real `export`/access-modifier tracking.
+- The incremental cache speeds up `okf-rs generate` only; `okf-rs diff` still re-analyzes both git-worktree checkouts from scratch (a shared, path-relocatable cache across worktrees is possible future work, since the cache key is a repo-relative path + content hash, not an absolute path).
 
 ## Phase 3 — Intelligence & Extended Output
 

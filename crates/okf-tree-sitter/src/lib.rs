@@ -20,11 +20,12 @@ mod typescript;
 use anyhow::{Context, Result};
 use okf_core::SourceFile;
 use okf_parser::{Concept, Language};
+use serde::{Deserialize, Serialize};
 use std::fs;
 
 /// A call expression found in a function/method body, not yet resolved to
 /// a target concept id.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallCandidate {
     /// Concept id of the enclosing function/method.
     pub caller_id: String,
@@ -33,7 +34,11 @@ pub struct CallCandidate {
 }
 
 /// Everything extracted from a single source file.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` so `okf-analyzer` can cache it to disk, keyed
+/// by the source file's content hash, and skip re-parsing files that
+/// haven't changed since the last run (see `okf_analyzer::AnalysisCache`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileExtraction {
     /// The file's own `Module` concept, followed by its types and
     /// functions/methods, in source order.

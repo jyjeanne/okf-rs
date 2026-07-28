@@ -44,6 +44,12 @@ enum Command {
         /// Bundle output directory. Defaults to the value in `okf.toml`, or `knowledge`.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Ignore and don't update the `.okf-cache.json` incremental-index
+        /// cache — every file is re-parsed from scratch. Useful to rule
+        /// out a stale/corrupt cache, or to verify output determinism
+        /// independent of cache state.
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Validate that a directory is a conformant OKF bundle.
     Validate {
@@ -159,7 +165,11 @@ fn run(command: Command) -> Result<ExitCode> {
             no_agent_files,
         } => cmd_init(&path, &output, no_agent_files),
         Command::Scan { path } => cmd_scan(&path),
-        Command::Generate { path, output } => cmd_generate(&path, output),
+        Command::Generate {
+            path,
+            output,
+            no_cache,
+        } => cmd_generate(&path, output, no_cache),
         Command::Validate {
             bundle,
             project,
@@ -233,21 +243,44 @@ fn cmd_scan(path: &std::path::Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_generate(path: &std::path::Path, output: Option<PathBuf>) -> Result<ExitCode> {
+/// Where `generate` persists its incremental-indexing cache: a hidden
+/// file at the project root, sibling to `okf.toml`, so it survives
+/// between invocations regardless of `--output`. Not part of the OKF
+/// bundle itself (it's not `.md`, and lives outside `--output` entirely)
+/// — a purely local, disposable performance cache, safe to delete or
+/// `.gitignore` like `target/`.
+const CACHE_FILE: &str = ".okf-cache.json";
+
+fn cmd_generate(
+    path: &std::path::Path,
+    output: Option<PathBuf>,
+    no_cache: bool,
+) -> Result<ExitCode> {
     let project = Project::load(path)?;
     let output = resolve_bundle_arg(&project.root, output);
+    let cache_path = project.root.join(CACHE_FILE);
 
-    let result = okf_analyzer::analyze(&project)?;
+    let mut cache = if no_cache {
+        okf_analyzer::AnalysisCache::default()
+    } else {
+        okf_analyzer::AnalysisCache::load(&cache_path)
+    };
+    let (result, stats) = okf_analyzer::analyze_with_cache(&project, &mut cache)?;
     okf_generator::write_bundle(&result.concepts, &output)?;
+    if !no_cache {
+        cache.save(&cache_path)?;
+    }
 
     let mut by_kind: BTreeMap<ConceptKind, usize> = BTreeMap::new();
     for concept in &result.concepts {
         *by_kind.entry(concept.kind).or_default() += 1;
     }
     println!(
-        "Generated {} concepts into {}",
+        "Generated {} concepts into {} ({} files parsed, {} reused from cache)",
         result.concepts.len(),
-        output.display()
+        output.display(),
+        stats.reparsed,
+        stats.reused
     );
     for (kind, count) in by_kind {
         println!("  {:<12} {count}", kind.as_str());

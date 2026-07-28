@@ -12,6 +12,14 @@
 //! (that arrives with LSP integration in Phase 2), resolving an ambiguous
 //! name would risk drawing a wrong edge, so it is deliberately left
 //! unresolved rather than guessed.
+//!
+//! Per-file extraction (the expensive tree-sitter parse) can be skipped
+//! for files that haven't changed since a previous run — see
+//! [`analyze_with_cache`] and [`AnalysisCache`].
+
+mod cache;
+
+pub use cache::AnalysisCache;
 
 use anyhow::{Context, Result};
 use okf_core::{ManifestKind, Project};
@@ -29,23 +37,71 @@ pub struct AnalysisResult {
     pub concepts: Vec<Concept>,
 }
 
+/// Counts of files reused from the cache vs. freshly re-parsed by one
+/// [`analyze_with_cache`] run, so a caller (e.g. `okf-rs generate`) can
+/// report how much work incremental indexing actually saved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IncrementalStats {
+    pub reused: usize,
+    pub reparsed: usize,
+}
+
 /// Scans and analyzes `project`, producing the full concept + relationship
 /// set. Deterministic: running this twice over unchanged source produces
 /// byte-identical results (no wall-clock timestamps, no unordered maps
 /// affecting output order).
 pub fn analyze(project: &Project) -> Result<AnalysisResult> {
+    let mut cache = AnalysisCache::default();
+    Ok(analyze_with_cache(project, &mut cache)?.0)
+}
+
+/// Like [`analyze`], but skips re-parsing any file whose content hash
+/// matches an entry already in `cache`, reusing that entry's extraction
+/// instead — the cache hit produces exactly the same result a fresh parse
+/// of that unchanged file would have, so this is a pure performance
+/// optimization, never a source of different output.
+///
+/// `cache` is replaced with a fresh cache reflecting exactly this run's
+/// file set on return: entries for files no longer in the project are
+/// dropped rather than left to accumulate. Callers that want the cache to
+/// persist across process invocations (e.g. `okf-rs generate`, re-run as
+/// source changes during local development) are responsible for loading
+/// it beforehand and saving it afterward with [`AnalysisCache::load`]/
+/// [`AnalysisCache::save`].
+pub fn analyze_with_cache(
+    project: &Project,
+    cache: &mut AnalysisCache,
+) -> Result<(AnalysisResult, IncrementalStats)> {
     let mut concepts = Vec::new();
     if let Some(package) = detect_package(project)? {
         concepts.push(package);
     }
 
     let mut calls = Vec::new();
+    let mut stats = IncrementalStats::default();
+    let mut fresh_cache = AnalysisCache::default();
+
     for file in &project.files {
-        let extraction = okf_tree_sitter::extract_file(file)
-            .with_context(|| format!("failed to analyze {}", file.relative_path))?;
+        let source = fs::read_to_string(&file.absolute_path)
+            .with_context(|| format!("failed to read {}", file.relative_path))?;
+        let hash = cache::hash_content(&source);
+
+        let extraction = match cache.get(&file.relative_path, hash) {
+            Some(extraction) => {
+                stats.reused += 1;
+                extraction
+            }
+            None => {
+                stats.reparsed += 1;
+                okf_tree_sitter::extract_file(file)
+                    .with_context(|| format!("failed to analyze {}", file.relative_path))?
+            }
+        };
+        fresh_cache.insert(&file.relative_path, hash, extraction.clone());
         calls.extend(extraction.calls);
         concepts.extend(extraction.concepts);
     }
+    *cache = fresh_cache;
 
     let mut symbol_table: HashMap<&str, Vec<&str>> = HashMap::new();
     for concept in &concepts {
@@ -98,10 +154,13 @@ pub fn analyze(project: &Project) -> Result<AnalysisResult> {
         });
     }
 
-    Ok(AnalysisResult {
-        root: project.root.clone(),
-        concepts,
-    })
+    Ok((
+        AnalysisResult {
+            root: project.root.clone(),
+            concepts,
+        },
+        stats,
+    ))
 }
 
 /// A concept present in both snapshots being diffed, but whose signature
@@ -438,5 +497,85 @@ mod tests {
             report.is_empty(),
             "reordered relationships should not count as a change"
         );
+    }
+
+    /// Sorts by id so cache-hit and cache-miss runs (which may extract
+    /// files in a different order relative to each other) compare equal.
+    fn sorted_ids(concepts: &[Concept]) -> Vec<&str> {
+        let mut ids: Vec<&str> = concepts.iter().map(|c| c.id.as_str()).collect();
+        ids.sort();
+        ids
+    }
+
+    fn two_file_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/a.rs"), "pub fn caller() { callee() }").unwrap();
+        fs::write(dir.path().join("src/b.rs"), "pub fn callee() {}").unwrap();
+        dir
+    }
+
+    #[test]
+    fn cached_analysis_matches_uncached_analysis() {
+        let dir = two_file_project();
+        let project = Project::load(dir.path()).unwrap();
+
+        let uncached = analyze(&project).unwrap();
+        let mut cache = AnalysisCache::default();
+        let (cached, stats) = analyze_with_cache(&project, &mut cache).unwrap();
+
+        assert_eq!(stats.reparsed, 2);
+        assert_eq!(stats.reused, 0);
+        assert_eq!(sorted_ids(&uncached.concepts), sorted_ids(&cached.concepts));
+    }
+
+    #[test]
+    fn second_run_with_a_warm_cache_reuses_every_unchanged_file() {
+        let dir = two_file_project();
+        let project = Project::load(dir.path()).unwrap();
+        let mut cache = AnalysisCache::default();
+
+        let (first, first_stats) = analyze_with_cache(&project, &mut cache).unwrap();
+        assert_eq!(first_stats.reparsed, 2);
+        assert_eq!(first_stats.reused, 0);
+
+        let (second, second_stats) = analyze_with_cache(&project, &mut cache).unwrap();
+        assert_eq!(second_stats.reparsed, 0);
+        assert_eq!(second_stats.reused, 2);
+        assert_eq!(sorted_ids(&first.concepts), sorted_ids(&second.concepts));
+    }
+
+    #[test]
+    fn only_the_changed_file_is_reparsed() {
+        let dir = two_file_project();
+        let project = Project::load(dir.path()).unwrap();
+        let mut cache = AnalysisCache::default();
+        analyze_with_cache(&project, &mut cache).unwrap();
+
+        fs::write(
+            dir.path().join("src/b.rs"),
+            "pub fn callee() {} pub fn extra() {}",
+        )
+        .unwrap();
+        let project = Project::load(dir.path()).unwrap();
+        let (_, stats) = analyze_with_cache(&project, &mut cache).unwrap();
+
+        assert_eq!(stats.reparsed, 1, "only src/b.rs changed");
+        assert_eq!(stats.reused, 1, "src/a.rs is untouched");
+    }
+
+    #[test]
+    fn removed_files_are_pruned_from_the_cache_not_left_stale() {
+        let dir = two_file_project();
+        let project = Project::load(dir.path()).unwrap();
+        let mut cache = AnalysisCache::default();
+        analyze_with_cache(&project, &mut cache).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        fs::remove_file(dir.path().join("src/b.rs")).unwrap();
+        let project = Project::load(dir.path()).unwrap();
+        analyze_with_cache(&project, &mut cache).unwrap();
+
+        assert_eq!(cache.len(), 1, "src/b.rs should be dropped, not stale");
     }
 }
