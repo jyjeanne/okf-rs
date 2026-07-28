@@ -77,6 +77,20 @@ impl<'a> Graph<'a> {
         self.get(module_id)
     }
 
+    /// The package concept that owns `id`: either `id`'s own `MemberOf`
+    /// relationship if it's a `Module` (which carries one directly, for a
+    /// multi-package workspace/monorepo — see `okf-analyzer`'s
+    /// aggregation), or its owning module's `MemberOf`, for anything else.
+    pub fn owning_package(&self, id: &str) -> Option<&'a Concept> {
+        if let Some(package) = self.related(id, RelationKind::MemberOf).into_iter().next() {
+            return Some(package);
+        }
+        let module = self.owning_module(id)?;
+        self.related(&module.id, RelationKind::MemberOf)
+            .into_iter()
+            .next()
+    }
+
     /// Every concept declared in `module_id`'s source file, excluding the
     /// module concept itself.
     pub fn members_of(&self, module_id: &str) -> Vec<&'a Concept> {
@@ -331,6 +345,36 @@ mod tests {
 
         let deps = graph.module_dependencies();
         assert_eq!(deps, vec![("modules/a", "modules/b")]);
+    }
+
+    #[test]
+    fn owning_package_resolves_through_a_module_for_any_concept() {
+        let package = concept("packages/demo", ConceptKind::Package, "Cargo.toml", true);
+        let mut module = concept("modules/a", ConceptKind::Module, "a.rs", true);
+        add_edge(&mut module, RelationKind::MemberOf, "packages/demo");
+        let function = concept("functions/a/f", ConceptKind::Function, "a.rs", true);
+
+        let concepts = vec![package, module, function];
+        let graph = Graph::build(&concepts);
+
+        assert_eq!(
+            graph.owning_package("modules/a").unwrap().id,
+            "packages/demo",
+            "a Module resolves its own MemberOf relationship directly"
+        );
+        assert_eq!(
+            graph.owning_package("functions/a/f").unwrap().id,
+            "packages/demo",
+            "a Function resolves transitively through its owning Module"
+        );
+    }
+
+    #[test]
+    fn owning_package_is_none_without_a_detected_package() {
+        let module = concept("modules/a", ConceptKind::Module, "a.rs", true);
+        let concepts = vec![module];
+        let graph = Graph::build(&concepts);
+        assert!(graph.owning_package("modules/a").is_none());
     }
 
     #[test]

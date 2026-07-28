@@ -247,9 +247,22 @@ fn cmd_init(
 fn cmd_scan(path: &std::path::Path) -> Result<ExitCode> {
     let project = Project::load(path)?;
     println!("Project root: {}", project.root.display());
-    match project.manifest {
-        Some(kind) => println!("Manifest: {kind:?}"),
-        None => println!("Manifest: none detected"),
+    match project.packages.as_slice() {
+        [] => println!("Manifest: none detected"),
+        // A single manifest at the project root: the common single-package
+        // case, reported the same way it always was.
+        [pkg] if pkg.relative_dir.is_empty() => println!("Manifest: {:?}", pkg.manifest),
+        packages => {
+            println!("{} packages detected:", packages.len());
+            for pkg in packages {
+                let dir = if pkg.relative_dir.is_empty() {
+                    "."
+                } else {
+                    &pkg.relative_dir
+                };
+                println!("  {:<30} {:?}", dir, pkg.manifest);
+            }
+        }
     }
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();

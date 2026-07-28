@@ -183,22 +183,37 @@ fn render_concept(
         body.push_str("`\n\n");
     }
 
-    if concept.kind == ConceptKind::Module {
-        let members: Vec<&Concept> = all
+    // A Module's members are every other concept declared in the same
+    // file; a Package's are every Module that named it in a `MemberOf`
+    // relationship (see `okf-analyzer`'s workspace/monorepo aggregation) —
+    // two different ways of finding "what's inside this container,"
+    // since only one of them (file identity) needs an explicit
+    // relationship to express.
+    let members: Vec<&Concept> = match concept.kind {
+        ConceptKind::Module => all
             .iter()
             .filter(|c| c.id != concept.id && c.location.file == concept.location.file)
-            .collect();
-        if !members.is_empty() {
-            body.push_str("# Contains\n\n");
-            for member in members {
-                body.push_str(&format!(
-                    "- [{}]({})\n",
-                    member.name,
-                    relative_link(&concept.id, &member.id)
-                ));
-            }
-            body.push('\n');
+            .collect(),
+        ConceptKind::Package => all
+            .iter()
+            .filter(|c| {
+                c.relationships
+                    .iter()
+                    .any(|r| r.kind == RelationKind::MemberOf && r.target == concept.id)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if !members.is_empty() {
+        body.push_str("# Contains\n\n");
+        for member in members {
+            body.push_str(&format!(
+                "- [{}]({})\n",
+                member.name,
+                relative_link(&concept.id, &member.id)
+            ));
         }
+        body.push('\n');
     }
 
     for (kind, heading) in [
@@ -465,5 +480,32 @@ mod tests {
 
         let content = fs::read_to_string(dir.path().join("functions/run.md")).unwrap();
         assert!(!content.contains("relationships"));
+    }
+
+    #[test]
+    fn package_contains_lists_its_member_modules_via_reverse_member_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = concept(ConceptKind::Package, "demo", "demo", "Cargo.toml");
+        let mut module = concept(ConceptKind::Module, "lib", "lib", "src/lib.rs");
+        module.relationships.push(Relationship {
+            kind: RelationKind::MemberOf,
+            target: package.id.clone(),
+            target_display: "demo".to_string(),
+        });
+
+        write_bundle(&[package.clone(), module.clone()], dir.path()).unwrap();
+
+        let package_content = fs::read_to_string(dir.path().join("packages/demo.md")).unwrap();
+        assert!(package_content.contains("# Contains"));
+        assert!(package_content.contains(&format!(
+            "[lib]({})",
+            relative_link(&package.id, &module.id)
+        )));
+
+        let module_content = fs::read_to_string(dir.path().join("modules/lib.md")).unwrap();
+        assert!(
+            module_content.contains("# Member of"),
+            "the generic relationship rendering should show the module's own Member of section: {module_content}"
+        );
     }
 }
