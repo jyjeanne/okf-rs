@@ -1,23 +1,22 @@
 [package]
-name = "okf-cli"
+name = "okf-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "okf-rs command-line interface"
+description = "Model Context Protocol server exposing okf-rs bundle/graph queries to AI agents"
 
 [[bin]]
-name = "okf-rs"
+name = "okf-mcp"
 path = "src/main.rs"
 
 [dependencies]
 okf-core.workspace = true
 okf-parser.workspace = true
-okf-analyzer.workspace = true
-okf-generator.workspace = true
-okf-validator.workspace = true
-okf-search.workspace = true
 okf-graph.workspace = true
+okf-search.workspace = true
 anyhow.workspace = true
-clap.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
 tempfile = "3"

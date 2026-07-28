@@ -9,6 +9,7 @@ members = [
     "crates/okf-validator",
     "crates/okf-search",
     "crates/okf-graph",
+    "crates/okf-mcp",
     "crates/okf-cli",
 ]
 

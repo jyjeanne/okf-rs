@@ -6,6 +6,8 @@ use ignore::WalkBuilder;
 use okf_parser::Language;
 use std::path::{Path, PathBuf};
 
+pub mod config;
+
 /// A single recognized source file within a [`Project`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFile {

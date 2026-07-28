@@ -7,7 +7,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase | Status |
 |---|---|
 | Phase 1 — Foundations | ✅ Complete |
-| Phase 2 — Depth & Integration | 🟡 In progress (4/11) |
+| Phase 2 — Depth & Integration | 🟡 In progress (5/11) |
 | Phase 3 — Intelligence & Extended Output | ⬜ Not started |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
@@ -43,13 +43,15 @@ Verified by dogfooding: running `okf-rs generate .` on this repository itself pr
 - [ ] Incremental indexing: content-hash-based re-analysis of only changed files
 - [ ] Extended language coverage: Java, Kotlin, C#, C/C++, PHP, Swift
 - [ ] Multi-package workspace and monorepo aggregation
-- [ ] MCP server (`okf-mcp`) exposing symbol, call-graph, and API-surface queries
+- [x] MCP server (`okf-mcp`) exposing symbol, call-graph, and API-surface queries — a stdio JSON-RPC 2.0 server implementing MCP's `initialize`/`tools/list`/`tools/call`, wrapping `okf-search` and `okf-graph` (via `okf_parser::read_bundle`) as the `search`, `graph_callers`, `graph_callees`, `graph_api`, `graph_cycles`, `graph_modules`, and `graph_path` tools
 - [ ] Basic documentation generation (Markdown, HTML) templated directly from the bundle — no LLM required
 - [ ] Continuous indexing in local development (`okf-watch`)
 
 Verified by dogfooding: `okf-rs graph api .` on this repository lists 71 public concepts, `okf-rs graph cycles .` correctly finds none, `okf-rs graph modules .` shows real cross-crate dependency edges, and `okf-rs diff <commit> <commit> .` against this repo's own history correctly reports added/changed functions using non-destructive worktrees (verified the working tree and branch were untouched afterward, including on an invalid-ref error path).
 
 Relationships (`Calls`/`CalledBy`/`Imports`/...) are now serialized into each concept's `relationships` frontmatter field (target ids grouped by kind), alongside the existing human-readable "# Calls" / "# Called by" markdown body sections. `okf_parser::read_bundle` reverses `okf-generator`'s writer to reconstruct the full relationship-rich concept model from a bundle on disk, so `okf-rs graph` now queries a previously generated bundle directly — the same way `okf-rs search` and `okf-rs validate` do — instead of re-analyzing the project from source; run `okf-rs generate` first (and after any source change, to keep the bundle current).
+
+`okf-mcp` reuses that same bundle-reading path: each tool call re-reads the bundle fresh via `okf_parser::read_bundle`/`okf_search::SearchIndex::build`, so a running server always reflects the latest `generate` without needing a restart. Verified end-to-end with a hand-fed `initialize` → `notifications/initialized` → `tools/list` → `tools/call` sequence over stdio against this repo's own bundle, and with unit tests covering the JSON-RPC dispatch (unknown methods, notifications never getting a response) and each tool (missing bundle, unknown concept id, missing arguments).
 
 **Known limitations:**
 - Public/private (`is_public`) detection is exact for Rust (`pub` modifier) and Go (capitalization, the language's real rule), but a naming-convention heuristic (leading underscore) for Python/JavaScript/TypeScript, pending real `export`/access-modifier tracking.

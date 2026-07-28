@@ -40,7 +40,7 @@ See [`docs/specification.md`](docs/specification.md) for the full project specif
 - **Search** — ranked free-text search by symbol, package, module, type, and tag
 - **Graph queries** — callers/callees, call-graph cycle detection, cross-module dependencies, and shortest call path
 - **Bundle diffing** — compare a project's concepts between two git refs without touching your working tree
-- **AI agent integration** — `okf-rs init` writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md`, idempotently
+- **AI agent integration** — `okf-rs init` writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md`, idempotently; `okf-mcp` exposes search and graph queries as an MCP server for tools like Claude Code
 - **Standalone binary** — no runtime dependency beyond the OS's standard C library; see [Packaging & Distribution](docs/specification.md#packaging--distribution)
 
 See [`ROADMAP.md`](ROADMAP.md) for what's shipped (Phase 1 complete, Phase 2 in progress) and what's next.
@@ -133,7 +133,19 @@ Run `okf-rs <command> --help` for each command's options. `okf-rs graph` has its
 
 ## Architecture
 
-`okf-rs` is a Cargo workspace of small, single-purpose crates under [`crates/`](crates/); `okf-cli` is a thin wrapper over the rest, so the same logic can be embedded by other Rust tools. See the [Architecture section](docs/specification.md#proposed-architecture) of the specification for the full crate-by-crate breakdown, including crates not yet built (`okf-lsp`, `okf-mcp`, `okf-server`, `okf-watch` — see [`ROADMAP.md`](ROADMAP.md)).
+`okf-rs` is a Cargo workspace of small, single-purpose crates under [`crates/`](crates/); `okf-cli` is a thin wrapper over the rest, so the same logic can be embedded by other Rust tools. See the [Architecture section](docs/specification.md#proposed-architecture) of the specification for the full crate-by-crate breakdown, including crates not yet built (`okf-lsp`, `okf-server`, `okf-watch` — see [`ROADMAP.md`](ROADMAP.md)).
+
+### MCP server
+
+`okf-mcp` exposes a bundle's search and graph queries as [Model Context Protocol](https://modelcontextprotocol.io) tools (`search`, `graph_callers`, `graph_callees`, `graph_api`, `graph_cycles`, `graph_modules`, `graph_path`) over stdio, so an MCP-aware agent can query the knowledge base directly instead of re-reading raw source. Point it at a project root (defaults to `.`); it resolves the bundle the same way `search`/`validate`/`graph` do (`okf.toml`'s `output`, or `knowledge`), and re-reads the bundle on every call so it always reflects the latest `okf-rs generate`.
+
+Register it with Claude Code:
+
+```sh
+claude mcp add okf-rs -- /path/to/okf-mcp /path/to/project
+```
+
+or point any other MCP client's stdio transport at the same binary and argument.
 
 ## Contributing
 

@@ -1,5 +1,3 @@
-mod config;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use okf_core::Project;
@@ -188,7 +186,7 @@ fn run(command: Command) -> Result<ExitCode> {
 /// what it was recorded against, so it's joined here rather than left to
 /// resolve against whatever directory the command happens to run from.
 fn resolve_bundle_arg(project_root: &std::path::Path, explicit: Option<PathBuf>) -> PathBuf {
-    explicit.unwrap_or_else(|| project_root.join(config::load(project_root).output))
+    okf_core::config::resolve_bundle(project_root, explicit)
 }
 
 fn cmd_init(
@@ -197,7 +195,7 @@ fn cmd_init(
     no_agent_files: bool,
 ) -> Result<ExitCode> {
     let project = Project::load(path)?;
-    let config_path = config::write_default(&project.root, output)?;
+    let config_path = okf_core::config::write_default(&project.root, output)?;
     println!(
         "Initialized okf-rs project at {} ({} source files detected)",
         project.root.display(),

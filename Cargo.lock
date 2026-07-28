@@ -432,7 +432,6 @@ dependencies = [
  "okf-search",
  "okf-validator",
  "tempfile",
- "toml",
 ]
 
 [[package]]
@@ -443,6 +442,7 @@ dependencies = [
  "ignore",
  "okf-parser",
  "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -462,6 +462,19 @@ name = "okf-graph"
 version = "0.1.0"
 dependencies = [
  "okf-parser",
+]
+
+[[package]]
+name = "okf-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "okf-core",
+ "okf-graph",
+ "okf-parser",
+ "okf-search",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
