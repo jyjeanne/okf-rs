@@ -33,8 +33,8 @@ See [`docs/specification.md`](docs/specification.md) for the full project specif
 ## Features
 
 - **Repository scanning** — recursive, `.gitignore`-aware, with git-aware indexing and manifest detection (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`)
-- **Semantic extraction** for **Rust, Python, TypeScript, JavaScript, Go, Java, and C#** — packages, modules, types (structs/classes/enums/interfaces/traits), functions, and methods, including public/private API-surface detection
-- **Relationship extraction** — imports, and a resolved call graph covering bare calls, `self.method()`/`this.method()`, `Type::method()`/`Type.method()`, and `module::func()` forms across all seven languages
+- **Semantic extraction** for **Rust, Python, TypeScript, JavaScript, Go, Java, C#, PHP, Kotlin, C/C++, and Swift** — packages, modules, types (structs/classes/enums/interfaces/traits), functions, and methods, including public/private API-surface detection tailored to each language's actual visibility rules (explicit-opt-in for Rust/Java/C#/Swift, opt-out-by-default for PHP/Kotlin, section-based for C++, capitalization for Go)
+- **Relationship extraction** — imports, and a resolved call graph covering bare calls, member/`self`/`this` calls, static/scoped calls, and qualified module calls across all eleven languages
 - **OKF bundle generation** — markdown + YAML frontmatter, cross-linked, with `index.md` navigation at every level
 - **Incremental indexing** — `okf-rs generate` caches each file's extraction by content hash, so a re-run only re-parses what actually changed
 - **Watch mode** — `okf-rs watch` keeps a project's bundle up to date as files change, reusing the same incremental cache
