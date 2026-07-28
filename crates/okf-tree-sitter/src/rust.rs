@@ -1,5 +1,6 @@
 use crate::common::{
-    import_relationship, location, make_concept, module_path, node_text, smallest_containing,
+    import_relationship, location, make_concept, module_path, node_text, slugify,
+    smallest_containing,
 };
 use crate::{CallCandidate, FileExtraction};
 use anyhow::{Context, Result};
@@ -14,23 +15,53 @@ const QUERY_SRC: &str = r#"
 (trait_item name: (type_identifier) @trait.name) @trait.def
 (function_item name: (identifier) @fn.name) @fn.def
 (call_expression function: (identifier) @call.name) @call.def
+(call_expression function: (field_expression field: (field_identifier) @call.name)) @call.def
+(call_expression function: (scoped_identifier name: (identifier) @call.name)) @call.def
 "#;
+
+/// The container a method belongs to: the `Self` type, plus the trait
+/// being implemented if this is a trait impl (as opposed to an inherent
+/// impl or a default trait-method body).
+struct Container<'a> {
+    type_name: &'a str,
+    /// Raw trait reference text (e.g. `From<i32>`), present only for
+    /// `impl Trait for Type` blocks. Distinguishing this in the qualified
+    /// name is what lets `impl From<i32> for Wrapper` and
+    /// `impl From<String> for Wrapper` produce different concept ids for
+    /// their `from` methods instead of colliding.
+    trait_name: Option<&'a str>,
+}
 
 /// Finds the containing `impl`/`trait` block of a `function_item`, if any,
 /// treating the function as a method rather than a top-level function.
-fn container_name<'a>(src: &'a str, function_node: Node) -> Option<&'a str> {
+fn container_name<'a>(src: &'a str, function_node: Node) -> Option<Container<'a>> {
     let parent = function_node.parent()?;
     if parent.kind() != "declaration_list" {
         return None;
     }
     let grand = parent.parent()?;
-    let field = match grand.kind() {
-        "impl_item" => grand.child_by_field_name("type")?,
-        "trait_item" => grand.child_by_field_name("name")?,
-        _ => return None,
-    };
-    let text = node_text(src, field);
-    Some(text.split('<').next().unwrap_or(text).trim())
+    match grand.kind() {
+        "impl_item" => {
+            let type_field = grand.child_by_field_name("type")?;
+            let type_text = node_text(src, type_field);
+            let type_name = type_text.split('<').next().unwrap_or(type_text).trim();
+            let trait_name = grand
+                .child_by_field_name("trait")
+                .map(|t| node_text(src, t));
+            Some(Container {
+                type_name,
+                trait_name,
+            })
+        }
+        "trait_item" => {
+            let name_field = grand.child_by_field_name("name")?;
+            Some(Container {
+                type_name: node_text(src, name_field),
+                trait_name: None,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn signature_before_body(src: &str, def_node: Node) -> String {
@@ -164,9 +195,25 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         if let (Some(def), Some(name)) = (fn_def, fn_name) {
             let fn_name_text = node_text(source, name);
             let (kind, qualified) = match container_name(source, def) {
-                Some(container) => (
+                Some(Container {
+                    type_name,
+                    trait_name: Some(trait_name),
+                }) => (
                     ConceptKind::Method,
-                    format!("{}.{}.{}", module, container, fn_name_text),
+                    format!(
+                        "{}.{}.{}.{}",
+                        module,
+                        type_name,
+                        slugify(trait_name),
+                        fn_name_text
+                    ),
+                ),
+                Some(Container {
+                    type_name,
+                    trait_name: None,
+                }) => (
+                    ConceptKind::Method,
+                    format!("{}.{}.{}", module, type_name, fn_name_text),
                 ),
                 None => (
                     ConceptKind::Function,
@@ -262,5 +309,67 @@ impl Foo {
 
         assert_eq!(extraction.calls.len(), 1);
         assert_eq!(extraction.calls[0].callee_name, "decode_jwt");
+    }
+
+    #[test]
+    fn captures_method_and_scoped_calls() {
+        let src = r#"
+struct Foo;
+impl Foo {
+    fn helper(&self) {
+        self.other();
+        Foo::other(self);
+        std::mem::drop(1);
+    }
+    fn other(&self) {}
+}
+"#;
+        let extraction = extract(src, "src/lib.rs").unwrap();
+        let callee_names: Vec<_> = extraction
+            .calls
+            .iter()
+            .map(|c| c.callee_name.as_str())
+            .collect();
+        assert!(
+            callee_names.contains(&"other"),
+            "expected self.other()/Foo::other() to be captured, got {callee_names:?}"
+        );
+        assert!(
+            callee_names.contains(&"drop"),
+            "expected std::mem::drop() to be captured, got {callee_names:?}"
+        );
+    }
+
+    #[test]
+    fn distinguishes_generic_trait_impls_with_the_same_method_name() {
+        let src = r#"
+struct Wrapper(String);
+
+impl From<i32> for Wrapper {
+    fn from(v: i32) -> Self { Wrapper(v.to_string()) }
+}
+
+impl From<String> for Wrapper {
+    fn from(v: String) -> Self { Wrapper(v) }
+}
+"#;
+        let extraction = extract(src, "src/wrapper.rs").unwrap();
+        let from_methods: Vec<_> = extraction
+            .concepts
+            .iter()
+            .filter(|c| c.name == "from")
+            .collect();
+        assert_eq!(
+            from_methods.len(),
+            2,
+            "both `from` impls should be extracted"
+        );
+
+        let ids: std::collections::HashSet<_> = from_methods.iter().map(|c| &c.id).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "the two `from` methods must not collide on id"
+        );
     }
 }

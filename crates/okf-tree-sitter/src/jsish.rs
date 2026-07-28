@@ -18,6 +18,7 @@ const BASE_QUERY_SRC: &str = r#"
 (function_declaration name: (identifier) @fn.name) @fn.def
 (method_definition name: (property_identifier) @method.name) @method.def
 (call_expression function: (identifier) @call.name) @call.def
+(call_expression function: (member_expression property: (property_identifier) @call.name)) @call.def
 "#;
 
 /// TypeScript-only: JavaScript's grammar has no `interface_declaration`
@@ -172,21 +173,26 @@ pub fn extract(
         }
 
         if let (Some(def), Some(name)) = (method_def, method_name) {
-            let method_name_text = node_text(source, name);
-            let qualified = match class_container_name(source, def) {
-                Some(container) => format!("{}.{}.{}", module, container, method_name_text),
-                None => format!("{}.{}", module, method_name_text),
-            };
-            let concept = make_concept(
-                ConceptKind::Method,
-                language,
-                method_name_text,
-                &qualified,
-                location(relative_path, def),
-                Some(signature_before_body(source, def)),
-            );
-            function_spans.push((concept.id.clone(), def.byte_range()));
-            concepts.push(concept);
+            // Only a `method_definition` inside a `class_body` is a real
+            // class method; the same node shape also matches ES6 shorthand
+            // methods in plain object literals (`{ greet() {...} }`), which
+            // have no stable, collision-free container to qualify them
+            // with, so they're skipped rather than misfiled as a top-level
+            // `Function` sharing an id with any same-named real function.
+            if let Some(container) = class_container_name(source, def) {
+                let method_name_text = node_text(source, name);
+                let qualified = format!("{}.{}.{}", module, container, method_name_text);
+                let concept = make_concept(
+                    ConceptKind::Method,
+                    language,
+                    method_name_text,
+                    &qualified,
+                    location(relative_path, def),
+                    Some(signature_before_body(source, def)),
+                );
+                function_spans.push((concept.id.clone(), def.byte_range()));
+                concepts.push(concept);
+            }
         }
 
         if let Some(node) = call_name {

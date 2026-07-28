@@ -57,8 +57,11 @@ impl SearchIndex {
                 .strip_suffix(".md")
                 .unwrap_or(&relative)
                 .to_string();
-            let content =
-                fs::read_to_string(path).with_context(|| format!("failed to read {relative}"))?;
+            // Normalize CRLF to LF, matching okf-validator, so a file
+            // edited on Windows still has its frontmatter recognized.
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("failed to read {relative}"))?
+                .replace("\r\n", "\n");
             if let Some(entry) = parse_entry(id, &content) {
                 entries.push(entry);
             }

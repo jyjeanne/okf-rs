@@ -46,4 +46,37 @@ function qux() {}
         assert_eq!(extraction.calls.len(), 1);
         assert_eq!(extraction.calls[0].callee_name, "qux");
     }
+
+    #[test]
+    fn object_literal_shorthand_methods_are_skipped_not_collided() {
+        let src = r#"
+function greet() { console.log("hi"); }
+const handlers = { greet() { console.log("obj greet"); } };
+"#;
+        let extraction = extract(src, "src/foo.js").unwrap();
+        let greet_fns: Vec<_> = extraction
+            .concepts
+            .iter()
+            .filter(|c| c.name == "greet")
+            .collect();
+        // Only the top-level `function greet()` is a concept; the object
+        // literal's shorthand method has no stable container, so it's
+        // skipped instead of colliding with it on id.
+        assert_eq!(greet_fns.len(), 1);
+        assert_eq!(greet_fns[0].kind, ConceptKind::Function);
+    }
+
+    #[test]
+    fn captures_member_expression_calls() {
+        let src = r#"
+class Bar {
+    baz() {
+        this.helper();
+    }
+    helper() {}
+}
+"#;
+        let extraction = extract(src, "src/bar.js").unwrap();
+        assert!(extraction.calls.iter().any(|c| c.callee_name == "helper"));
+    }
 }

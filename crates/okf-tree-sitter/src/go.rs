@@ -12,9 +12,11 @@ use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 const QUERY_SRC: &str = r#"
 (import_spec path: (interpreted_string_literal) @import.path)
 (type_spec name: (type_identifier) @struct.name type: (struct_type)) @struct.def
+(type_spec name: (type_identifier) @interface.name type: (interface_type)) @interface.def
 (method_declaration receiver: (parameter_list (parameter_declaration type: (_) @method.receiver)) name: (field_identifier) @method.name) @method.def
 (function_declaration name: (identifier) @fn.name) @fn.def
 (call_expression function: (identifier) @call.name) @call.def
+(call_expression function: (selector_expression field: (field_identifier) @call.name)) @call.def
 "#;
 
 fn signature_before_body(src: &str, def_node: Node) -> String {
@@ -23,6 +25,19 @@ fn signature_before_body(src: &str, def_node: Node) -> String {
         .map(|b| b.start_byte())
         .unwrap_or(def_node.end_byte());
     src[def_node.start_byte()..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `type_spec` nodes (struct/interface definitions) have no `body` field,
+/// so `signature_before_body` can't be used for them — this truncates at
+/// the first `{` instead, giving just the declaration line.
+fn type_signature(src: &str, def_node: Node) -> String {
+    let text = node_text(src, def_node);
+    text.split('{')
+        .next()
+        .unwrap_or(text)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -64,6 +79,8 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         let mut import_path = None;
         let mut struct_def = None;
         let mut struct_name = None;
+        let mut interface_def = None;
+        let mut interface_name = None;
         let mut method_def = None;
         let mut method_name = None;
         let mut method_receiver = None;
@@ -76,6 +93,8 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 "import.path" => import_path = Some(cap.node),
                 "struct.def" => struct_def = Some(cap.node),
                 "struct.name" => struct_name = Some(cap.node),
+                "interface.def" => interface_def = Some(cap.node),
+                "interface.name" => interface_name = Some(cap.node),
                 "method.def" => method_def = Some(cap.node),
                 "method.name" => method_name = Some(cap.node),
                 "method.receiver" => method_receiver = Some(cap.node),
@@ -99,7 +118,19 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 node_text(source, name),
                 &qualified,
                 location(relative_path, def),
-                Some(signature_before_body(source, def)),
+                Some(type_signature(source, def)),
+            ));
+        }
+
+        if let (Some(def), Some(name)) = (interface_def, interface_name) {
+            let qualified = format!("{}.{}", module, node_text(source, name));
+            concepts.push(make_concept(
+                ConceptKind::Interface,
+                Language::Go,
+                node_text(source, name),
+                &qualified,
+                location(relative_path, def),
+                Some(type_signature(source, def)),
             ));
         }
 
@@ -217,7 +248,46 @@ func Baz() {
             .unwrap();
         assert_eq!(module.relationships.len(), 2);
 
+        // Baz() (bare identifier, from Bar) and fmt.Println (selector
+        // expression, from Baz) are both now captured as call candidates.
+        assert_eq!(extraction.calls.len(), 2);
+        let callee_names: Vec<_> = extraction
+            .calls
+            .iter()
+            .map(|c| c.callee_name.as_str())
+            .collect();
+        assert!(callee_names.contains(&"Baz"));
+        assert!(callee_names.contains(&"Println"));
+    }
+
+    #[test]
+    fn extracts_interface_and_selector_calls_to_local_methods() {
+        let src = r#"
+package pkg
+
+type Reader interface {
+	Read([]byte) (int, error)
+}
+
+type Foo struct{}
+
+func (f *Foo) Helper() {}
+
+func Run(f *Foo) {
+	f.Helper()
+}
+"#;
+        let extraction = extract(src, "pkg/reader.go").unwrap();
+
+        let reader = extraction
+            .concepts
+            .iter()
+            .find(|c| c.name == "Reader")
+            .unwrap();
+        assert_eq!(reader.kind, ConceptKind::Interface);
+        assert_eq!(reader.signature.as_deref(), Some("Reader interface"));
+
         assert_eq!(extraction.calls.len(), 1);
-        assert_eq!(extraction.calls[0].callee_name, "Baz");
+        assert_eq!(extraction.calls[0].callee_name, "Helper");
     }
 }

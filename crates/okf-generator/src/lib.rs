@@ -28,12 +28,19 @@ struct Frontmatter {
 /// Writes `concepts` to `output_dir` as an OKF bundle. Fails fast (before
 /// writing anything) if two concepts would collide on the same id, since
 /// that would otherwise silently overwrite one file with another.
+///
+/// The collision check is case-insensitive, even though ids are compared
+/// exactly everywhere else: ids become file paths, and the most common
+/// target filesystems (default macOS APFS, Windows NTFS) are
+/// case-insensitive, so two ids differing only by case (e.g. `Run` vs.
+/// `run`) would still collide on disk even though this checker's own
+/// case-sensitive `HashSet` wouldn't catch it.
 pub fn write_bundle(concepts: &[Concept], output_dir: &Path) -> Result<()> {
     let mut seen = HashSet::new();
     for concept in concepts {
-        if !seen.insert(concept.id.as_str()) {
+        if !seen.insert(concept.id.to_ascii_lowercase()) {
             return Err(anyhow!(
-                "duplicate concept id `{}` (from {}); refusing to write a bundle that would silently overwrite it",
+                "duplicate concept id `{}` (from {}); refusing to write a bundle that would silently overwrite it (ids are compared case-insensitively, since they become file paths on filesystems that may not distinguish case)",
                 concept.id,
                 concept.location
             ));
@@ -278,6 +285,18 @@ mod tests {
     fn rejects_duplicate_ids() {
         let dir = tempfile::tempdir().unwrap();
         let a = concept(ConceptKind::Function, "run", "run", "src/a.rs");
+        let b = concept(ConceptKind::Function, "run", "run", "src/b.rs");
+        let err = write_bundle(&[a, b], dir.path()).unwrap_err();
+        assert!(err.to_string().contains("duplicate concept id"));
+    }
+
+    #[test]
+    fn rejects_ids_differing_only_by_case() {
+        // On case-insensitive filesystems (default macOS, Windows), `Run`
+        // and `run` are the same path, so this must be caught even though
+        // the ids aren't byte-for-byte equal.
+        let dir = tempfile::tempdir().unwrap();
+        let a = concept(ConceptKind::Function, "Run", "Run", "src/a.rs");
         let b = concept(ConceptKind::Function, "run", "run", "src/b.rs");
         let err = write_bundle(&[a, b], dir.path()).unwrap_err();
         assert!(err.to_string().contains("duplicate concept id"));

@@ -13,10 +13,18 @@ const QUERY_SRC: &str = r#"
 (class_definition name: (identifier) @class.name) @class.def
 (function_definition name: (identifier) @fn.name) @fn.def
 (call function: (identifier) @call.name) @call.def
+(call function: (attribute attribute: (identifier) @call.name)) @call.def
 "#;
 
 fn container_name<'a>(src: &'a str, function_node: Node) -> Option<&'a str> {
-    let parent = function_node.parent()?;
+    // A decorated method's real parent is `decorated_definition` (the
+    // decorator wraps it), which itself sits in the class's `block` — skip
+    // over that wrapper so `@staticmethod`/`@classmethod`/`@property`/any
+    // decorator doesn't break class-membership detection.
+    let mut parent = function_node.parent()?;
+    if parent.kind() == "decorated_definition" {
+        parent = parent.parent()?;
+    }
     if parent.kind() != "block" {
         return None;
     }
@@ -202,5 +210,48 @@ def baz():
 
         assert_eq!(extraction.calls.len(), 1);
         assert_eq!(extraction.calls[0].callee_name, "baz");
+    }
+
+    #[test]
+    fn decorated_methods_stay_class_members() {
+        let src = r#"
+class Foo:
+    @staticmethod
+    def bar():
+        pass
+
+    def baz(self):
+        pass
+"#;
+        let extraction = extract(src, "foo.py").unwrap();
+
+        let bar = extraction
+            .concepts
+            .iter()
+            .find(|c| c.name == "bar")
+            .unwrap();
+        assert_eq!(bar.kind, ConceptKind::Method);
+        assert_eq!(bar.qualified_name, "foo.Foo.bar");
+
+        let baz = extraction
+            .concepts
+            .iter()
+            .find(|c| c.name == "baz")
+            .unwrap();
+        assert_eq!(baz.kind, ConceptKind::Method);
+    }
+
+    #[test]
+    fn captures_self_and_attribute_calls() {
+        let src = r#"
+class Foo:
+    def bar(self):
+        self.helper()
+
+    def helper(self):
+        pass
+"#;
+        let extraction = extract(src, "foo.py").unwrap();
+        assert!(extraction.calls.iter().any(|c| c.callee_name == "helper"));
     }
 }

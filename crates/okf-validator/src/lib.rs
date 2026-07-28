@@ -9,9 +9,10 @@
 //! - markdown links between concepts resolve to files that exist in the
 //!   bundle (no dangling references)
 //! - every concept is reachable from an `index.md` (no orphaned files)
-//! - no duplicate concept identity (case-insensitive path collisions,
-//!   which would silently clobber each other on case-insensitive
-//!   filesystems)
+//! - no duplicate concept identity: neither two files colliding on path
+//!   (case-insensitively, since paths become filesystem entries that may
+//!   not distinguish case) nor two files independently describing the
+//!   same source location (`resource`)
 //!
 //! Schema-version conformance (the sixth check named in the spec) is not
 //! implemented yet: okf-rs doesn't emit a schema version into bundles in
@@ -70,8 +71,13 @@ pub fn validate_bundle(bundle_dir: &Path) -> Result<ValidationReport> {
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
-        let content =
-            fs::read_to_string(path).with_context(|| format!("failed to read {relative}"))?;
+        // Normalize CRLF to LF before any frontmatter parsing: files
+        // edited or checked out on Windows (or with `core.autocrlf=true`)
+        // are otherwise valid OKF content that the `"---\n"` delimiter
+        // match would reject wholesale as "missing frontmatter".
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {relative}"))?
+            .replace("\r\n", "\n");
         files.push(ScannedFile { relative, content });
     }
     files.sort_by(|a, b| a.relative.cmp(&b.relative));
@@ -81,6 +87,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> Result<ValidationReport> {
 
     check_frontmatter(&files, &mut report);
     check_duplicate_ids(&files, &mut report);
+    check_duplicate_resources(&files, &mut report);
     let links = check_links_and_collect(&files, &known_paths, &mut report);
     check_reachability(&files, &links, &mut report);
 
@@ -197,6 +204,60 @@ fn check_duplicate_ids(files: &[ScannedFile], report: &mut ValidationReport) {
                     file: path.to_string(),
                     message: format!(
                         "concept id collides case-insensitively with: {}",
+                        sorted
+                            .iter()
+                            .filter(|p| **p != *path)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// Catches the OKF spec's other "duplicate concept identity" case:
+/// `check_duplicate_ids` only catches two files that collide on *path*,
+/// but a source symbol can just as easily be emitted twice under two
+/// *different* paths (e.g. a stale file left behind after a rename, or a
+/// hand-edited copy) — that's detected here by two concept files sharing
+/// the same `resource` (source location).
+fn check_duplicate_resources(files: &[ScannedFile], report: &mut ValidationReport) {
+    let mut by_resource: HashMap<String, Vec<&str>> = HashMap::new();
+    for file in files {
+        if is_index(&file.relative) {
+            continue;
+        }
+        let Some((yaml, _)) = split_frontmatter(&file.content) else {
+            continue;
+        };
+        let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+            continue;
+        };
+        let Some(resource) = value
+            .as_mapping()
+            .and_then(|m| m.get("resource"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        by_resource
+            .entry(resource.to_string())
+            .or_default()
+            .push(&file.relative);
+    }
+
+    for (resource, paths) in by_resource {
+        if paths.len() > 1 {
+            let mut sorted = paths.clone();
+            sorted.sort();
+            for path in &sorted {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    file: path.to_string(),
+                    message: format!(
+                        "duplicate concept identity: `resource: {resource}` also appears in: {}",
                         sorted
                             .iter()
                             .filter(|p| **p != *path)
@@ -390,5 +451,56 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.message.contains("`timestamp`")));
+    }
+
+    #[test]
+    fn accepts_crlf_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\r\ntype: Rust Function\r\ntitle: run\r\nresource: src/main.rs#L1\r\n---\r\n\r\nbody\r\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "CRLF-formatted frontmatter should still validate cleanly: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn flags_same_resource_emitted_under_two_different_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [a](functions/verify_token.md)\n- [b](functions/verify_token_v2.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/verify_token.md",
+            "---\ntype: Rust Function\ntitle: verify_token\nresource: src/auth/token.rs#L42\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/verify_token_v2.md",
+            "---\ntype: Rust Function\ntitle: verify_token\nresource: src/auth/token.rs#L42\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.has_errors());
+        assert_eq!(
+            report
+                .issues
+                .iter()
+                .filter(|i| i.message.contains("duplicate concept identity"))
+                .count(),
+            2,
+            "both files sharing the resource should be flagged: {:?}",
+            report.issues
+        );
     }
 }

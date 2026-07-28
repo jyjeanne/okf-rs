@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 
 /// Minimal per-project config written by `okf-rs init` and read by the
 /// other commands so `--output`/bundle paths don't need repeating on every
-/// invocation. Anything not found here (or no `okf.toml` at all) falls
-/// back to the literal default `knowledge`.
+/// invocation. `output` is relative to the project root it was recorded
+/// for — see [`load`] for how callers should resolve it. Anything not
+/// found here (or no `okf.toml` at all) falls back to the literal default
+/// `knowledge`.
 pub struct Config {
     pub output: PathBuf,
 }
@@ -20,20 +22,53 @@ impl Default for Config {
 
 const CONFIG_FILE: &str = "okf.toml";
 
+/// Loads `<project_root>/okf.toml`, if any. A missing file is the normal,
+/// silent case (most projects haven't run `init`) and falls back to
+/// [`Config::default`]. A file that exists but fails to read or parse is
+/// different — that's a real configuration error, not an absent one — so
+/// it's reported on stderr before falling back, rather than silently
+/// masking it (a bad `okf.toml` would otherwise make every later command
+/// quietly target the wrong bundle with no indication why).
+///
+/// The returned `output` is still relative to `project_root`; join it
+/// yourself (`project_root.join(config.output)`) before using it, since
+/// this function has no way to know whether the caller's current
+/// directory is `project_root`.
 pub fn load(project_root: &Path) -> Config {
     let path = project_root.join(CONFIG_FILE);
-    let Ok(content) = fs::read_to_string(&path) else {
-        return Config::default();
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Config::default(),
+        Err(e) => {
+            eprintln!(
+                "warning: failed to read {}: {e}; using defaults",
+                path.display()
+            );
+            return Config::default();
+        }
     };
-    let Ok(value) = content.parse::<toml::Value>() else {
-        return Config::default();
+    let value = match content.parse::<toml::Value>() {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!(
+                "warning: failed to parse {}: {e}; using defaults",
+                path.display()
+            );
+            return Config::default();
+        }
     };
-    let output = value
-        .get("output")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("knowledge"));
-    Config { output }
+    match value.get("output").and_then(|v| v.as_str()) {
+        Some(output) => Config {
+            output: PathBuf::from(output),
+        },
+        None => {
+            eprintln!(
+                "warning: {} has no `output` key; using default \"knowledge\"",
+                path.display()
+            );
+            Config::default()
+        }
+    }
 }
 
 pub fn write_default(project_root: &Path, output: &Path) -> Result<PathBuf> {

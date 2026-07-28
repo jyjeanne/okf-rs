@@ -47,6 +47,9 @@ enum Command {
     Validate {
         /// Defaults to the value in `okf.toml`, or `knowledge`.
         bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
         /// Treat orphaned-concept warnings as failures too (for CI gating).
         #[arg(long)]
         ci: bool,
@@ -56,6 +59,9 @@ enum Command {
         query: String,
         /// Defaults to the value in `okf.toml`, or `knowledge`.
         bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
 }
 
@@ -75,13 +81,27 @@ fn run(command: Command) -> Result<ExitCode> {
         Command::Init { path, output } => cmd_init(&path, &output),
         Command::Scan { path } => cmd_scan(&path),
         Command::Generate { path, output } => cmd_generate(&path, output),
-        Command::Validate { bundle, ci } => cmd_validate(bundle, ci),
-        Command::Search { query, bundle } => cmd_search(&query, bundle),
+        Command::Validate {
+            bundle,
+            project,
+            ci,
+        } => cmd_validate(bundle, &project, ci),
+        Command::Search {
+            query,
+            bundle,
+            project,
+        } => cmd_search(&query, bundle, &project),
     }
 }
 
+/// Resolves the bundle path for a command: an explicit path always wins
+/// (used as-is, relative to the caller's current directory, standard CLI
+/// convention); otherwise falls back to `okf.toml`'s `output`, which is
+/// relative to `project_root` — not the current directory — since that's
+/// what it was recorded against, so it's joined here rather than left to
+/// resolve against whatever directory the command happens to run from.
 fn resolve_bundle_arg(project_root: &std::path::Path, explicit: Option<PathBuf>) -> PathBuf {
-    explicit.unwrap_or_else(|| config::load(project_root).output)
+    explicit.unwrap_or_else(|| project_root.join(config::load(project_root).output))
 }
 
 fn cmd_init(path: &std::path::Path, output: &std::path::Path) -> Result<ExitCode> {
@@ -137,8 +157,14 @@ fn cmd_generate(path: &std::path::Path, output: Option<PathBuf>) -> Result<ExitC
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_validate(bundle: Option<PathBuf>, ci: bool) -> Result<ExitCode> {
-    let project_root = std::env::current_dir()?;
+fn cmd_validate(bundle: Option<PathBuf>, project: &std::path::Path, ci: bool) -> Result<ExitCode> {
+    // Falls back to the raw (uncanonicalized) path rather than erroring:
+    // validating a bundle with no accompanying project checkout (e.g. one
+    // fetched from elsewhere) is a legitimate use, and `--project` simply
+    // won't resolve an `okf.toml` in that case.
+    let project_root = project
+        .canonicalize()
+        .unwrap_or_else(|_| project.to_path_buf());
     let bundle = resolve_bundle_arg(&project_root, bundle);
     let report = okf_validator::validate_bundle(&bundle)?;
 
@@ -168,8 +194,10 @@ fn cmd_validate(bundle: Option<PathBuf>, ci: bool) -> Result<ExitCode> {
     }
 }
 
-fn cmd_search(query: &str, bundle: Option<PathBuf>) -> Result<ExitCode> {
-    let project_root = std::env::current_dir()?;
+fn cmd_search(query: &str, bundle: Option<PathBuf>, project: &std::path::Path) -> Result<ExitCode> {
+    let project_root = project
+        .canonicalize()
+        .unwrap_or_else(|_| project.to_path_buf());
     let bundle = resolve_bundle_arg(&project_root, bundle);
     let index = okf_search::SearchIndex::build(&bundle)?;
     let hits = index.search(query);
