@@ -20,6 +20,7 @@ pub enum Language {
     Java,
     CSharp,
     Php,
+    Kotlin,
 }
 
 impl Language {
@@ -34,6 +35,7 @@ impl Language {
             Language::Java => "Java",
             Language::CSharp => "C#",
             Language::Php => "PHP",
+            Language::Kotlin => "Kotlin",
         }
     }
 
@@ -48,6 +50,7 @@ impl Language {
             "java" => Some(Language::Java),
             "cs" => Some(Language::CSharp),
             "php" => Some(Language::Php),
+            "kt" | "kts" => Some(Language::Kotlin),
             _ => None,
         }
     }
@@ -64,6 +67,7 @@ impl Language {
             "Java" => Some(Language::Java),
             "C#" => Some(Language::CSharp),
             "PHP" => Some(Language::Php),
+            "Kotlin" => Some(Language::Kotlin),
             _ => None,
         }
     }

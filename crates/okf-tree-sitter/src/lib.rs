@@ -15,6 +15,7 @@ mod go;
 mod java;
 mod javascript;
 mod jsish;
+mod kotlin;
 mod php;
 mod python;
 mod rust;
@@ -63,5 +64,6 @@ pub fn extract_file(file: &SourceFile) -> Result<FileExtraction> {
         Language::Java => java::extract(&source, &file.relative_path),
         Language::CSharp => csharp::extract(&source, &file.relative_path),
         Language::Php => php::extract(&source, &file.relative_path),
+        Language::Kotlin => kotlin::extract(&source, &file.relative_path),
     }
 }
