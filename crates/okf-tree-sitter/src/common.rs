@@ -75,6 +75,7 @@ pub fn make_concept(
     qualified_name: &str,
     location: Location,
     signature: Option<String>,
+    is_public: bool,
 ) -> Concept {
     Concept {
         id: Concept::make_id(kind, qualified_name),
@@ -86,9 +87,24 @@ pub fn make_concept(
         location,
         signature,
         tags: Vec::new(),
+        is_public,
         timestamp: None,
         relationships: Vec::new(),
     }
+}
+
+/// Python/JavaScript/TypeScript's "leading underscore means private"
+/// naming convention. Unlike Rust's `pub` keyword or Go's capitalization
+/// rule, this is not enforced by the language — it's a heuristic until
+/// real `export`/access-modifier tracking lands.
+pub fn is_public_by_underscore_convention(name: &str) -> bool {
+    !name.starts_with('_')
+}
+
+/// Go's actual visibility rule: an identifier is exported (public) if and
+/// only if its first character is uppercase.
+pub fn is_public_by_go_convention(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
 /// Finds, among `candidates`, the id of the smallest byte range containing

@@ -8,6 +8,7 @@ members = [
     "crates/okf-generator",
     "crates/okf-validator",
     "crates/okf-search",
+    "crates/okf-graph",
     "crates/okf-cli",
 ]
 
@@ -25,6 +26,7 @@ okf-analyzer = { path = "crates/okf-analyzer" }
 okf-generator = { path = "crates/okf-generator" }
 okf-validator = { path = "crates/okf-validator" }
 okf-search = { path = "crates/okf-search" }
+okf-graph = { path = "crates/okf-graph" }
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

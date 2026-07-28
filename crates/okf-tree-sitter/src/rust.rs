@@ -10,10 +10,10 @@ use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 const QUERY_SRC: &str = r#"
 (use_declaration) @import
-(struct_item name: (type_identifier) @struct.name) @struct.def
-(enum_item name: (type_identifier) @enum.name) @enum.def
-(trait_item name: (type_identifier) @trait.name) @trait.def
-(function_item name: (identifier) @fn.name) @fn.def
+(struct_item (visibility_modifier)? @struct.vis name: (type_identifier) @struct.name) @struct.def
+(enum_item (visibility_modifier)? @enum.vis name: (type_identifier) @enum.name) @enum.def
+(trait_item (visibility_modifier)? @trait.vis name: (type_identifier) @trait.name) @trait.def
+(function_item (visibility_modifier)? @fn.vis name: (identifier) @fn.name) @fn.def
 (call_expression function: (identifier) @call.name) @call.def
 (call_expression function: (field_expression field: (field_identifier) @call.name)) @call.def
 (call_expression function: (scoped_identifier name: (identifier) @call.name)) @call.def
@@ -107,6 +107,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
             end_line: source.lines().count().max(1),
         },
         None,
+        true,
     );
 
     let query = Query::new(&ts_lang, QUERY_SRC).context("invalid Rust query")?;
@@ -121,12 +122,16 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         let mut import_node = None;
         let mut struct_def = None;
         let mut struct_name = None;
+        let mut struct_vis = None;
         let mut enum_def = None;
         let mut enum_name = None;
+        let mut enum_vis = None;
         let mut trait_def = None;
         let mut trait_name = None;
+        let mut trait_vis = None;
         let mut fn_def = None;
         let mut fn_name = None;
+        let mut fn_vis = None;
         let mut call_name = None;
 
         for cap in m.captures {
@@ -135,12 +140,16 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 "import" => import_node = Some(cap.node),
                 "struct.def" => struct_def = Some(cap.node),
                 "struct.name" => struct_name = Some(cap.node),
+                "struct.vis" => struct_vis = Some(cap.node),
                 "enum.def" => enum_def = Some(cap.node),
                 "enum.name" => enum_name = Some(cap.node),
+                "enum.vis" => enum_vis = Some(cap.node),
                 "trait.def" => trait_def = Some(cap.node),
                 "trait.name" => trait_name = Some(cap.node),
+                "trait.vis" => trait_vis = Some(cap.node),
                 "fn.def" => fn_def = Some(cap.node),
                 "fn.name" => fn_name = Some(cap.node),
+                "fn.vis" => fn_vis = Some(cap.node),
                 "call.name" => call_name = Some(cap.node),
                 _ => {}
             }
@@ -165,6 +174,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 &qualified,
                 location(relative_path, def),
                 Some(type_signature(source, def)),
+                struct_vis.is_some(),
             ));
         }
 
@@ -177,6 +187,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 &qualified,
                 location(relative_path, def),
                 Some(type_signature(source, def)),
+                enum_vis.is_some(),
             ));
         }
 
@@ -189,6 +200,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 &qualified,
                 location(relative_path, def),
                 Some(type_signature(source, def)),
+                trait_vis.is_some(),
             ));
         }
 
@@ -227,6 +239,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 &qualified,
                 location(relative_path, def),
                 Some(signature_before_body(source, def)),
+                fn_vis.is_some(),
             );
             function_spans.push((concept.id.clone(), def.byte_range()));
             concepts.push(concept);
@@ -371,5 +384,30 @@ impl From<String> for Wrapper {
             2,
             "the two `from` methods must not collide on id"
         );
+    }
+
+    #[test]
+    fn detects_pub_visibility() {
+        let src = r#"
+pub struct Public;
+struct Private;
+
+pub fn public_fn() {}
+fn private_fn() {}
+
+impl Public {
+    pub fn pub_method(&self) {}
+    fn priv_method(&self) {}
+}
+"#;
+        let extraction = extract(src, "src/lib.rs").unwrap();
+        let find = |name: &str| extraction.concepts.iter().find(|c| c.name == name).unwrap();
+
+        assert!(find("Public").is_public);
+        assert!(!find("Private").is_public);
+        assert!(find("public_fn").is_public);
+        assert!(!find("private_fn").is_public);
+        assert!(find("pub_method").is_public);
+        assert!(!find("priv_method").is_public);
     }
 }

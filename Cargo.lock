@@ -427,9 +427,11 @@ dependencies = [
  "okf-analyzer",
  "okf-core",
  "okf-generator",
+ "okf-graph",
  "okf-parser",
  "okf-search",
  "okf-validator",
+ "tempfile",
  "toml",
 ]
 
@@ -453,6 +455,13 @@ dependencies = [
  "serde",
  "serde_yaml",
  "tempfile",
+]
+
+[[package]]
+name = "okf-graph"
+version = "0.1.0"
+dependencies = [
+ "okf-parser",
 ]
 
 [[package]]

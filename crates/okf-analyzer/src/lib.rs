@@ -104,6 +104,86 @@ pub fn analyze(project: &Project) -> Result<AnalysisResult> {
     })
 }
 
+/// A concept present in both snapshots being diffed, but whose signature
+/// or relationships changed between them.
+#[derive(Debug, Clone)]
+pub struct ChangedConcept {
+    pub id: String,
+    pub kind: ConceptKind,
+    pub before_signature: Option<String>,
+    pub after_signature: Option<String>,
+}
+
+/// The result of comparing two analyzed snapshots of the same project
+/// (typically two git refs) at the concept level.
+#[derive(Debug, Clone, Default)]
+pub struct DiffReport {
+    pub added: Vec<Concept>,
+    pub removed: Vec<Concept>,
+    pub changed: Vec<ChangedConcept>,
+}
+
+impl DiffReport {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+/// Compares two concept snapshots by id: concepts only in `after` are
+/// additions, concepts only in `before` are removals, and concepts in both
+/// whose signature or relationship set differs are changes. Pure and
+/// git-agnostic — the caller is responsible for producing `before`/`after`
+/// (e.g. by analyzing two git refs), which keeps this testable without a
+/// repository.
+pub fn diff(before: &[Concept], after: &[Concept]) -> DiffReport {
+    let before_by_id: HashMap<&str, &Concept> = before.iter().map(|c| (c.id.as_str(), c)).collect();
+    let after_by_id: HashMap<&str, &Concept> = after.iter().map(|c| (c.id.as_str(), c)).collect();
+
+    let mut report = DiffReport::default();
+
+    for concept in after {
+        if !before_by_id.contains_key(concept.id.as_str()) {
+            report.added.push(concept.clone());
+        }
+    }
+    for concept in before {
+        if !after_by_id.contains_key(concept.id.as_str()) {
+            report.removed.push(concept.clone());
+        }
+    }
+    for concept in after {
+        let Some(&before_concept) = before_by_id.get(concept.id.as_str()) else {
+            continue;
+        };
+        if before_concept.signature != concept.signature
+            || relationship_set(before_concept) != relationship_set(concept)
+        {
+            report.changed.push(ChangedConcept {
+                id: concept.id.clone(),
+                kind: concept.kind,
+                before_signature: before_concept.signature.clone(),
+                after_signature: concept.signature.clone(),
+            });
+        }
+    }
+
+    report.added.sort_by(|a, b| a.id.cmp(&b.id));
+    report.removed.sort_by(|a, b| a.id.cmp(&b.id));
+    report.changed.sort_by(|a, b| a.id.cmp(&b.id));
+    report
+}
+
+/// A comparable, order-independent view of a concept's relationships, so
+/// `diff` treats two relationship lists as equal regardless of extraction
+/// order.
+fn relationship_set(concept: &Concept) -> std::collections::BTreeSet<(RelationKind, &str)> {
+    concept
+        .relationships
+        .iter()
+        .map(|r| (r.kind, r.target.as_str()))
+        .collect()
+}
+
 /// Derives a single `Package` concept from the project's root manifest
 /// (`Cargo.toml`, `package.json`, `pyproject.toml`, or `go.mod`), if one
 /// was detected during scanning. Multi-package workspace/monorepo
@@ -145,6 +225,7 @@ fn detect_package(project: &Project) -> Result<Option<Concept>> {
         },
         signature: None,
         tags: Vec::new(),
+        is_public: true,
         timestamp: None,
         relationships: Vec::new(),
     }))
@@ -263,5 +344,99 @@ mod tests {
             .relationships
             .iter()
             .any(|r| r.kind == RelationKind::Calls));
+    }
+
+    fn make_concept(id: &str, signature: &str) -> Concept {
+        Concept {
+            id: id.to_string(),
+            kind: ConceptKind::Function,
+            language: Language::Rust,
+            name: id.to_string(),
+            qualified_name: id.to_string(),
+            description: None,
+            location: Location {
+                file: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+            signature: Some(signature.to_string()),
+            tags: Vec::new(),
+            is_public: true,
+            timestamp: None,
+            relationships: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn diff_detects_added_removed_and_changed() {
+        let before = vec![
+            make_concept("functions/kept", "fn kept()"),
+            make_concept("functions/removed", "fn removed()"),
+            make_concept("functions/changed", "fn changed(a: i32)"),
+        ];
+        let after = vec![
+            make_concept("functions/kept", "fn kept()"),
+            make_concept("functions/added", "fn added()"),
+            make_concept("functions/changed", "fn changed(a: i32, b: i32)"),
+        ];
+
+        let report = diff(&before, &after);
+
+        assert_eq!(report.added.len(), 1);
+        assert_eq!(report.added[0].id, "functions/added");
+
+        assert_eq!(report.removed.len(), 1);
+        assert_eq!(report.removed[0].id, "functions/removed");
+
+        assert_eq!(report.changed.len(), 1);
+        assert_eq!(report.changed[0].id, "functions/changed");
+        assert_eq!(
+            report.changed[0].before_signature.as_deref(),
+            Some("fn changed(a: i32)")
+        );
+        assert_eq!(
+            report.changed[0].after_signature.as_deref(),
+            Some("fn changed(a: i32, b: i32)")
+        );
+    }
+
+    #[test]
+    fn diff_is_empty_for_identical_snapshots() {
+        let concepts = vec![make_concept("functions/a", "fn a()")];
+        let report = diff(&concepts, &concepts.clone());
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn diff_ignores_relationship_order() {
+        let mut before = make_concept("functions/a", "fn a()");
+        before.relationships.push(Relationship {
+            kind: RelationKind::Calls,
+            target: "functions/x".to_string(),
+            target_display: "x".to_string(),
+        });
+        before.relationships.push(Relationship {
+            kind: RelationKind::Calls,
+            target: "functions/y".to_string(),
+            target_display: "y".to_string(),
+        });
+
+        let mut after = make_concept("functions/a", "fn a()");
+        after.relationships.push(Relationship {
+            kind: RelationKind::Calls,
+            target: "functions/y".to_string(),
+            target_display: "y".to_string(),
+        });
+        after.relationships.push(Relationship {
+            kind: RelationKind::Calls,
+            target: "functions/x".to_string(),
+            target_display: "x".to_string(),
+        });
+
+        let report = diff(&[before], &[after]);
+        assert!(
+            report.is_empty(),
+            "reordered relationships should not count as a change"
+        );
     }
 }

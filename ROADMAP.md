@@ -7,7 +7,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase | Status |
 |---|---|
 | Phase 1 — Foundations | ✅ Complete |
-| Phase 2 — Depth & Integration | ⬜ Not started |
+| Phase 2 — Depth & Integration | 🟡 In progress (4/11) |
 | Phase 3 — Intelligence & Extended Output | ⬜ Not started |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
@@ -33,19 +33,25 @@ Verified by dogfooding: running `okf-rs generate .` on this repository itself pr
 
 ---
 
-## Phase 2 — Depth & Integration
+## Phase 2 — Depth & Integration 🟡
 
+- [x] Graph queries (`okf-graph`): cross-module links, ownership, public API surface, and cycle/dependency analysis (Tarjan's SCC), plus shortest call-path — exposed via `okf-rs graph {callers,callees,cycles,api,modules,path}`
+- [x] Relationship-aware queries backed by `okf-graph` — delivered as the `okf-rs graph` subcommand family above rather than folded into `okf-rs search` itself, since relationship queries (traversal, cycles) are a different shape than free-text search
+- [x] Bundle diffing (`okf-rs diff <ref-a> <ref-b> [path]`) — compares two git refs' concepts (added/removed/changed) using a non-destructive `git worktree` checkout of each ref, so it never touches the caller's working tree
+- [x] Agent entry-point generation: `CLAUDE.md`, `AGENTS.md`, `.github/copilot-instructions.md`, written/updated by `okf-rs init` (skip with `--no-agent-files`); idempotent via marker comments, so pre-existing content in those files is preserved and only the okf-rs section is replaced on re-run
 - [ ] LSP integration (`okf-lsp`) to enrich/disambiguate symbols beyond what Tree-sitter alone can resolve
 - [ ] Incremental indexing: content-hash-based re-analysis of only changed files
 - [ ] Extended language coverage: Java, Kotlin, C#, C/C++, PHP, Swift
 - [ ] Multi-package workspace and monorepo aggregation
-- [ ] Graph queries (`okf-graph`): cross-module links, ownership, API surface, cycle/dependency analysis
-- [ ] Relationship-aware search: extend Phase 1 search with "Relationship" and "API" queries backed by `okf-graph`
-- [ ] Bundle diffing (`okf-rs diff`)
 - [ ] MCP server (`okf-mcp`) exposing symbol, call-graph, and API-surface queries
-- [ ] Agent entry-point generation: `CLAUDE.md`, `AGENTS.md`, `.github/copilot-instructions.md`
 - [ ] Basic documentation generation (Markdown, HTML) templated directly from the bundle — no LLM required
 - [ ] Continuous indexing in local development (`okf-watch`)
+
+Verified by dogfooding: `okf-rs graph api .` on this repository lists 71 public concepts, `okf-rs graph cycles .` correctly finds none, `okf-rs graph modules .` shows real cross-crate dependency edges, and `okf-rs diff <commit> <commit> .` against this repo's own history correctly reports added/changed functions using non-destructive worktrees (verified the working tree and branch were untouched afterward, including on an invalid-ref error path).
+
+**Known limitations:**
+- `okf-rs graph` re-analyzes the project from source on every invocation rather than reading a previously generated bundle, since `Calls`/`CalledBy`/`Imports` relationships aren't yet serialized into bundle frontmatter — only into the "# Calls" / "# Called by" markdown body sections, which aren't meant to be machine-parsed back. Serializing relationships into frontmatter (so `okf-graph` and other tools could work directly off a bundle on disk) is still open.
+- Public/private (`is_public`) detection is exact for Rust (`pub` modifier) and Go (capitalization, the language's real rule), but a naming-convention heuristic (leading underscore) for Python/JavaScript/TypeScript, pending real `export`/access-modifier tracking.
 
 ## Phase 3 — Intelligence & Extended Output
 

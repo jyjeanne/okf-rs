@@ -30,15 +30,20 @@ Most codebase-analysis tools produce a proprietary graph database, an AI-specifi
 
 See [`docs/specification.md`](docs/specification.md) for the full project specification, including how `okf-rs` compares to other tools in this space, and [`ROADMAP.md`](ROADMAP.md) for what's shipped and what's next.
 
-## Features (Phase 1)
+## Features
 
 - **Repository scanning** — recursive, `.gitignore`-aware, with git-aware indexing and manifest detection (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`)
-- **Semantic extraction** for **Rust, Python, TypeScript, JavaScript, and Go** — packages, modules, types (structs/classes/enums/interfaces/traits), functions, and methods
+- **Semantic extraction** for **Rust, Python, TypeScript, JavaScript, and Go** — packages, modules, types (structs/classes/enums/interfaces/traits), functions, and methods, including public/private API-surface detection
 - **Relationship extraction** — imports, and a resolved call graph covering bare calls, `self.method()`, `Type::method()`, and `module::func()` forms across all five languages
 - **OKF bundle generation** — markdown + YAML frontmatter, cross-linked, with `index.md` navigation at every level
 - **Validation** — frontmatter/schema checks, dangling-link detection, orphan detection, and duplicate-identity checks (both path collisions and same-symbol-different-file)
 - **Search** — ranked free-text search by symbol, package, module, type, and tag
+- **Graph queries** — callers/callees, call-graph cycle detection, cross-module dependencies, and shortest call path
+- **Bundle diffing** — compare a project's concepts between two git refs without touching your working tree
+- **AI agent integration** — `okf-rs init` writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md`, idempotently
 - **Standalone binary** — no runtime dependency beyond the OS's standard C library; see [Packaging & Distribution](docs/specification.md#packaging--distribution)
+
+See [`ROADMAP.md`](ROADMAP.md) for what's shipped (Phase 1 complete, Phase 2 in progress) and what's next.
 
 ## Installation
 
@@ -120,13 +125,15 @@ Commands:
   generate  Analyze a repository and write an OKF bundle
   validate  Validate that a directory is a conformant OKF bundle
   search    Search an OKF bundle by symbol, type, or tag
+  graph     Query the concept graph: callers, callees, cycles, public API, and cross-module dependencies
+  diff      Compare the OKF concepts between two git refs (added/removed/changed)
 ```
 
-Run `okf-rs <command> --help` for each command's options.
+Run `okf-rs <command> --help` for each command's options. `okf-rs graph` has its own subcommands (`callers`, `callees`, `cycles`, `api`, `modules`, `path`) — e.g. `okf-rs graph callers functions/src/auth/verify_token` lists everything that calls it, and `okf-rs graph cycles` flags any call-graph cycles. `okf-rs diff <ref-a> <ref-b>` compares two git refs' concepts without touching your working tree (it uses a temporary `git worktree` checkout for each ref). `okf-rs init` also writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md` to point AI coding agents at the bundle — pass `--no-agent-files` to skip that.
 
 ## Architecture
 
-`okf-rs` is a Cargo workspace of small, single-purpose crates under [`crates/`](crates/); `okf-cli` is a thin wrapper over the rest, so the same logic can be embedded by other Rust tools. See the [Architecture section](docs/specification.md#proposed-architecture) of the specification for the full crate-by-crate breakdown, including crates not yet built (`okf-lsp`, `okf-graph`, `okf-mcp`, `okf-server`, `okf-watch` — see [`ROADMAP.md`](ROADMAP.md)).
+`okf-rs` is a Cargo workspace of small, single-purpose crates under [`crates/`](crates/); `okf-cli` is a thin wrapper over the rest, so the same logic can be embedded by other Rust tools. See the [Architecture section](docs/specification.md#proposed-architecture) of the specification for the full crate-by-crate breakdown, including crates not yet built (`okf-lsp`, `okf-mcp`, `okf-server`, `okf-watch` — see [`ROADMAP.md`](ROADMAP.md)).
 
 ## Contributing
 

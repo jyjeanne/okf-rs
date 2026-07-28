@@ -3,6 +3,8 @@
 //! per-kind directories, with an `index.md` at the bundle root and at each
 //! directory.
 
+mod agents;
+
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use okf_parser::{Concept, ConceptKind, RelationKind};
@@ -10,6 +12,8 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
+
+pub use agents::write_agent_entrypoints;
 
 #[derive(Serialize)]
 struct Frontmatter {
@@ -21,6 +25,12 @@ struct Frontmatter {
     resource: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
+    /// Only emitted for non-public concepts, so a bundle where everything
+    /// is public (the common case) stays uncluttered; absence of the
+    /// field means public, matching the natural reading of a knowledge
+    /// base entry as something worth exposing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visibility: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<DateTime<Utc>>,
 }
@@ -101,6 +111,11 @@ fn render_concept(
         description: concept.description.clone(),
         resource: concept.location.to_string(),
         tags: concept.tags.clone(),
+        visibility: if concept.is_public {
+            None
+        } else {
+            Some("private")
+        },
         timestamp: concept.timestamp,
     };
     let yaml = serde_yaml::to_string(&frontmatter)?;
@@ -225,6 +240,7 @@ mod tests {
             },
             signature: Some(format!("fn {name}()")),
             tags: Vec::new(),
+            is_public: true,
             timestamp: None,
             relationships: Vec::new(),
         }
@@ -300,5 +316,21 @@ mod tests {
         let b = concept(ConceptKind::Function, "run", "run", "src/b.rs");
         let err = write_bundle(&[a, b], dir.path()).unwrap_err();
         assert!(err.to_string().contains("duplicate concept id"));
+    }
+
+    #[test]
+    fn omits_visibility_for_public_and_marks_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let public = concept(ConceptKind::Function, "run", "run", "src/a.rs");
+        let mut private = concept(ConceptKind::Function, "helper", "helper", "src/a.rs");
+        private.is_public = false;
+
+        write_bundle(&[public, private], dir.path()).unwrap();
+
+        let public_content = fs::read_to_string(dir.path().join("functions/run.md")).unwrap();
+        assert!(!public_content.contains("visibility"));
+
+        let private_content = fs::read_to_string(dir.path().join("functions/helper.md")).unwrap();
+        assert!(private_content.contains("visibility: private"));
     }
 }

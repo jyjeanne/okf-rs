@@ -100,7 +100,7 @@ impl fmt::Display for ConceptKind {
 }
 
 /// The kind of relationship between two concepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RelationKind {
     Imports,
     Calls,
@@ -169,6 +169,16 @@ pub struct Concept {
     pub location: Location,
     pub signature: Option<String>,
     pub tags: Vec<String>,
+    /// Whether this concept is part of the project's public API surface.
+    /// Detected per language: Rust's `pub` modifier (any `pub`/`pub(...)`
+    /// variant); Go's exported-identifier convention (leading uppercase);
+    /// Python/JavaScript/TypeScript's leading-underscore-is-private
+    /// convention. The JS/TS and Python rules are conventions, not
+    /// language guarantees (unlike Rust's `pub` or Go's capitalization),
+    /// so treat this as a heuristic for those three until real `export`
+    /// tracking lands. `Module` and `Package` concepts are always public
+    /// — they're structural, not something a language marks private.
+    pub is_public: bool,
     /// Last-modified time, if it can be derived deterministically from
     /// source control (e.g. the git commit date of the file). `None` when
     /// no such source is available — okf-rs never stamps concepts with the

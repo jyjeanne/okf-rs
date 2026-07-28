@@ -1,0 +1,10 @@
+[package]
+name = "okf-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cross-module, ownership, API-surface, and cycle queries over an okf-rs concept graph"
+
+[dependencies]
+okf-parser.workspace = true

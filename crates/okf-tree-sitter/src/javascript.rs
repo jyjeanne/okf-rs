@@ -79,4 +79,17 @@ class Bar {
         let extraction = extract(src, "src/bar.js").unwrap();
         assert!(extraction.calls.iter().any(|c| c.callee_name == "helper"));
     }
+
+    #[test]
+    fn detects_underscore_convention_visibility() {
+        let src = r#"
+function publicFn() {}
+function _privateFn() {}
+"#;
+        let extraction = extract(src, "src/foo.js").unwrap();
+        let find = |name: &str| extraction.concepts.iter().find(|c| c.name == name).unwrap();
+
+        assert!(find("publicFn").is_public);
+        assert!(!find("_privateFn").is_public);
+    }
 }

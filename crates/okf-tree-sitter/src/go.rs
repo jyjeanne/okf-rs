@@ -1,6 +1,6 @@
 use crate::common::{
-    import_relationship, location, make_concept, module_path, node_text, smallest_containing,
-    strip_quotes,
+    import_relationship, is_public_by_go_convention, location, make_concept, module_path,
+    node_text, smallest_containing, strip_quotes,
 };
 use crate::{CallCandidate, FileExtraction};
 use anyhow::Context;
@@ -65,6 +65,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
             end_line: source.lines().count().max(1),
         },
         None,
+        true,
     );
 
     let query = Query::new(&ts_lang, QUERY_SRC).context("invalid Go query")?;
@@ -111,26 +112,30 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         }
 
         if let (Some(def), Some(name)) = (struct_def, struct_name) {
-            let qualified = format!("{}.{}", module, node_text(source, name));
+            let name_text = node_text(source, name);
+            let qualified = format!("{}.{}", module, name_text);
             concepts.push(make_concept(
                 ConceptKind::Struct,
                 Language::Go,
-                node_text(source, name),
+                name_text,
                 &qualified,
                 location(relative_path, def),
                 Some(type_signature(source, def)),
+                is_public_by_go_convention(name_text),
             ));
         }
 
         if let (Some(def), Some(name)) = (interface_def, interface_name) {
-            let qualified = format!("{}.{}", module, node_text(source, name));
+            let name_text = node_text(source, name);
+            let qualified = format!("{}.{}", module, name_text);
             concepts.push(make_concept(
                 ConceptKind::Interface,
                 Language::Go,
-                node_text(source, name),
+                name_text,
                 &qualified,
                 location(relative_path, def),
                 Some(type_signature(source, def)),
+                is_public_by_go_convention(name_text),
             ));
         }
 
@@ -144,6 +149,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 &qualified,
                 location(relative_path, def),
                 Some(signature_before_body(source, def)),
+                is_public_by_go_convention(fn_name_text),
             );
             function_spans.push((concept.id.clone(), def.byte_range()));
             concepts.push(concept);
@@ -166,6 +172,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 &qualified,
                 location(relative_path, def),
                 Some(signature_before_body(source, def)),
+                is_public_by_go_convention(method_name_text),
             );
             function_spans.push((concept.id.clone(), def.byte_range()));
             concepts.push(concept);
@@ -289,5 +296,25 @@ func Run(f *Foo) {
 
         assert_eq!(extraction.calls.len(), 1);
         assert_eq!(extraction.calls[0].callee_name, "Helper");
+    }
+
+    #[test]
+    fn detects_exported_identifier_convention() {
+        let src = r#"
+package pkg
+
+type Public struct{}
+type private struct{}
+
+func Exported() {}
+func unexported() {}
+"#;
+        let extraction = extract(src, "pkg/x.go").unwrap();
+        let find = |name: &str| extraction.concepts.iter().find(|c| c.name == name).unwrap();
+
+        assert!(find("Public").is_public);
+        assert!(!find("private").is_public);
+        assert!(find("Exported").is_public);
+        assert!(!find("unexported").is_public);
     }
 }

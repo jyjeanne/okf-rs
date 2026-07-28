@@ -4,8 +4,8 @@
 //! lacks).
 
 use crate::common::{
-    import_relationship, location, make_concept, module_path, node_text, smallest_containing,
-    strip_quotes,
+    import_relationship, is_public_by_underscore_convention, location, make_concept, module_path,
+    node_text, smallest_containing, strip_quotes,
 };
 use crate::{CallCandidate, FileExtraction};
 use anyhow::{Context, Result};
@@ -82,6 +82,7 @@ pub fn extract(
             end_line: source.lines().count().max(1),
         },
         None,
+        true,
     );
 
     let mut query_src = format!(
@@ -134,26 +135,30 @@ pub fn extract(
         }
 
         if let (Some(def), Some(name)) = (interface_def, interface_name) {
-            let qualified = format!("{}.{}", module, node_text(source, name));
+            let name_text = node_text(source, name);
+            let qualified = format!("{}.{}", module, name_text);
             concepts.push(make_concept(
                 ConceptKind::Interface,
                 language,
-                node_text(source, name),
+                name_text,
                 &qualified,
                 location(relative_path, def),
                 Some(signature_before_body(source, def)),
+                is_public_by_underscore_convention(name_text),
             ));
         }
 
         if let (Some(def), Some(name)) = (class_def, class_name) {
-            let qualified = format!("{}.{}", module, node_text(source, name));
+            let name_text = node_text(source, name);
+            let qualified = format!("{}.{}", module, name_text);
             concepts.push(make_concept(
                 ConceptKind::Class,
                 language,
-                node_text(source, name),
+                name_text,
                 &qualified,
                 location(relative_path, def),
                 Some(signature_before_body(source, def)),
+                is_public_by_underscore_convention(name_text),
             ));
         }
 
@@ -167,6 +172,7 @@ pub fn extract(
                 &qualified,
                 location(relative_path, def),
                 Some(signature_before_body(source, def)),
+                is_public_by_underscore_convention(fn_name_text),
             );
             function_spans.push((concept.id.clone(), def.byte_range()));
             concepts.push(concept);
@@ -189,6 +195,7 @@ pub fn extract(
                     &qualified,
                     location(relative_path, def),
                     Some(signature_before_body(source, def)),
+                    is_public_by_underscore_convention(method_name_text),
                 );
                 function_spans.push((concept.id.clone(), def.byte_range()));
                 concepts.push(concept);

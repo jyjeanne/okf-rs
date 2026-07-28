@@ -1,6 +1,6 @@
 mod config;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use okf_core::Project;
 use okf_parser::ConceptKind;
@@ -29,6 +29,10 @@ enum Command {
         /// Bundle output directory to record as the project default.
         #[arg(short, long, default_value = "knowledge")]
         output: PathBuf,
+        /// Skip writing/updating CLAUDE.md, AGENTS.md, and
+        /// .github/copilot-instructions.md.
+        #[arg(long)]
+        no_agent_files: bool,
     },
     /// Recursively scan a repository and report what would be analyzed.
     Scan {
@@ -63,6 +67,59 @@ enum Command {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+    /// Query the concept graph: callers, callees, cycles, public API, and
+    /// cross-module dependencies. Re-analyzes the project fresh each run
+    /// (relationships aren't yet serialized into the bundle on disk).
+    Graph {
+        #[command(subcommand)]
+        query: GraphQuery,
+    },
+    /// Compare the OKF concepts between two git refs (added/removed/changed).
+    Diff {
+        from_ref: String,
+        to_ref: String,
+        /// Project directory to diff, relative to the git repository root.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphQuery {
+    /// List concepts that directly call the given concept id.
+    Callers {
+        id: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// List concepts the given concept id directly calls.
+    Callees {
+        id: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// List groups of concepts that call each other in a cycle.
+    Cycles {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// List the public API surface (public functions/methods/types).
+    Api {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// List cross-module dependency edges (which modules call into which).
+    Modules {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Find the shortest call path between two concept ids.
+    Path {
+        from: String,
+        to: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -78,7 +135,11 @@ fn main() -> ExitCode {
 
 fn run(command: Command) -> Result<ExitCode> {
     match command {
-        Command::Init { path, output } => cmd_init(&path, &output),
+        Command::Init {
+            path,
+            output,
+            no_agent_files,
+        } => cmd_init(&path, &output, no_agent_files),
         Command::Scan { path } => cmd_scan(&path),
         Command::Generate { path, output } => cmd_generate(&path, output),
         Command::Validate {
@@ -91,6 +152,12 @@ fn run(command: Command) -> Result<ExitCode> {
             bundle,
             project,
         } => cmd_search(&query, bundle, &project),
+        Command::Graph { query } => cmd_graph(query),
+        Command::Diff {
+            from_ref,
+            to_ref,
+            path,
+        } => cmd_diff(&from_ref, &to_ref, &path),
     }
 }
 
@@ -104,7 +171,11 @@ fn resolve_bundle_arg(project_root: &std::path::Path, explicit: Option<PathBuf>)
     explicit.unwrap_or_else(|| project_root.join(config::load(project_root).output))
 }
 
-fn cmd_init(path: &std::path::Path, output: &std::path::Path) -> Result<ExitCode> {
+fn cmd_init(
+    path: &std::path::Path,
+    output: &std::path::Path,
+    no_agent_files: bool,
+) -> Result<ExitCode> {
     let project = Project::load(path)?;
     let config_path = config::write_default(&project.root, output)?;
     println!(
@@ -113,6 +184,15 @@ fn cmd_init(path: &std::path::Path, output: &std::path::Path) -> Result<ExitCode
         project.files.len()
     );
     println!("Wrote {}", config_path.display());
+
+    if !no_agent_files {
+        let output_display = output.display().to_string();
+        let agent_files = okf_generator::write_agent_entrypoints(&project.root, &output_display)?;
+        for file in agent_files {
+            println!("Wrote {}", file.display());
+        }
+    }
+
     Ok(ExitCode::SUCCESS)
 }
 
@@ -213,5 +293,241 @@ fn cmd_search(query: &str, bundle: Option<PathBuf>, project: &std::path::Path) -
             hit.score, hit.entry.title, hit.entry.concept_type, hit.entry.id
         );
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn analyze_path(path: &std::path::Path) -> Result<okf_analyzer::AnalysisResult> {
+    let project = Project::load(path)?;
+    okf_analyzer::analyze(&project)
+}
+
+fn require_concept<'a>(
+    graph: &okf_graph::Graph<'a>,
+    id: &str,
+) -> Result<&'a okf_parser::Concept, ExitCode> {
+    match graph.get(id) {
+        Some(concept) => Ok(concept),
+        None => {
+            eprintln!("error: no concept with id `{id}` (use `okf-rs search` to find valid ids)");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
+    match query {
+        GraphQuery::Callers { id, path } => {
+            let result = analyze_path(&path)?;
+            let graph = okf_graph::Graph::build(&result.concepts);
+            let Ok(_) = require_concept(&graph, &id) else {
+                return Ok(ExitCode::FAILURE);
+            };
+            let callers = graph.callers(&id);
+            if callers.is_empty() {
+                println!("No callers found for `{id}`");
+            }
+            for caller in callers {
+                println!("{} — {}", caller.id, caller.frontmatter_type());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        GraphQuery::Callees { id, path } => {
+            let result = analyze_path(&path)?;
+            let graph = okf_graph::Graph::build(&result.concepts);
+            let Ok(_) = require_concept(&graph, &id) else {
+                return Ok(ExitCode::FAILURE);
+            };
+            let callees = graph.callees(&id);
+            if callees.is_empty() {
+                println!(
+                    "`{id}` doesn't call anything (or only calls unresolved/ambiguous targets)"
+                );
+            }
+            for callee in callees {
+                println!("{} — {}", callee.id, callee.frontmatter_type());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        GraphQuery::Cycles { path } => {
+            let result = analyze_path(&path)?;
+            let graph = okf_graph::Graph::build(&result.concepts);
+            let cycles = graph.cycles();
+            if cycles.is_empty() {
+                println!("No cycles found in the call graph");
+            }
+            for cycle in cycles {
+                println!("{}", cycle.join(" -> "));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        GraphQuery::Api { path } => {
+            let result = analyze_path(&path)?;
+            let graph = okf_graph::Graph::build(&result.concepts);
+            let api = graph.public_api();
+            println!("{} public concepts:", api.len());
+            for concept in api {
+                println!("  {:<12} {}", concept.frontmatter_type(), concept.id);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        GraphQuery::Modules { path } => {
+            let result = analyze_path(&path)?;
+            let graph = okf_graph::Graph::build(&result.concepts);
+            let deps = graph.module_dependencies();
+            if deps.is_empty() {
+                println!("No cross-module call dependencies found");
+            }
+            for (from, to) in deps {
+                println!("{from} -> {to}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        GraphQuery::Path { from, to, path } => {
+            let result = analyze_path(&path)?;
+            let graph = okf_graph::Graph::build(&result.concepts);
+            let Ok(_) = require_concept(&graph, &from) else {
+                return Ok(ExitCode::FAILURE);
+            };
+            let Ok(_) = require_concept(&graph, &to) else {
+                return Ok(ExitCode::FAILURE);
+            };
+            match graph.shortest_call_path(&from, &to) {
+                Some(steps) => {
+                    println!("{}", steps.join(" -> "));
+                    Ok(ExitCode::SUCCESS)
+                }
+                None => {
+                    println!("No call path found from `{from}` to `{to}`");
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
+    }
+}
+
+/// A `git worktree` checkout of a specific ref, non-destructively created
+/// alongside the repository (never touching the caller's working tree)
+/// and always removed on drop, whether or not analysis succeeded.
+struct WorktreeCheckout {
+    repo_root: std::path::PathBuf,
+    worktree_path: std::path::PathBuf,
+}
+
+impl WorktreeCheckout {
+    fn new(repo_root: &std::path::Path, git_ref: &str) -> Result<Self> {
+        let base = std::env::temp_dir().join(format!(
+            "okf-rs-diff-{}-{}",
+            std::process::id(),
+            fastrand_suffix()
+        ));
+        let status = std::process::Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(&base)
+            .arg(git_ref)
+            .current_dir(repo_root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .context("failed to run `git worktree add`")?;
+        if !status.success() {
+            anyhow::bail!("`git worktree add` failed for ref `{git_ref}` — is it a valid ref?");
+        }
+        Ok(WorktreeCheckout {
+            repo_root: repo_root.to_path_buf(),
+            worktree_path: base,
+        })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.worktree_path
+    }
+}
+
+impl Drop for WorktreeCheckout {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.worktree_path)
+            .current_dir(&self.repo_root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// A short, unique-enough suffix for scratch directory names, without
+/// pulling in a dedicated random/uuid dependency for one call site.
+fn fastrand_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+fn git_repo_root(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .context("failed to run `git rev-parse --show-toplevel`")?;
+    if !output.status.success() {
+        anyhow::bail!("{} is not inside a git repository", path.display());
+    }
+    let root = String::from_utf8(output.stdout)
+        .context("git output was not valid UTF-8")?
+        .trim()
+        .to_string();
+    Ok(std::path::PathBuf::from(root))
+}
+
+fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<ExitCode> {
+    let repo_root = git_repo_root(path)?;
+    let canonical_path = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let relative_project = canonical_path
+        .strip_prefix(&repo_root)
+        .unwrap_or(std::path::Path::new("."));
+
+    let from_checkout = WorktreeCheckout::new(&repo_root, from_ref)?;
+    let from_result = analyze_path(&from_checkout.path().join(relative_project))?;
+
+    let to_checkout = WorktreeCheckout::new(&repo_root, to_ref)?;
+    let to_result = analyze_path(&to_checkout.path().join(relative_project))?;
+
+    let report = okf_analyzer::diff(&from_result.concepts, &to_result.concepts);
+
+    if report.is_empty() {
+        println!("No concept-level changes between {from_ref} and {to_ref}");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if !report.added.is_empty() {
+        println!("Added ({}):", report.added.len());
+        for concept in &report.added {
+            println!("  + {} — {}", concept.id, concept.frontmatter_type());
+        }
+    }
+    if !report.removed.is_empty() {
+        println!("Removed ({}):", report.removed.len());
+        for concept in &report.removed {
+            println!("  - {} — {}", concept.id, concept.frontmatter_type());
+        }
+    }
+    if !report.changed.is_empty() {
+        println!("Changed ({}):", report.changed.len());
+        for change in &report.changed {
+            println!("  ~ {} — {}", change.id, change.kind.as_str());
+            if change.before_signature != change.after_signature {
+                if let Some(before) = &change.before_signature {
+                    println!("      - {before}");
+                }
+                if let Some(after) = &change.after_signature {
+                    println!("      + {after}");
+                }
+            }
+        }
+    }
+
     Ok(ExitCode::SUCCESS)
 }

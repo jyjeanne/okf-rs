@@ -1,5 +1,6 @@
 use crate::common::{
-    import_relationship, location, make_concept, module_path, node_text, smallest_containing,
+    import_relationship, is_public_by_underscore_convention, location, make_concept, module_path,
+    node_text, smallest_containing,
 };
 use crate::{CallCandidate, FileExtraction};
 use anyhow::{Context, Result};
@@ -70,6 +71,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
             end_line: source.lines().count().max(1),
         },
         None,
+        true,
     );
 
     let query = Query::new(&ts_lang, QUERY_SRC).context("invalid Python query")?;
@@ -107,14 +109,16 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         }
 
         if let (Some(def), Some(name)) = (class_def, class_name) {
-            let qualified = format!("{}.{}", module, node_text(source, name));
+            let name_text = node_text(source, name);
+            let qualified = format!("{}.{}", module, name_text);
             concepts.push(make_concept(
                 ConceptKind::Class,
                 Language::Python,
-                node_text(source, name),
+                name_text,
                 &qualified,
                 location(relative_path, def),
                 Some(signature_before_body(source, def)),
+                is_public_by_underscore_convention(name_text),
             ));
         }
 
@@ -137,6 +141,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 &qualified,
                 location(relative_path, def),
                 Some(signature_before_body(source, def)),
+                is_public_by_underscore_convention(fn_name_text),
             );
             function_spans.push((concept.id.clone(), def.byte_range()));
             concepts.push(concept);
@@ -253,5 +258,30 @@ class Foo:
 "#;
         let extraction = extract(src, "foo.py").unwrap();
         assert!(extraction.calls.iter().any(|c| c.callee_name == "helper"));
+    }
+
+    #[test]
+    fn detects_underscore_convention_visibility() {
+        let src = r#"
+def public_fn():
+    pass
+
+def _private_fn():
+    pass
+
+class Foo:
+    def public_method(self):
+        pass
+
+    def _private_method(self):
+        pass
+"#;
+        let extraction = extract(src, "foo.py").unwrap();
+        let find = |name: &str| extraction.concepts.iter().find(|c| c.name == name).unwrap();
+
+        assert!(find("public_fn").is_public);
+        assert!(!find("_private_fn").is_public);
+        assert!(find("public_method").is_public);
+        assert!(!find("_private_method").is_public);
     }
 }
