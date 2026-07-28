@@ -54,7 +54,7 @@ Key characteristics of the OKF standard that "okf-rs" targets:
 - Git-aware indexing
 - Incremental updates
 - Ignore ".gitignore"
-- Workspace support
+- Workspace support (Cargo workspaces, npm/yarn workspaces, and other monorepos with multiple packages, aggregated into one bundle or one bundle per package)
 
 Supported ecosystems:
 
@@ -180,6 +180,35 @@ Only `type` is mandatory; `okf-rs` populates the remaining frontmatter fields (`
 
 ---
 
+### Validation
+
+Validate that a generated (or hand-edited) bundle is a conformant OKF bundle before it is committed, published, or consumed by an agent.
+
+`okf-rs validate` checks:
+
+- Every concept file has a valid YAML frontmatter block with the mandatory `type` field
+- Frontmatter values match expected types (e.g. `tags` is a list, `timestamp` is RFC 3339)
+- Markdown links between concepts resolve to files that exist in the bundle (no dangling references)
+- Every concept is reachable from an `index.md` (no orphaned files)
+- No duplicate concept identity (same source symbol emitted twice)
+- Bundle structure matches the OKF schema version declared for the project
+
+Validation is deterministic and fully offline, and is designed to run in CI (e.g. `okf-rs validate --ci`) to fail a pipeline on a broken or stale bundle.
+
+---
+
+### Bundle Diffing
+
+`okf-rs diff <ref-a> <ref-b>` compares the OKF bundle generated from two git refs (branches, tags, or commits) and reports:
+
+- Concepts added, removed, or changed (by frontmatter and/or body content)
+- Relationships added or removed (new/removed calls, imports, implementations)
+- Moved or renamed concepts (tracked via source location changes)
+
+This is primarily aimed at code review and CI: it lets a pull request show *knowledge*-level changes (new public API, removed function, changed call graph) rather than only line-level diffs, and lets agents watching a PR reason about what changed semantically.
+
+---
+
 ### Documentation Generation
 
 Generate documentation from the OKF bundle.
@@ -218,6 +247,8 @@ Example queries:
 - Find REST endpoints.
 - Find architectural violations.
 - List public APIs.
+
+The breadth of answerable queries grows with the roadmap: symbol, call-graph, and API-surface queries are available as soon as the MCP server ships (Phase 2); queries that depend on architecture extraction or REST-endpoint detection (e.g. "find architectural violations") become available once that analysis lands (Phase 3).
 
 ---
 
@@ -299,6 +330,22 @@ okf-rs/
 └── okf-watch
 ```
 
+| Crate | Responsibility |
+|---|---|
+| `okf-cli` | Command-line entry point (`init`, `scan`, `generate`, `validate`, `search`, `serve`, `diff`); thin wrapper over the library crates |
+| `okf-core` | Shared types (`Project`, `Bundle`, `Concept`), repository scanning, git-aware indexing, workspace resolution, bundle diffing |
+| `okf-parser` | Language-agnostic parsing abstraction shared by `okf-tree-sitter` and `okf-lsp` |
+| `okf-tree-sitter` | Per-language Tree-sitter grammars and symbol/relationship extraction |
+| `okf-lsp` | Optional LSP-backed enrichment (type resolution, precise cross-references) layered on top of Tree-sitter extraction |
+| `okf-analyzer` | Orchestrates parsing + extraction into a language-agnostic semantic model consumed by `okf-generator` and `okf-graph` |
+| `okf-graph` | Builds and queries the knowledge graph (cross-module links, ownership, API surface, cycle/dependency analysis) on top of the semantic model |
+| `okf-generator` | Emits the OKF bundle (markdown + YAML frontmatter, cross-links) and agent entry-point files (`CLAUDE.md`, `AGENTS.md`, `.github/copilot-instructions.md`) |
+| `okf-validator` | Validates bundle conformance to the OKF schema (see [Validation](#validation)) |
+| `okf-search` | Indexes and queries the bundle by symbol, package, module, type, API, relationship, and tag |
+| `okf-mcp` | Model Context Protocol server exposing the bundle/graph to AI agents |
+| `okf-server` | HTTP server for browsing, visualization, and serving the bundle/search/MCP endpoints |
+| `okf-watch` | Filesystem watcher for continuous re-indexing during local development |
+
 ---
 
 ## Design Principles
@@ -316,34 +363,48 @@ okf-rs/
 
 ## Roadmap
 
-### Phase 1
+Each phase builds strictly on the previous one's output; a feature is only listed once, in the phase where it first ships. Later phases assume everything in earlier phases already works.
 
-- CLI
-- Tree-sitter parsing
-- OKF generation
-- Validator
-- Search
+### Phase 1 — Foundations
 
-### Phase 2
+- `okf-cli` skeleton (`init`, `scan`, `generate`, `validate`, `search`)
+- Repository scanning: recursive walk, `.gitignore` handling, git-aware indexing, single-package workspace support
+- Tree-sitter parsing and core symbol extraction (packages, modules, types, functions) for an initial language set: **Rust, Python, TypeScript/JavaScript, Go**
+- Direct relationship extraction (imports, call graph) for the initial language set
+- OKF bundle generation (`okf-generator`): markdown + YAML frontmatter, cross-linked via markdown links — this is also where the base link-graph described in [Knowledge Graph](#knowledge-graph) is produced
+- Validator (`okf-validator`): schema conformance, frontmatter validity, link integrity — see [Validation](#validation)
+- Basic search (`okf-search`): by symbol, package, module, type, and tag (no relationship queries yet)
 
-- LSP integration
-- Incremental indexing
-- Graph generation
-- MCP server
+### Phase 2 — Depth & Integration
 
-### Phase 3
+- LSP integration (`okf-lsp`) to enrich/disambiguate symbols beyond what Tree-sitter alone can resolve
+- Incremental indexing: content-hash-based re-analysis of only changed files
+- Extended language coverage: Java, Kotlin, C#, C/C++, PHP, Swift
+- Multi-package workspace and monorepo aggregation
+- Graph queries (`okf-graph`): cross-module links, ownership, API surface, cycle/dependency analysis — built on top of the link-graph already present in the bundle since Phase 1
+- Relationship-aware search: extend Phase 1 search with "Relationship" and "API" queries backed by `okf-graph`
+- Bundle diffing (`okf-rs diff`) — see [Bundle Diffing](#bundle-diffing)
+- MCP server (`okf-mcp`) exposing symbol, call-graph, and API-surface queries
+- Agent entry-point generation: `CLAUDE.md`, `AGENTS.md`, `.github/copilot-instructions.md` (see [AI Agent Compatibility](#ai-agent-compatibility))
+- Basic documentation generation (Markdown, HTML) templated directly from the bundle — no LLM required
+- Continuous indexing in local development (`okf-watch`)
 
-- AI enrichment
-- Architecture extraction
-- Documentation generation
+### Phase 3 — Intelligence & Extended Output
+
+- Optional AI enrichment: function summaries, module descriptions, architecture explanations, usage examples, glossary entries
+- Architecture extraction: architectural layers, domain boundaries, design patterns
+- REST endpoint, database model, and event-flow detection (feeds the architecture-dependent MCP queries noted in [MCP Server](#mcp-server))
 - DITA export
+- PDF export
 
-### Phase 4
+### Phase 4 — Ecosystem
 
-- IDE plugins
-- Continuous indexing
-- Distributed knowledge server
-- Visualization
+- IDE plugins (VS Code, JetBrains) consuming the bundle and `okf-mcp`
+- Distributed knowledge server (`okf-server`): multi-repository, organization-wide serving
+- Visualization: interactive graph explorer over `okf-server`
+- Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
+
+Language ecosystems not yet scheduled in a phase (DITA XML as a *source* format, for example) remain future work and are tracked separately from the DITA *export* format above.
 
 ---
 
