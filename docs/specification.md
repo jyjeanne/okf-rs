@@ -358,6 +358,52 @@ okf-rs/
 
 ---
 
+## Comparison with Other Tools
+
+Two projects address adjacent problems and are worth situating "okf-rs" against. This comparison is based on public information about each project as of July 2026 and may evolve as both projects do.
+
+### okf-rs vs. okf-generator
+
+[okf-generator](https://github.com/UmairBaig8/okf-generator) is a Python, tree-sitter-based tool that also targets the Open Knowledge Format, extending OKF v0.1 with schema versioning and typed relationships. It supports 18 languages plus 17 dependency-manifest formats, offers optional LSP enrichment, a D3.js visualization dashboard, and can export training data for model fine-tuning.
+
+| | okf-rs | okf-generator |
+|---|---|---|
+| Implementation | Rust | Python |
+| Performance model | Native binary, parallel analysis by design | Interpreted; incremental re-parse via SHA256 manifests |
+| Output format | Canonical OKF bundle (markdown + YAML frontmatter, `type`-only required field) | OKF v0.1 extended with custom schema-versioning and relationship typing |
+| Core extraction | Deterministic, offline, no LLM required | Deterministic, offline, no LLM required for core extraction |
+| Optional enrichment | LSP + optional LLM enrichment layer | LSP enrichment (4 language servers) + multi-provider LLM routing |
+| Distribution | Reusable Rust library + CLI, embeddable in other tools | Standalone CLI/toolchain |
+| Agent integration | Native MCP server (`okf-mcp`) plus generated `CLAUDE.md`/`AGENTS.md` entry points | Bundle is agent-readable; no dedicated MCP server described |
+| Visualization | Planned, via `okf-server` | Included (self-contained D3.js dashboard) |
+
+okf-generator is the closer relative in spirit — both aim to stay within the OKF spec rather than replace it. "okf-rs" differentiates mainly on runtime characteristics (a native, parallel Rust core versus an interpreted Python pipeline) and on being designed from the outset as an embeddable library plus a first-class MCP server, rather than primarily a standalone CLI.
+
+### okf-rs vs. Graphify
+
+Graphify is a commercial/YC-backed tool that converts a codebase (including SQL schemas, docs, PDFs, and other assets) into a queryable knowledge graph, using tree-sitter parsing locally and integrating with many AI coding assistants (Claude Code, Cursor, Codex, Gemini CLI, opencode, and others). Its public marketing material reports figures (GitHub star counts, language coverage) that vary between sources, so they are treated here as directional rather than verified.
+
+| | okf-rs | Graphify |
+|---|---|---|
+| Output format | Open, spec-compliant OKF bundle — plain markdown files, git-diffable, readable in any editor | Proprietary `graph.json` graph plus a custom git merge driver to reconcile parallel commits |
+| Openness | Format is the artifact: any OKF-aware tool can read/write it without going through Graphify's tooling | Graph structure and merge tooling are Graphify-specific; interoperability depends on their format |
+| Determinism | Core extraction is deterministic and reproducible for identical source | Relationships are tagged `EXTRACTED`, `INFERRED`, or `AMBIGUOUS` — part of the graph is model-inferred, not purely deterministic |
+| Storage model | Bundle lives in the repository as ordinary files, versioned by git natively | Graph committed to the repo, but requires a post-commit hook and a custom merge driver to stay consistent |
+| Business model | Open-source library + CLI, offline-first, no account required | Hosted/commercial product with local parsing component |
+| Agent integration | MCP server + convention files (`CLAUDE.md`, `AGENTS.md`) | MCP-style "skill" integration across 20+ assistants |
+
+The practical trade-off: Graphify optimizes for a rich, queryable graph with confidence-scored, partly LLM-inferred edges and broad multi-assistant packaging; "okf-rs" optimizes for staying inside an open, vendor-neutral, git-native format where every artifact is a plain file anyone can read, diff, and reproduce deterministically without depending on Graphify's runtime, merge driver, or hosted components.
+
+### Summary of advantages
+
+- **Standards-based, not proprietary** — the output is a conformant OKF bundle, not a tool-specific graph format.
+- **Deterministic core** — identical source produces identical output, with AI enrichment layered on top as an explicit, optional step rather than mixed into the base graph.
+- **Native performance** — a Rust core avoids the interpreter overhead of Python-based alternatives and the runtime dependency of hosted/graph-database-backed tools.
+- **No lock-in** — bundles are plain files in the repository; no proprietary merge driver, hosted service, or account is required to produce or consume them.
+- **Library-first** — usable as an embeddable Rust crate, not just a CLI, so other Rust tools can build on `okf-core`/`okf-analyzer` directly.
+
+---
+
 ## Why okf-rs?
 
 Current repository analysis tools generally produce proprietary graphs, Markdown summaries, or AI-specific context.
@@ -371,3 +417,4 @@ Its combination of native Rust performance, deterministic analysis, incremental 
 ## References
 
 - Google Cloud Blog — [How the Open Knowledge Format can improve data sharing](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing?hl=en)
+- [okf-generator](https://github.com/UmairBaig8/okf-generator) — Python/tree-sitter implementation extending OKF v0.1
