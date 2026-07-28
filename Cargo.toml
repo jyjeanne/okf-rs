@@ -11,6 +11,7 @@ members = [
     "crates/okf-graph",
     "crates/okf-mcp",
     "crates/okf-watch",
+    "crates/okf-docs",
     "crates/okf-cli",
 ]
 
@@ -30,6 +31,7 @@ okf-validator = { path = "crates/okf-validator" }
 okf-search = { path = "crates/okf-search" }
 okf-graph = { path = "crates/okf-graph" }
 okf-watch = { path = "crates/okf-watch" }
+okf-docs = { path = "crates/okf-docs" }
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

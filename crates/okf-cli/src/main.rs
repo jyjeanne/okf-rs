@@ -103,6 +103,28 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Generate human-readable documentation from a previously generated OKF
+    /// bundle: either a browsable static HTML site, or a single consolidated
+    /// Markdown document.
+    Docs {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+        /// Output path: a directory for `--format html`, a file for
+        /// `--format markdown`. Defaults to `docs/` or `docs.md` respectively.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(short, long, value_enum, default_value_t = DocsFormat::Html)]
+        format: DocsFormat,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DocsFormat {
+    Html,
+    Markdown,
 }
 
 #[derive(Subcommand)]
@@ -206,6 +228,12 @@ fn run(command: Command) -> Result<ExitCode> {
             to_ref,
             path,
         } => cmd_diff(&from_ref, &to_ref, &path),
+        Command::Docs {
+            bundle,
+            project,
+            output,
+            format,
+        } => cmd_docs(bundle, &project, output, format),
     }
 }
 
@@ -550,6 +578,38 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             }
         }
     }
+}
+
+fn cmd_docs(
+    bundle: Option<PathBuf>,
+    project: &std::path::Path,
+    output: Option<PathBuf>,
+    format: DocsFormat,
+) -> Result<ExitCode> {
+    let concepts = load_graph_concepts(bundle, project)?;
+    match format {
+        DocsFormat::Html => {
+            let output = output.unwrap_or_else(|| PathBuf::from("docs"));
+            okf_docs::generate_html(&concepts, &output)?;
+            println!(
+                "Generated HTML documentation for {} concepts into {}",
+                concepts.len(),
+                output.display()
+            );
+        }
+        DocsFormat::Markdown => {
+            let output = output.unwrap_or_else(|| PathBuf::from("docs.md"));
+            let markdown = okf_docs::generate_markdown(&concepts);
+            std::fs::write(&output, markdown)
+                .with_context(|| format!("failed to write {}", output.display()))?;
+            println!(
+                "Generated Markdown documentation for {} concepts into {}",
+                concepts.len(),
+                output.display()
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// A `git worktree` checkout of a specific ref, non-destructively created

@@ -532,6 +532,7 @@ dependencies = [
  "clap",
  "okf-analyzer",
  "okf-core",
+ "okf-docs",
  "okf-generator",
  "okf-graph",
  "okf-parser",
@@ -550,6 +551,15 @@ dependencies = [
  "okf-parser",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "okf-docs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "okf-parser",
+ "tempfile",
 ]
 
 [[package]]
