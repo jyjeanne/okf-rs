@@ -17,6 +17,7 @@ pub enum Language {
     TypeScript,
     JavaScript,
     Go,
+    Java,
 }
 
 impl Language {
@@ -28,6 +29,7 @@ impl Language {
             Language::TypeScript => "TypeScript",
             Language::JavaScript => "JavaScript",
             Language::Go => "Go",
+            Language::Java => "Java",
         }
     }
 
@@ -39,6 +41,7 @@ impl Language {
             "ts" | "tsx" => Some(Language::TypeScript),
             "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
             "go" => Some(Language::Go),
+            "java" => Some(Language::Java),
             _ => None,
         }
     }
@@ -52,6 +55,7 @@ impl Language {
             "TypeScript" => Some(Language::TypeScript),
             "JavaScript" => Some(Language::JavaScript),
             "Go" => Some(Language::Go),
+            "Java" => Some(Language::Java),
             _ => None,
         }
     }

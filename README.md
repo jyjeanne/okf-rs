@@ -33,8 +33,8 @@ See [`docs/specification.md`](docs/specification.md) for the full project specif
 ## Features
 
 - **Repository scanning** — recursive, `.gitignore`-aware, with git-aware indexing and manifest detection (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`)
-- **Semantic extraction** for **Rust, Python, TypeScript, JavaScript, and Go** — packages, modules, types (structs/classes/enums/interfaces/traits), functions, and methods, including public/private API-surface detection
-- **Relationship extraction** — imports, and a resolved call graph covering bare calls, `self.method()`, `Type::method()`, and `module::func()` forms across all five languages
+- **Semantic extraction** for **Rust, Python, TypeScript, JavaScript, Go, and Java** — packages, modules, types (structs/classes/enums/interfaces/traits), functions, and methods, including public/private API-surface detection
+- **Relationship extraction** — imports, and a resolved call graph covering bare calls, `self.method()`/`this.method()`, `Type::method()`/`Type.method()`, and `module::func()` forms across all six languages
 - **OKF bundle generation** — markdown + YAML frontmatter, cross-linked, with `index.md` navigation at every level
 - **Incremental indexing** — `okf-rs generate` caches each file's extraction by content hash, so a re-run only re-parses what actually changed
 - **Validation** — frontmatter/schema checks, dangling-link detection, orphan detection, and duplicate-identity checks (both path collisions and same-symbol-different-file)

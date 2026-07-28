@@ -11,6 +11,7 @@
 
 mod common;
 mod go;
+mod java;
 mod javascript;
 mod jsish;
 mod python;
@@ -57,5 +58,6 @@ pub fn extract_file(file: &SourceFile) -> Result<FileExtraction> {
         Language::TypeScript => typescript::extract(&source, &file.relative_path),
         Language::JavaScript => javascript::extract(&source, &file.relative_path),
         Language::Go => go::extract(&source, &file.relative_path),
+        Language::Java => java::extract(&source, &file.relative_path),
     }
 }
