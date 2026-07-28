@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/okf-core",
+    "crates/okf-parser",
+    "crates/okf-tree-sitter",
+    "crates/okf-analyzer",
+    "crates/okf-generator",
+    "crates/okf-validator",
+    "crates/okf-search",
+    "crates/okf-graph",
+    "crates/okf-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jyjeanne/okf-rs"
+
+[workspace.dependencies]
+okf-core = { path = "crates/okf-core" }
+okf-parser = { path = "crates/okf-parser" }
+okf-tree-sitter = { path = "crates/okf-tree-sitter" }
+okf-analyzer = { path = "crates/okf-analyzer" }
+okf-generator = { path = "crates/okf-generator" }
+okf-validator = { path = "crates/okf-validator" }
+okf-search = { path = "crates/okf-search" }
+okf-graph = { path = "crates/okf-graph" }
+
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+walkdir = "2"
+ignore = "0.4"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Tuned for distributing `okf-rs` as a single standalone release binary:
+# strip debug info, and optimize aggressively since this is a build users
+# download and run, not a crate iterated on locally.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
