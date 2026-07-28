@@ -52,22 +52,32 @@ pub struct FileExtraction {
     pub calls: Vec<CallCandidate>,
 }
 
-/// Parses `file` and extracts its concepts and call candidates.
+/// Parses `file` and extracts its concepts and call candidates, reading its
+/// contents from disk itself. Prefer [`extract_source`] when the caller
+/// already has the file's contents in hand (e.g. to compute a content
+/// hash) — reading it again here would cost a redundant disk read, and
+/// risks the two reads observing different content if the file is
+/// modified concurrently.
 pub fn extract_file(file: &SourceFile) -> Result<FileExtraction> {
     let source = fs::read_to_string(&file.absolute_path)
         .with_context(|| format!("failed to read {}", file.relative_path))?;
+    extract_source(&source, file)
+}
 
+/// Extracts concepts and call candidates from `source`, already read by the
+/// caller — see [`extract_file`] for the disk-reading convenience wrapper.
+pub fn extract_source(source: &str, file: &SourceFile) -> Result<FileExtraction> {
     match file.language {
-        Language::Rust => rust::extract(&source, &file.relative_path),
-        Language::Python => python::extract(&source, &file.relative_path),
-        Language::TypeScript => typescript::extract(&source, &file.relative_path),
-        Language::JavaScript => javascript::extract(&source, &file.relative_path),
-        Language::Go => go::extract(&source, &file.relative_path),
-        Language::Java => java::extract(&source, &file.relative_path),
-        Language::CSharp => csharp::extract(&source, &file.relative_path),
-        Language::Php => php::extract(&source, &file.relative_path),
-        Language::Kotlin => kotlin::extract(&source, &file.relative_path),
-        Language::Cpp => cpp::extract(&source, &file.relative_path),
-        Language::Swift => swift::extract(&source, &file.relative_path),
+        Language::Rust => rust::extract(source, &file.relative_path),
+        Language::Python => python::extract(source, &file.relative_path),
+        Language::TypeScript => typescript::extract(source, &file.relative_path),
+        Language::JavaScript => javascript::extract(source, &file.relative_path),
+        Language::Go => go::extract(source, &file.relative_path),
+        Language::Java => java::extract(source, &file.relative_path),
+        Language::CSharp => csharp::extract(source, &file.relative_path),
+        Language::Php => php::extract(source, &file.relative_path),
+        Language::Kotlin => kotlin::extract(source, &file.relative_path),
+        Language::Cpp => cpp::extract(source, &file.relative_path),
+        Language::Swift => swift::extract(source, &file.relative_path),
     }
 }

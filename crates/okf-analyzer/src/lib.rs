@@ -92,7 +92,7 @@ pub fn analyze_with_cache(
             }
             None => {
                 stats.reparsed += 1;
-                okf_tree_sitter::extract_file(file)
+                okf_tree_sitter::extract_source(&source, file)
                     .with_context(|| format!("failed to analyze {}", file.relative_path))?
             }
         };
@@ -252,6 +252,18 @@ fn relationship_set(concept: &Concept) -> std::collections::BTreeSet<(RelationKi
 /// is nothing to name the concept after.
 fn detect_packages(project: &Project) -> Result<Vec<Concept>> {
     let mut packages = Vec::new();
+
+    // How many manifests share each directory -- almost always one, but a
+    // directory can legitimately hold more than one manifest kind (e.g. a
+    // Rust crate with an npm-based docs build alongside it), in which case
+    // the directory alone no longer uniquely identifies a package below.
+    let mut dir_counts: HashMap<&str, usize> = HashMap::new();
+    for pkg_root in &project.packages {
+        *dir_counts
+            .entry(pkg_root.relative_dir.as_str())
+            .or_default() += 1;
+    }
+
     for pkg_root in &project.packages {
         let manifest_dir = if pkg_root.relative_dir.is_empty() {
             project.root.clone()
@@ -260,25 +272,50 @@ fn detect_packages(project: &Project) -> Result<Vec<Concept>> {
         };
         let manifest_path = manifest_dir.join(pkg_root.manifest.file_name());
 
-        let (name, language) = match pkg_root.manifest {
-            ManifestKind::Cargo => (read_cargo_name(&manifest_path)?, Language::Rust),
-            ManifestKind::Npm => (read_npm_name(&manifest_path)?, Language::JavaScript),
-            ManifestKind::PyProject => (read_pyproject_name(&manifest_path)?, Language::Python),
-            ManifestKind::GoModule => (read_gomod_name(&manifest_path)?, Language::Go),
+        let language = match pkg_root.manifest {
+            ManifestKind::Cargo => Language::Rust,
+            ManifestKind::Npm => Language::JavaScript,
+            ManifestKind::PyProject => Language::Python,
+            ManifestKind::GoModule => Language::Go,
         };
-        let Some(name) = name else {
-            continue;
+        // A manifest that fails to read or parse is skipped rather than
+        // aborting analysis of the whole project -- one malformed or
+        // mid-edit manifest shouldn't take every other, valid package in
+        // the workspace down with it.
+        let name = match pkg_root.manifest {
+            ManifestKind::Cargo => read_cargo_name(&manifest_path),
+            ManifestKind::Npm => read_npm_name(&manifest_path),
+            ManifestKind::PyProject => read_pyproject_name(&manifest_path),
+            ManifestKind::GoModule => read_gomod_name(&manifest_path),
+        };
+        let name = match name {
+            Ok(Some(name)) => name,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!(
+                    "warning: skipping unreadable manifest {}: {e:#}",
+                    manifest_path.display()
+                );
+                continue;
+            }
         };
 
         // A single-package project keeps exactly the id it always had
         // (just the package name); a member of a multi-package workspace
         // is identified by its directory instead, since names alone
         // aren't guaranteed unique across ecosystems, but a filesystem
-        // path always is.
+        // path always is -- unless more than one manifest kind shares
+        // that directory, in which case the manifest kind is appended too
+        // so the two don't collide on the same id.
         let qualified_name = if pkg_root.relative_dir.is_empty() {
             name.clone()
         } else {
-            pkg_root.relative_dir.replace('/', ".")
+            let dir_id = pkg_root.relative_dir.replace('/', ".");
+            if dir_counts[pkg_root.relative_dir.as_str()] > 1 {
+                format!("{dir_id}.{}", pkg_root.manifest.short_tag())
+            } else {
+                dir_id
+            }
         };
         let file = if pkg_root.relative_dir.is_empty() {
             pkg_root.manifest.file_name().to_string()
@@ -723,5 +760,81 @@ mod tests {
                 .any(|r| r.kind == RelationKind::MemberOf && r.target == package_a.id),
             "crate b's module must not be linked to package a"
         );
+    }
+
+    #[test]
+    fn two_manifest_kinds_in_the_same_directory_get_distinct_package_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/docgen\"]\n",
+        )
+        .unwrap();
+        let member = dir.path().join("crates/docgen");
+        fs::create_dir_all(member.join("src")).unwrap();
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"docgen\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(member.join("package.json"), r#"{"name": "docgen-web"}"#).unwrap();
+        fs::write(member.join("src/lib.rs"), "pub fn hello() {}").unwrap();
+
+        let project = Project::load(dir.path()).unwrap();
+        let result = analyze(&project).unwrap();
+
+        let packages: Vec<&Concept> = result
+            .concepts
+            .iter()
+            .filter(|c| c.kind == ConceptKind::Package)
+            .collect();
+        assert_eq!(packages.len(), 2, "{packages:?}");
+        assert_ne!(
+            packages[0].id, packages[1].id,
+            "two different manifest kinds sharing a directory must not collide on id"
+        );
+    }
+
+    #[test]
+    fn a_malformed_manifest_does_not_abort_analysis_of_sibling_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("crates/a/src")).unwrap();
+        // Truncated table header: fails to parse as TOML.
+        fs::write(
+            dir.path().join("crates/a/Cargo.toml"),
+            "[package\nname = \"a\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("crates/a/src/lib.rs"), "pub fn a_fn() {}").unwrap();
+
+        fs::create_dir_all(dir.path().join("crates/b/src")).unwrap();
+        fs::write(
+            dir.path().join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("crates/b/src/lib.rs"), "pub fn b_fn() {}").unwrap();
+
+        let project = Project::load(dir.path()).unwrap();
+        let result = analyze(&project).expect("a bad manifest must not abort the whole analysis");
+
+        let packages: Vec<&Concept> = result
+            .concepts
+            .iter()
+            .filter(|c| c.kind == ConceptKind::Package)
+            .collect();
+        assert_eq!(
+            packages.len(),
+            1,
+            "only the valid crate b should get a Package concept: {packages:?}"
+        );
+        assert_eq!(packages[0].name, "b");
+        assert!(result.concepts.iter().any(|c| c.name == "a_fn"));
+        assert!(result.concepts.iter().any(|c| c.name == "b_fn"));
     }
 }

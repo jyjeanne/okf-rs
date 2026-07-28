@@ -40,7 +40,13 @@ fn main() -> Result<()> {
     let mut stdout = io::stdout();
 
     for line in stdin.lock().lines() {
-        let line = line?;
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                eprintln!("okf-mcp: failed to read request line: {e}");
+                continue;
+            }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;

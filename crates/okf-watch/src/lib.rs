@@ -84,14 +84,24 @@ pub fn watch(
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }
         }
-        regenerate_once(
+        // A transient failure here (e.g. a file deleted between the
+        // directory scan and its read, racing an in-progress edit) must
+        // not end the watch session -- only the initial baseline
+        // regenerate above is allowed to fail the whole call, matching
+        // this function's documented contract of running until
+        // interrupted. `cache`/`last_ids` are left untouched by a failed
+        // attempt (they're only updated after `analyze_with_cache`
+        // succeeds), so the next successful regenerate picks up cleanly.
+        if let Err(e) = regenerate_once(
             project_root,
             bundle_output,
             cache_path,
             &mut cache,
             &mut last_ids,
             &mut on_regenerate,
-        )?;
+        ) {
+            eprintln!("okf-rs watch: regenerate failed, will retry on the next change: {e:#}");
+        }
     }
 }
 

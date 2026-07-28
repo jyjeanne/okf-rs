@@ -38,6 +38,16 @@ a:hover { text-decoration: underline; }
 </style>
 "#;
 
+/// Basename (no extension) used for the per-kind directory listing page,
+/// e.g. `modules/@index.html`. Deliberately not `index`: a concept's own
+/// slug can legitimately be the literal text `index` (e.g. a root-level
+/// `index.js`, whose module id becomes `modules/index` -- see
+/// `okf_tree_sitter::common::module_path`), which would otherwise collide
+/// with this page at the exact same path and get silently overwritten.
+/// `@` can't appear in an extracted identifier in any supported language,
+/// so this can never collide with a real concept id.
+const DIR_INDEX_NAME: &str = "@index";
+
 const RELATIONSHIP_HEADINGS: [(RelationKind, &str); 7] = [
     (RelationKind::Imports, "Imports"),
     (RelationKind::Calls, "Calls"),
@@ -89,7 +99,7 @@ pub fn generate_html(concepts: &[Concept], output_dir: &Path) -> Result<()> {
 }
 
 /// Relative link from the page for `from_pseudo_id` (a concept id, or
-/// `"<dir>/index"` / `"index"` for an index page) to `to_pseudo_id`.
+/// `"<dir>/{DIR_INDEX_NAME}"` / `"index"` for an index page) to `to_pseudo_id`.
 /// Always correct (walks up to the site root and back down), though not
 /// always the shortest possible path — the same trade-off
 /// `okf-generator`'s own `relative_link` makes for the markdown bundle.
@@ -123,7 +133,7 @@ fn render_concept_html(concept: &Concept, all: &[Concept], bundle_ids: &HashSet<
     let type_label = escape_html(&concept.frontmatter_type());
     let home = relative_link(&concept.id, "index");
     let kind_dir = concept.kind.bundle_dir();
-    let kind_index = relative_link(&concept.id, &format!("{kind_dir}/index"));
+    let kind_index = relative_link(&concept.id, &format!("{kind_dir}/{DIR_INDEX_NAME}"));
 
     let mut body = String::new();
     body.push_str(&format!(
@@ -229,7 +239,7 @@ fn render_link_section(body: &mut String, heading: &str, members: &[&Concept], f
 }
 
 fn write_dir_index_html(output_dir: &Path, dir: &str, entries: &[&Concept]) -> Result<()> {
-    let pseudo_id = format!("{dir}/index");
+    let pseudo_id = format!("{dir}/{DIR_INDEX_NAME}");
     let home = relative_link(&pseudo_id, "index");
     let title = capitalize(dir);
 
@@ -248,7 +258,7 @@ fn write_dir_index_html(output_dir: &Path, dir: &str, entries: &[&Concept]) -> R
     body.push_str("</ul>\n");
 
     fs::write(
-        output_dir.join(dir).join("index.html"),
+        output_dir.join(dir).join(format!("{DIR_INDEX_NAME}.html")),
         html_page(&title, &body),
     )?;
     Ok(())
@@ -258,7 +268,7 @@ fn write_root_index_html(output_dir: &Path, by_dir: &BTreeMap<&str, Vec<&Concept
     let mut body = String::from("<h1>Knowledge Base</h1>\n<ul>\n");
     for (dir, entries) in by_dir {
         body.push_str(&format!(
-            "<li><a href=\"{dir}/index.html\">{}</a> ({})</li>\n",
+            "<li><a href=\"{dir}/{DIR_INDEX_NAME}.html\">{}</a> ({})</li>\n",
             escape_html(&capitalize(dir)),
             entries.len()
         ));
@@ -414,8 +424,8 @@ mod tests {
         generate_html(&concepts, dir.path()).unwrap();
 
         assert!(dir.path().join("index.html").exists());
-        assert!(dir.path().join("modules/index.html").exists());
-        assert!(dir.path().join("functions/index.html").exists());
+        assert!(dir.path().join("modules/@index.html").exists());
+        assert!(dir.path().join("functions/@index.html").exists());
         assert!(dir.path().join("modules/auth.html").exists());
         assert!(dir.path().join("functions/auth/verify_token.html").exists());
 
@@ -501,5 +511,25 @@ mod tests {
 
         let markdown = generate_markdown(&[caller]);
         assert!(markdown.contains("**Calls:** b"));
+    }
+
+    #[test]
+    fn a_module_whose_id_is_literally_index_does_not_collide_with_the_directory_index() {
+        // A root-level `index.js`-style file collapses to the module id
+        // `modules/index` (see `okf_tree_sitter::common::module_path`),
+        // which used to be exactly the same output path as the
+        // `modules/` directory's own listing page.
+        let module = concept(ConceptKind::Module, "index", "index", "index.js");
+        let dir = tempfile::tempdir().unwrap();
+        generate_html(&[module], dir.path()).unwrap();
+
+        let module_page = fs::read_to_string(dir.path().join("modules/index.html")).unwrap();
+        assert!(
+            module_page.contains("<h1>index</h1>"),
+            "the module's own page must not be overwritten by the directory index: {module_page}"
+        );
+
+        let dir_index = fs::read_to_string(dir.path().join("modules/@index.html")).unwrap();
+        assert!(dir_index.contains("Modules"));
     }
 }

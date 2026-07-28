@@ -3,10 +3,13 @@
 //! hasn't changed since the cache was last saved.
 //!
 //! Purely a performance optimization: a cache miss just costs a re-parse,
-//! never a correctness issue, so the hash doesn't need to be portable or
-//! stable across okf-rs/toolchain versions the way the bundle's own
-//! output does — the bundle's determinism guarantee depends only on
-//! source content, never on cache state.
+//! never a correctness issue. The content hash itself doesn't need to be
+//! portable or stable across okf-rs versions -- but the *extraction logic*
+//! a hit reuses does need to match the running build, or an upgrade that
+//! fixes an extractor bug would silently keep serving the old, pre-fix
+//! output for every unchanged file. `AnalysisCache::load` guards against
+//! that by stamping (and checking) the okf-rs version that wrote the
+//! cache, invalidating it wholesale on a version mismatch.
 
 use okf_tree_sitter::FileExtraction;
 use serde::{Deserialize, Serialize};
@@ -15,12 +18,17 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
+/// The okf-rs version stamped into a saved cache -- see the module docs.
+const CACHE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// A saved (or in-progress) cache, keyed by each file's project-relative
 /// path. Serializes with keys in sorted order (`BTreeMap`), so the cache
 /// file itself is stable to diff across runs rather than shuffling on
 /// every save the way a `HashMap`'s iteration order would.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalysisCache {
+    #[serde(default)]
+    version: String,
     entries: BTreeMap<String, CacheEntry>,
 }
 
@@ -31,20 +39,29 @@ struct CacheEntry {
 }
 
 impl AnalysisCache {
-    /// Loads a previously saved cache from `path`. A missing file, or one
-    /// that fails to read or parse (e.g. left over from an incompatible
-    /// okf-rs version), is the normal non-fatal case and falls back to an
-    /// empty cache rather than erroring — every file is simply treated as
-    /// a cache miss and re-parsed.
+    /// Loads a previously saved cache from `path`. A missing file, one
+    /// that fails to read or parse, or one saved by a different okf-rs
+    /// version than this build, is the normal non-fatal case and falls
+    /// back to an empty cache rather than erroring — every file is simply
+    /// treated as a cache miss and re-parsed (with this build's own
+    /// extraction logic, never a stale one from whatever version wrote
+    /// the file being discarded).
     pub fn load(path: &Path) -> AnalysisCache {
-        std::fs::read_to_string(path)
+        let cache: AnalysisCache = std::fs::read_to_string(path)
             .ok()
             .and_then(|content| serde_json::from_str(&content).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if cache.version == CACHE_VERSION {
+            cache
+        } else {
+            AnalysisCache::default()
+        }
     }
 
-    /// Persists the cache to `path` as JSON.
-    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+    /// Persists the cache to `path` as JSON, stamped with this build's
+    /// okf-rs version (see the module docs).
+    pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
+        self.version = CACHE_VERSION.to_string();
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
@@ -124,6 +141,26 @@ mod tests {
             "hash mismatch should miss"
         );
         assert!(loaded.get("src/other.rs", 42).is_none());
+    }
+
+    #[test]
+    fn a_cache_saved_by_a_different_okf_rs_version_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".okf-cache.json");
+
+        std::fs::write(
+            &path,
+            r#"{"version":"0.0.0-not-this-build","entries":{"src/lib.rs":{"content_hash":42,"extraction":{"concepts":[],"calls":[]}}}}"#,
+        )
+        .unwrap();
+
+        let loaded = AnalysisCache::load(&path);
+        assert_eq!(
+            loaded.len(),
+            0,
+            "a cache stamped with a different okf-rs version must be treated as empty, \
+             not silently reused"
+        );
     }
 
     #[test]

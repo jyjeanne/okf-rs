@@ -39,6 +39,19 @@ impl ManifestKind {
         }
     }
 
+    /// A short, filesystem/id-safe tag identifying this manifest kind,
+    /// used to disambiguate two `Package` concepts that would otherwise
+    /// collide on the same directory (e.g. a Rust crate with an npm-based
+    /// docs build alongside it).
+    pub fn short_tag(&self) -> &'static str {
+        match self {
+            ManifestKind::Cargo => "cargo",
+            ManifestKind::Npm => "npm",
+            ManifestKind::PyProject => "pyproject",
+            ManifestKind::GoModule => "gomod",
+        }
+    }
+
     const ALL: [ManifestKind; 4] = [
         ManifestKind::Cargo,
         ManifestKind::Npm,

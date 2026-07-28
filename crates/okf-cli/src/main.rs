@@ -354,7 +354,13 @@ fn cmd_watch(
     output: Option<PathBuf>,
     debounce_ms: u64,
 ) -> Result<ExitCode> {
-    let project_root = Project::load(path)?.root;
+    // Just the canonicalized root is needed here -- `okf_watch::watch`
+    // does its own full `Project::load` scan for the baseline regenerate,
+    // so doing another one here first would walk the whole directory
+    // tree twice before the first bundle is even produced.
+    let project_root = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve project root {}", path.display()))?;
     let output = resolve_bundle_arg(&project_root, output);
     let cache_path = project_root.join(CACHE_FILE);
 
