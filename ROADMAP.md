@@ -7,7 +7,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase | Status |
 |---|---|
 | Phase 1 — Foundations | ✅ Complete |
-| Phase 2 — Depth & Integration | 🟡 In progress (6/11) |
+| Phase 2 — Depth & Integration | 🟡 In progress (7/11) |
 | Phase 3 — Intelligence & Extended Output | ⬜ Not started |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
@@ -45,7 +45,7 @@ Verified by dogfooding: running `okf-rs generate .` on this repository itself pr
 - [ ] Multi-package workspace and monorepo aggregation
 - [x] MCP server (`okf-mcp`) exposing symbol, call-graph, and API-surface queries — a stdio JSON-RPC 2.0 server implementing MCP's `initialize`/`tools/list`/`tools/call`, wrapping `okf-search` and `okf-graph` (via `okf_parser::read_bundle`) as the `search`, `graph_callers`, `graph_callees`, `graph_api`, `graph_cycles`, `graph_modules`, and `graph_path` tools
 - [ ] Basic documentation generation (Markdown, HTML) templated directly from the bundle — no LLM required
-- [ ] Continuous indexing in local development (`okf-watch`)
+- [x] Continuous indexing in local development (`okf-watch`) — `okf-rs watch` regenerates the bundle once immediately, then again each time a burst of filesystem activity (recursive, via `notify`) settles for a debounce period (`--debounce-ms`, default 300ms), reusing the exact same `.okf-cache.json` incremental cache `generate` does. Reports a regenerate only when something actually changed (a file was reparsed, or the concept id set differs from the last reported run) — a wakeup from unrelated churn under an ignored path (e.g. `target/` mid-`cargo build`) still costs a cheap `.gitignore`-aware re-scan and a harmless, byte-identical bundle rewrite, but isn't reported, so watch mode doesn't spam the terminal
 
 Verified by dogfooding: `okf-rs graph api .` on this repository lists 71 public concepts, `okf-rs graph cycles .` correctly finds none, `okf-rs graph modules .` shows real cross-crate dependency edges, and `okf-rs diff <commit> <commit> .` against this repo's own history correctly reports added/changed functions using non-destructive worktrees (verified the working tree and branch were untouched afterward, including on an invalid-ref error path).
 
@@ -57,10 +57,13 @@ Verified by dogfooding: on this repository (22 source files), a cold `okf-rs gen
 
 Java support verified end-to-end against a small standalone sample (a `package`-scoped class with a public/private method pair): `okf-rs scan` recognizes `.java` files, `okf-rs generate` extracts the class and both methods with a resolved `Calls` edge between them, `okf-rs validate` reports the bundle clean, `okf-rs search` finds the method by name, and `okf-rs graph callers` correctly reports the caller from the bundle's serialized relationships. C# support verified the same way against an equivalent `namespace`-scoped class.
 
+`okf-rs watch` verified against a scratch project: the startup (baseline) run reports immediately; appending a function to a watched file reports a regenerate with the new concept count and `reparsed > 0`; a bare `touch` of the same file (mtime bumped, content byte-identical) triggers a wakeup but is correctly silent, since the content hash is unchanged. `okf-watch`'s own test suite drives the real filesystem watcher (not a mock) end-to-end, additionally covering that deleting a file is reported even though nothing needs reparsing (caught via the concept-id-set check, not the reparse count) and that a burst of rapid edits coalesces into a single regenerate.
+
 **Known limitations:**
 - Public/private (`is_public`) detection is exact for Rust (`pub` modifier), Go (capitalization, the language's real rule), Java, and C# (`public` modifier — C#'s `internal`/`protected internal`/`private protected` are all folded into "private" for now, since `is_public` is a boolean), but a naming-convention heuristic (leading underscore) for Python/JavaScript/TypeScript, pending real `export`/access-modifier tracking.
 - Java's and C#'s per-file `Module` concept follows the same convention as every other language (one module per source file), not their actual package/namespace-spans-multiple-files model; a `package`/`namespace` declaration doesn't yet merge same-package/namespace files into one module concept.
 - The incremental cache speeds up `okf-rs generate` only; `okf-rs diff` still re-analyzes both git-worktree checkouts from scratch (a shared, path-relocatable cache across worktrees is possible future work, since the cache key is a repo-relative path + content hash, not an absolute path).
+- `okf-rs watch` watches the project root recursively at the OS level (via `notify`), not `.gitignore`-filtered at the watch itself — only the subsequent re-scan is `.gitignore`-aware. A very large, actively churning ignored directory (e.g. a `target/` mid-build) still triggers a debounce cycle and a cheap re-scan per burst, even though nothing gets reported; skipping the watch subscription for ignored paths entirely is possible future work.
 
 ## Phase 3 — Intelligence & Extended Output
 

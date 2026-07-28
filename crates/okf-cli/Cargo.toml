@@ -18,6 +18,7 @@ okf-generator.workspace = true
 okf-validator.workspace = true
 okf-search.workspace = true
 okf-graph.workspace = true
+okf-watch.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tempfile = "3"

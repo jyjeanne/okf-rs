@@ -37,6 +37,7 @@ See [`docs/specification.md`](docs/specification.md) for the full project specif
 - **Relationship extraction** — imports, and a resolved call graph covering bare calls, `self.method()`/`this.method()`, `Type::method()`/`Type.method()`, and `module::func()` forms across all seven languages
 - **OKF bundle generation** — markdown + YAML frontmatter, cross-linked, with `index.md` navigation at every level
 - **Incremental indexing** — `okf-rs generate` caches each file's extraction by content hash, so a re-run only re-parses what actually changed
+- **Watch mode** — `okf-rs watch` keeps a project's bundle up to date as files change, reusing the same incremental cache
 - **Validation** — frontmatter/schema checks, dangling-link detection, orphan detection, and duplicate-identity checks (both path collisions and same-symbol-different-file)
 - **Search** — ranked free-text search by symbol, package, module, type, and tag
 - **Graph queries** — callers/callees, call-graph cycle detection, cross-module dependencies, and shortest call path
@@ -124,17 +125,18 @@ Commands:
   init      Scan a project and write an `okf.toml` recording defaults for later commands
   scan      Recursively scan a repository and report what would be analyzed
   generate  Analyze a repository and write an OKF bundle
+  watch     Watch a project and keep its OKF bundle up to date as files change
   validate  Validate that a directory is a conformant OKF bundle
   search    Search an OKF bundle by symbol, type, or tag
   graph     Query the concept graph: callers, callees, cycles, public API, and cross-module dependencies
   diff      Compare the OKF concepts between two git refs (added/removed/changed)
 ```
 
-Run `okf-rs <command> --help` for each command's options. `okf-rs generate` persists a `.okf-cache.json` at the project root keyed by each file's content hash, so a re-run only re-parses files that actually changed since the last one (report line: `N files parsed, M reused from cache`); pass `--no-cache` to bypass it and re-parse everything (the bundle it produces is byte-identical either way — the cache only affects how long it takes). `okf-rs graph` has its own subcommands (`callers`, `callees`, `cycles`, `api`, `modules`, `path`) — e.g. `okf-rs graph callers functions/src/auth/verify_token` lists everything that calls it, and `okf-rs graph cycles` flags any call-graph cycles. Like `search` and `validate`, `graph` reads a previously generated bundle rather than re-analyzing the project, so run `okf-rs generate` first (and again after source changes). `okf-rs diff <ref-a> <ref-b>` compares two git refs' concepts without touching your working tree (it uses a temporary `git worktree` checkout for each ref). `okf-rs init` also writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md` to point AI coding agents at the bundle — pass `--no-agent-files` to skip that.
+Run `okf-rs <command> --help` for each command's options. `okf-rs generate` persists a `.okf-cache.json` at the project root keyed by each file's content hash, so a re-run only re-parses files that actually changed since the last one (report line: `N files parsed, M reused from cache`); pass `--no-cache` to bypass it and re-parse everything (the bundle it produces is byte-identical either way — the cache only affects how long it takes). `okf-rs watch` runs that same cycle continuously: it regenerates once immediately, then again each time a burst of filesystem activity settles (`--debounce-ms`, default 300), printing a line only when something actually changed — silent on a wakeup caused by unrelated churn (e.g. a background `cargo build` touching `target/`) — and keeps running until interrupted (Ctrl+C). `okf-rs graph` has its own subcommands (`callers`, `callees`, `cycles`, `api`, `modules`, `path`) — e.g. `okf-rs graph callers functions/src/auth/verify_token` lists everything that calls it, and `okf-rs graph cycles` flags any call-graph cycles. Like `search` and `validate`, `graph` reads a previously generated bundle rather than re-analyzing the project, so run `okf-rs generate` first (and again after source changes). `okf-rs diff <ref-a> <ref-b>` compares two git refs' concepts without touching your working tree (it uses a temporary `git worktree` checkout for each ref). `okf-rs init` also writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md` to point AI coding agents at the bundle — pass `--no-agent-files` to skip that.
 
 ## Architecture
 
-`okf-rs` is a Cargo workspace of small, single-purpose crates under [`crates/`](crates/); `okf-cli` is a thin wrapper over the rest, so the same logic can be embedded by other Rust tools. See the [Architecture section](docs/specification.md#proposed-architecture) of the specification for the full crate-by-crate breakdown, including crates not yet built (`okf-lsp`, `okf-server`, `okf-watch` — see [`ROADMAP.md`](ROADMAP.md)).
+`okf-rs` is a Cargo workspace of small, single-purpose crates under [`crates/`](crates/); `okf-cli` is a thin wrapper over the rest, so the same logic can be embedded by other Rust tools. See the [Architecture section](docs/specification.md#proposed-architecture) of the specification for the full crate-by-crate breakdown, including crates not yet built (`okf-lsp`, `okf-server` — see [`ROADMAP.md`](ROADMAP.md)).
 
 ### MCP server
 

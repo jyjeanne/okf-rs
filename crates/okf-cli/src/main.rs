@@ -51,6 +51,21 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
     },
+    /// Watch a project and keep its OKF bundle up to date as files change.
+    /// Runs until interrupted (Ctrl+C). Regenerates once immediately, then
+    /// again after each burst of filesystem activity settles, reusing the
+    /// same `.okf-cache.json` incremental-index cache `generate` does.
+    Watch {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Bundle output directory. Defaults to the value in `okf.toml`, or `knowledge`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// How long a quiet period must last, in milliseconds, before a
+        /// burst of filesystem events triggers a regenerate.
+        #[arg(long, default_value_t = 300)]
+        debounce_ms: u64,
+    },
     /// Validate that a directory is a conformant OKF bundle.
     Validate {
         /// Defaults to the value in `okf.toml`, or `knowledge`.
@@ -170,6 +185,11 @@ fn run(command: Command) -> Result<ExitCode> {
             output,
             no_cache,
         } => cmd_generate(&path, output, no_cache),
+        Command::Watch {
+            path,
+            output,
+            debounce_ms,
+        } => cmd_watch(&path, output, debounce_ms),
         Command::Validate {
             bundle,
             project,
@@ -285,6 +305,35 @@ fn cmd_generate(
     for (kind, count) in by_kind {
         println!("  {:<12} {count}", kind.as_str());
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_watch(
+    path: &std::path::Path,
+    output: Option<PathBuf>,
+    debounce_ms: u64,
+) -> Result<ExitCode> {
+    let project_root = Project::load(path)?.root;
+    let output = resolve_bundle_arg(&project_root, output);
+    let cache_path = project_root.join(CACHE_FILE);
+
+    println!(
+        "Watching {} for changes (bundle: {}, Ctrl+C to stop)...",
+        project_root.display(),
+        output.display()
+    );
+    okf_watch::watch(
+        &project_root,
+        &output,
+        &cache_path,
+        std::time::Duration::from_millis(debounce_ms),
+        |event| {
+            println!(
+                "Regenerated {} concepts ({} files parsed, {} reused from cache)",
+                event.concepts, event.stats.reparsed, event.stats.reused
+            );
+        },
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 

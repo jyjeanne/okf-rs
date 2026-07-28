@@ -1,0 +1,17 @@
+[package]
+name = "okf-watch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Continuous re-indexing during local development for okf-rs"
+
+[dependencies]
+okf-core.workspace = true
+okf-analyzer.workspace = true
+okf-generator.workspace = true
+anyhow.workspace = true
+notify = "6"
+
+[dev-dependencies]
+tempfile = "3"
