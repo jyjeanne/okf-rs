@@ -22,6 +22,7 @@ pub enum Language {
     Php,
     Kotlin,
     Cpp,
+    Swift,
 }
 
 impl Language {
@@ -38,6 +39,7 @@ impl Language {
             Language::Php => "PHP",
             Language::Kotlin => "Kotlin",
             Language::Cpp => "C++",
+            Language::Swift => "Swift",
         }
     }
 
@@ -59,6 +61,7 @@ impl Language {
             "c" | "h" | "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" => {
                 Some(Language::Cpp)
             }
+            "swift" => Some(Language::Swift),
             _ => None,
         }
     }
@@ -77,6 +80,7 @@ impl Language {
             "PHP" => Some(Language::Php),
             "Kotlin" => Some(Language::Kotlin),
             "C++" => Some(Language::Cpp),
+            "Swift" => Some(Language::Swift),
             _ => None,
         }
     }

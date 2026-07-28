@@ -20,6 +20,7 @@ mod kotlin;
 mod php;
 mod python;
 mod rust;
+mod swift;
 mod typescript;
 
 use anyhow::{Context, Result};
@@ -67,5 +68,6 @@ pub fn extract_file(file: &SourceFile) -> Result<FileExtraction> {
         Language::Php => php::extract(&source, &file.relative_path),
         Language::Kotlin => kotlin::extract(&source, &file.relative_path),
         Language::Cpp => cpp::extract(&source, &file.relative_path),
+        Language::Swift => swift::extract(&source, &file.relative_path),
     }
 }
