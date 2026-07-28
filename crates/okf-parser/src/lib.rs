@@ -21,6 +21,7 @@ pub enum Language {
     CSharp,
     Php,
     Kotlin,
+    Cpp,
 }
 
 impl Language {
@@ -36,10 +37,14 @@ impl Language {
             Language::CSharp => "C#",
             Language::Php => "PHP",
             Language::Kotlin => "Kotlin",
+            Language::Cpp => "C++",
         }
     }
 
-    /// Maps a file extension (without the leading dot) to a language, if recognized.
+    /// Maps a file extension (without the leading dot) to a language, if
+    /// recognized. `c`/`h` map to [`Language::Cpp`] too (see the module
+    /// docs on `okf-tree-sitter`'s `cpp` extractor for why one grammar
+    /// covers both).
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
             "rs" => Some(Language::Rust),
@@ -51,6 +56,9 @@ impl Language {
             "cs" => Some(Language::CSharp),
             "php" => Some(Language::Php),
             "kt" | "kts" => Some(Language::Kotlin),
+            "c" | "h" | "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" => {
+                Some(Language::Cpp)
+            }
             _ => None,
         }
     }
@@ -68,6 +76,7 @@ impl Language {
             "C#" => Some(Language::CSharp),
             "PHP" => Some(Language::Php),
             "Kotlin" => Some(Language::Kotlin),
+            "C++" => Some(Language::Cpp),
             _ => None,
         }
     }

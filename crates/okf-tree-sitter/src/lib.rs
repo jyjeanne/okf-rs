@@ -10,6 +10,7 @@
 //! `okf-analyzer`.
 
 mod common;
+mod cpp;
 mod csharp;
 mod go;
 mod java;
@@ -65,5 +66,6 @@ pub fn extract_file(file: &SourceFile) -> Result<FileExtraction> {
         Language::CSharp => csharp::extract(&source, &file.relative_path),
         Language::Php => php::extract(&source, &file.relative_path),
         Language::Kotlin => kotlin::extract(&source, &file.relative_path),
+        Language::Cpp => cpp::extract(&source, &file.relative_path),
     }
 }
