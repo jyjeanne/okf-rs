@@ -1,0 +1,91 @@
+name: Release
+
+# Builds standalone `okf-rs` CLI binaries for Linux, macOS, and Windows and
+# attaches them to the GitHub Release for the pushed tag. Triggered by
+# pushing a tag like `v0.1.0`.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive_ext: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+          rustup default stable
+
+      - name: Build release binary
+        run: cargo build --release --locked -p okf-cli --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          bin_dir=target/${{ matrix.target }}/release
+          name=okf-rs-${{ matrix.target }}
+          mkdir -p dist
+          tar -czf dist/${name}.tar.gz -C "$bin_dir" okf-rs
+
+      - name: Package (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: bash
+        run: |
+          bin_dir=target/${{ matrix.target }}/release
+          name=okf-rs-${{ matrix.target }}
+          mkdir -p dist
+          (cd "$bin_dir" && 7z a -tzip "${GITHUB_WORKSPACE}/dist/${name}.zip" okf-rs.exe)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: okf-rs-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

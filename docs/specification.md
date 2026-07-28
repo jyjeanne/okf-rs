@@ -281,6 +281,8 @@ The generated OKF remains valid even without AI enrichment.
 
 ## CLI
 
+The CLI is the primary, supported way to use `okf-rs` — see [Packaging & Distribution](#packaging--distribution) for how it ships as a standalone executable.
+
 Examples:
 
 ```
@@ -298,6 +300,24 @@ okf-rs serve
 
 okf-rs diff main feature/login
 ```
+
+---
+
+## Packaging & Distribution
+
+`okf-rs` is primarily distributed and used as a **standalone CLI executable**, not as a library that application code links against. The library crates (`okf-core`, `okf-analyzer`, `okf-generator`, …) exist so `okf-cli` itself stays a thin wrapper and so other Rust tools can embed the same logic (see [Library API](#library-api)), but the product a user downloads and runs is a single binary named `okf-rs`.
+
+Properties of that binary:
+
+- **Self-contained** — built from the `okf-cli` crate's `[[bin]]` target, it links only against the operating system's standard C library (e.g. `libc`, `libgcc_s`, `ld-linux` on Linux). It has no dependency on Cargo, rustc, a Tree-sitter runtime, or the source workspace at build time or run time — verified by building a release binary and running it, copied to an empty directory, against a project with no relation to the okf-rs repository.
+- **No installation step required** — `cp okf-rs /usr/local/bin/` (or the Windows/macOS equivalent) is sufficient; there is no separate runtime, interpreter, or shared-library bundle to install alongside it.
+- **Tuned release profile** — `[profile.release]` in the workspace `Cargo.toml` sets `strip = true`, `lto = true`, `codegen-units = 1`, and `panic = "abort"`, trading longer release-build times for a smaller, faster binary appropriate for something users download rather than iterate on locally.
+
+Distribution channels:
+
+- **Prebuilt binaries** — `.github/workflows/release.yml` builds and attaches release binaries for `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl` (fully static, no glibc dependency), `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc` to the GitHub Release whenever a `v*` tag is pushed.
+- **`cargo install`** — `cargo install --git https://github.com/jyjeanne/okf-rs okf-cli` builds the same standalone binary locally for any platform Rust supports, without needing the prebuilt-binary matrix to cover it.
+- **Package managers** (Homebrew, Scoop, `cargo-binstall`, Linux distro packages) are future work once the CLI's interface stabilizes past Phase 1.
 
 ---
 
