@@ -12,7 +12,8 @@ mod agents;
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use okf_parser::{Concept, ConceptKind, RelationKind};
+use okf_parser::{Concept, RelationKind};
+use okf_render::{capitalize, contains_members, group_by_kind_dir, relative_link};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -111,17 +112,7 @@ pub fn write_bundle(concepts: &[Concept], output_dir: &Path) -> Result<()> {
     }
 
     let bundle_ids: HashSet<&str> = concepts.iter().map(|c| c.id.as_str()).collect();
-
-    let mut by_dir: BTreeMap<&str, Vec<&Concept>> = BTreeMap::new();
-    for concept in concepts {
-        by_dir
-            .entry(concept.kind.bundle_dir())
-            .or_default()
-            .push(concept);
-    }
-    for entries in by_dir.values_mut() {
-        entries.sort_by(|a, b| a.id.cmp(&b.id));
-    }
+    let by_dir = group_by_kind_dir(concepts);
 
     fs::create_dir_all(output_dir)?;
 
@@ -141,16 +132,6 @@ pub fn write_bundle(concepts: &[Concept], output_dir: &Path) -> Result<()> {
     write_root_index(output_dir, &by_dir)?;
 
     Ok(())
-}
-
-/// Relative markdown link from the file at `from_pseudo_id` (a concept id,
-/// or `"<dir>/index"` / `"index"` for an index file) to `to_id`. Always
-/// correct (walks up to the bundle root and back down), though not always
-/// the shortest possible path.
-fn relative_link(from_pseudo_id: &str, to_id: &str) -> String {
-    let depth = from_pseudo_id.matches('/').count();
-    let up = "../".repeat(depth);
-    format!("{up}{to_id}.md")
 }
 
 fn render_concept(
@@ -183,34 +164,14 @@ fn render_concept(
         body.push_str("`\n\n");
     }
 
-    // A Module's members are every other concept declared in the same
-    // file; a Package's are every Module that named it in a `MemberOf`
-    // relationship (see `okf-analyzer`'s workspace/monorepo aggregation) —
-    // two different ways of finding "what's inside this container,"
-    // since only one of them (file identity) needs an explicit
-    // relationship to express.
-    let members: Vec<&Concept> = match concept.kind {
-        ConceptKind::Module => all
-            .iter()
-            .filter(|c| c.id != concept.id && c.location.file == concept.location.file)
-            .collect(),
-        ConceptKind::Package => all
-            .iter()
-            .filter(|c| {
-                c.relationships
-                    .iter()
-                    .any(|r| r.kind == RelationKind::MemberOf && r.target == concept.id)
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
+    let members = contains_members(concept, all);
     if !members.is_empty() {
         body.push_str("# Contains\n\n");
         for member in members {
             body.push_str(&format!(
                 "- [{}]({})\n",
                 member.name,
-                relative_link(&concept.id, &member.id)
+                relative_link(&concept.id, &member.id, "md")
             ));
         }
         body.push('\n');
@@ -240,7 +201,7 @@ fn render_concept(
                 body.push_str(&format!(
                     "- [{}]({})\n",
                     rel.target_display,
-                    relative_link(&concept.id, &rel.target)
+                    relative_link(&concept.id, &rel.target, "md")
                 ));
             } else {
                 body.push_str(&format!("- `{}`\n", rel.target_display));
@@ -259,7 +220,7 @@ fn write_dir_index(output_dir: &Path, dir: &str, entries: &[&Concept]) -> Result
         content.push_str(&format!(
             "- [{}]({}) — {}\n",
             concept.name,
-            relative_link(&pseudo_id, &concept.id),
+            relative_link(&pseudo_id, &concept.id, "md"),
             concept.frontmatter_type()
         ));
     }
@@ -279,14 +240,6 @@ fn write_root_index(output_dir: &Path, by_dir: &BTreeMap<&str, Vec<&Concept>>) -
     }
     fs::write(output_dir.join("index.md"), content)?;
     Ok(())
-}
-
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
 }
 
 #[cfg(test)]
@@ -499,7 +452,7 @@ mod tests {
         assert!(package_content.contains("# Contains"));
         assert!(package_content.contains(&format!(
             "[lib]({})",
-            relative_link(&package.id, &module.id)
+            relative_link(&package.id, &module.id, "md")
         )));
 
         let module_content = fs::read_to_string(dir.path().join("modules/lib.md")).unwrap();

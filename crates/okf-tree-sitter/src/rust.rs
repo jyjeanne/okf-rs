@@ -1,6 +1,6 @@
 use crate::common::{
-    import_relationship, location, make_concept, module_path, node_text, slugify,
-    smallest_containing,
+    import_relationship, location, make_concept, module_concept, module_path, node_text,
+    signature_before_body, slugify, smallest_containing,
 };
 use crate::{CallCandidate, FileExtraction};
 use anyhow::{Context, Result};
@@ -64,17 +64,6 @@ fn container_name<'a>(src: &'a str, function_node: Node) -> Option<Container<'a>
     }
 }
 
-fn signature_before_body(src: &str, def_node: Node) -> String {
-    let end = def_node
-        .child_by_field_name("body")
-        .map(|b| b.start_byte())
-        .unwrap_or(def_node.end_byte());
-    src[def_node.start_byte()..end]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn type_signature(src: &str, def_node: Node) -> String {
     let text = node_text(src, def_node);
     text.split(['{', ';'])
@@ -96,19 +85,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         .context("failed to parse Rust source")?;
 
     let module = module_path(relative_path);
-    let mut module_concept = make_concept(
-        ConceptKind::Module,
-        Language::Rust,
-        module.rsplit('.').next().unwrap_or(&module),
-        &module,
-        okf_parser::Location {
-            file: relative_path.to_string(),
-            start_line: 1,
-            end_line: source.lines().count().max(1),
-        },
-        None,
-        true,
-    );
+    let mut module_concept = module_concept(Language::Rust, relative_path, source);
 
     let query = Query::new(&ts_lang, QUERY_SRC).context("invalid Rust query")?;
     let mut cursor = QueryCursor::new();

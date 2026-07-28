@@ -6,9 +6,11 @@ members = [
     "crates/okf-tree-sitter",
     "crates/okf-analyzer",
     "crates/okf-generator",
+    "crates/okf-render",
     "crates/okf-validator",
     "crates/okf-search",
     "crates/okf-graph",
+    "crates/okf-query",
     "crates/okf-mcp",
     "crates/okf-watch",
     "crates/okf-docs",
@@ -27,9 +29,11 @@ okf-parser = { path = "crates/okf-parser" }
 okf-tree-sitter = { path = "crates/okf-tree-sitter" }
 okf-analyzer = { path = "crates/okf-analyzer" }
 okf-generator = { path = "crates/okf-generator" }
+okf-render = { path = "crates/okf-render" }
 okf-validator = { path = "crates/okf-validator" }
 okf-search = { path = "crates/okf-search" }
 okf-graph = { path = "crates/okf-graph" }
+okf-query = { path = "crates/okf-query" }
 okf-watch = { path = "crates/okf-watch" }
 okf-docs = { path = "crates/okf-docs" }
 

@@ -14,7 +14,8 @@
 //! calls, `this.Foo()`, `obj.Foo()`, and `ClassName.StaticFoo()`.
 
 use crate::common::{
-    import_relationship, location, make_concept, module_path, node_text, smallest_containing,
+    import_relationship, location, make_concept, module_concept, module_path, node_text,
+    signature_before_body, smallest_containing, type_signature,
 };
 use crate::{CallCandidate, FileExtraction};
 use anyhow::{Context, Result};
@@ -62,30 +63,6 @@ fn has_public_modifier(src: &str, def_node: Node) -> bool {
     is_public
 }
 
-fn signature_before_body(src: &str, def_node: Node) -> String {
-    let end = def_node
-        .child_by_field_name("body")
-        .map(|b| b.start_byte())
-        .unwrap_or(def_node.end_byte());
-    src[def_node.start_byte()..end]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// `class_declaration`/`struct_declaration`/`interface_declaration`/
-/// `enum_declaration` have no single field name usable across all four —
-/// truncating at the first `{` gives just the declaration line either way.
-fn type_signature(src: &str, def_node: Node) -> String {
-    let text = node_text(src, def_node);
-    text.split('{')
-        .next()
-        .unwrap_or(text)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
     let ts_lang: tree_sitter::Language = tree_sitter_c_sharp::LANGUAGE.into();
     let mut parser = Parser::new();
@@ -97,19 +74,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         .context("failed to parse C# source")?;
 
     let module = module_path(relative_path);
-    let mut module_concept = make_concept(
-        ConceptKind::Module,
-        Language::CSharp,
-        module.rsplit('.').next().unwrap_or(&module),
-        &module,
-        okf_parser::Location {
-            file: relative_path.to_string(),
-            start_line: 1,
-            end_line: source.lines().count().max(1),
-        },
-        None,
-        true,
-    );
+    let mut module_concept = module_concept(Language::CSharp, relative_path, source);
 
     let query = Query::new(&ts_lang, QUERY_SRC).context("invalid C# query")?;
     let mut cursor = QueryCursor::new();

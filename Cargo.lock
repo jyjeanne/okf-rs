@@ -534,9 +534,8 @@ dependencies = [
  "okf-core",
  "okf-docs",
  "okf-generator",
- "okf-graph",
  "okf-parser",
- "okf-search",
+ "okf-query",
  "okf-validator",
  "okf-watch",
  "tempfile",
@@ -559,6 +558,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "okf-parser",
+ "okf-render",
  "tempfile",
 ]
 
@@ -569,6 +569,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "okf-parser",
+ "okf-render",
  "serde",
  "serde_yaml",
  "tempfile",
@@ -587,9 +588,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "okf-core",
- "okf-graph",
- "okf-parser",
- "okf-search",
+ "okf-query",
  "serde_json",
  "tempfile",
 ]
@@ -604,6 +603,24 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "walkdir",
+]
+
+[[package]]
+name = "okf-query"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "okf-graph",
+ "okf-parser",
+ "okf-search",
+ "tempfile",
+]
+
+[[package]]
+name = "okf-render"
+version = "0.1.0"
+dependencies = [
+ "okf-parser",
 ]
 
 [[package]]

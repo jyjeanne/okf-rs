@@ -1,7 +1,6 @@
 //! Tool definitions and dispatch for the okf-mcp server: MCP's `tools/list`
-//! result and the implementation behind `tools/call`, both wrapping
-//! `okf-search`/`okf-graph`/`okf_parser::read_bundle` the same way
-//! `okf-rs search`/`graph` do from the CLI.
+//! result and the implementation behind `tools/call`, both wrapping the
+//! same `okf-query` layer `okf-rs search`/`graph` use from the CLI.
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -81,13 +80,17 @@ pub fn list() -> Vec<Value> {
 /// can react to, not a malformed request.
 pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
     match name {
-        "search" => search(arguments, bundle),
-        "graph_callers" => graph_callers(arguments, bundle),
-        "graph_callees" => graph_callees(arguments, bundle),
-        "graph_api" => graph_api(bundle),
-        "graph_cycles" => graph_cycles(bundle),
-        "graph_modules" => graph_modules(bundle),
-        "graph_path" => graph_path(arguments, bundle),
+        "search" => okf_query::search(bundle, &arg_str(arguments, "query")?),
+        "graph_callers" => okf_query::graph_callers(bundle, &arg_str(arguments, "id")?),
+        "graph_callees" => okf_query::graph_callees(bundle, &arg_str(arguments, "id")?),
+        "graph_api" => okf_query::graph_api(bundle),
+        "graph_cycles" => okf_query::graph_cycles(bundle),
+        "graph_modules" => okf_query::graph_modules(bundle),
+        "graph_path" => okf_query::graph_path(
+            bundle,
+            &arg_str(arguments, "from")?,
+            &arg_str(arguments, "to")?,
+        ),
         other => Err(anyhow!("unknown tool `{other}`")),
     }
 }
@@ -98,143 +101,6 @@ fn arg_str(arguments: &Value, key: &str) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| anyhow!("missing required argument `{key}`"))
-}
-
-fn require_bundle(bundle: &Path) -> Result<()> {
-    if bundle.is_dir() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "no bundle found at {} — run `okf-rs generate` first",
-            bundle.display()
-        ))
-    }
-}
-
-fn load_concepts(bundle: &Path) -> Result<Vec<okf_parser::Concept>> {
-    require_bundle(bundle)?;
-    okf_parser::read_bundle(bundle)
-}
-
-fn require_concept<'a>(graph: &okf_graph::Graph<'a>, id: &str) -> Result<()> {
-    if graph.get(id).is_some() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "no concept with id `{id}` (use the `search` tool to find valid ids)"
-        ))
-    }
-}
-
-fn search(arguments: &Value, bundle: &Path) -> Result<String> {
-    let query = arg_str(arguments, "query")?;
-    require_bundle(bundle)?;
-    let index = okf_search::SearchIndex::build(bundle)?;
-    let hits = index.search(&query);
-    if hits.is_empty() {
-        return Ok(format!("No matches for `{query}`."));
-    }
-    let mut out = String::new();
-    for hit in hits {
-        out.push_str(&format!(
-            "{:>3}  {:<24} {:<20} {}\n",
-            hit.score, hit.entry.title, hit.entry.concept_type, hit.entry.id
-        ));
-    }
-    Ok(out)
-}
-
-fn graph_callers(arguments: &Value, bundle: &Path) -> Result<String> {
-    let id = arg_str(arguments, "id")?;
-    let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
-    require_concept(&graph, &id)?;
-    let callers = graph.callers(&id);
-    if callers.is_empty() {
-        return Ok(format!("No callers found for `{id}`."));
-    }
-    Ok(concept_lines(&callers))
-}
-
-fn graph_callees(arguments: &Value, bundle: &Path) -> Result<String> {
-    let id = arg_str(arguments, "id")?;
-    let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
-    require_concept(&graph, &id)?;
-    let callees = graph.callees(&id);
-    if callees.is_empty() {
-        return Ok(format!(
-            "`{id}` doesn't call anything (or only calls unresolved/ambiguous targets)."
-        ));
-    }
-    Ok(concept_lines(&callees))
-}
-
-fn graph_api(bundle: &Path) -> Result<String> {
-    let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
-    let api = graph.public_api();
-    if api.is_empty() {
-        return Ok("No public concepts found.".to_string());
-    }
-    let mut out = format!("{} public concepts:\n", api.len());
-    for concept in api {
-        out.push_str(&format!(
-            "  {:<12} {}\n",
-            concept.frontmatter_type(),
-            concept.id
-        ));
-    }
-    Ok(out)
-}
-
-fn graph_cycles(bundle: &Path) -> Result<String> {
-    let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
-    let cycles = graph.cycles();
-    if cycles.is_empty() {
-        return Ok("No cycles found in the call graph.".to_string());
-    }
-    Ok(cycles
-        .into_iter()
-        .map(|cycle| cycle.join(" -> "))
-        .collect::<Vec<_>>()
-        .join("\n"))
-}
-
-fn graph_modules(bundle: &Path) -> Result<String> {
-    let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
-    let deps = graph.module_dependencies();
-    if deps.is_empty() {
-        return Ok("No cross-module call dependencies found.".to_string());
-    }
-    Ok(deps
-        .into_iter()
-        .map(|(from, to)| format!("{from} -> {to}"))
-        .collect::<Vec<_>>()
-        .join("\n"))
-}
-
-fn graph_path(arguments: &Value, bundle: &Path) -> Result<String> {
-    let from = arg_str(arguments, "from")?;
-    let to = arg_str(arguments, "to")?;
-    let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
-    require_concept(&graph, &from)?;
-    require_concept(&graph, &to)?;
-    match graph.shortest_call_path(&from, &to) {
-        Some(steps) => Ok(steps.join(" -> ")),
-        None => Ok(format!("No call path found from `{from}` to `{to}`.")),
-    }
-}
-
-fn concept_lines(concepts: &[&okf_parser::Concept]) -> String {
-    concepts
-        .iter()
-        .map(|c| format!("{} — {}", c.id, c.frontmatter_type()))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[cfg(test)]

@@ -4,8 +4,9 @@
 //! lacks).
 
 use crate::common::{
-    import_relationship, is_public_by_underscore_convention, location, make_concept, module_path,
-    node_text, smallest_containing, strip_quotes,
+    import_relationship, is_public_by_underscore_convention, location, make_concept,
+    module_concept, module_path, node_text, signature_before_body, smallest_containing,
+    strip_quotes,
 };
 use crate::{CallCandidate, FileExtraction};
 use anyhow::{Context, Result};
@@ -37,17 +38,6 @@ fn class_container_name<'a>(src: &'a str, method_node: Node) -> Option<&'a str> 
     Some(node_text(src, name))
 }
 
-fn signature_before_body(src: &str, def_node: Node) -> String {
-    let end = def_node
-        .child_by_field_name("body")
-        .map(|b| b.start_byte())
-        .unwrap_or(def_node.end_byte());
-    src[def_node.start_byte()..end]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 pub fn extract(
     source: &str,
     relative_path: &str,
@@ -71,19 +61,7 @@ pub fn extract(
         .with_context(|| format!("failed to parse {} source", language))?;
 
     let module = module_path(relative_path);
-    let mut module_concept = make_concept(
-        ConceptKind::Module,
-        language,
-        module.rsplit('.').next().unwrap_or(&module),
-        &module,
-        okf_parser::Location {
-            file: relative_path.to_string(),
-            start_line: 1,
-            end_line: source.lines().count().max(1),
-        },
-        None,
-        true,
-    );
+    let mut module_concept = module_concept(language, relative_path, source);
 
     let mut query_src = format!(
         "{}\n(class_declaration name: ({}) @class.name) @class.def\n",

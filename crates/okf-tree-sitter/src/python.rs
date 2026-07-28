@@ -1,6 +1,6 @@
 use crate::common::{
-    import_relationship, is_public_by_underscore_convention, location, make_concept, module_path,
-    node_text, smallest_containing,
+    import_relationship, is_public_by_underscore_convention, location, make_concept,
+    module_concept, module_path, node_text, smallest_containing,
 };
 use crate::{CallCandidate, FileExtraction};
 use anyhow::{Context, Result};
@@ -60,19 +60,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         .context("failed to parse Python source")?;
 
     let module = module_path(relative_path);
-    let mut module_concept = make_concept(
-        ConceptKind::Module,
-        Language::Python,
-        module.rsplit('.').next().unwrap_or(&module),
-        &module,
-        okf_parser::Location {
-            file: relative_path.to_string(),
-            start_line: 1,
-            end_line: source.lines().count().max(1),
-        },
-        None,
-        true,
-    );
+    let mut module_concept = module_concept(Language::Python, relative_path, source);
 
     let query = Query::new(&ts_lang, QUERY_SRC).context("invalid Python query")?;
     let mut cursor = QueryCursor::new();

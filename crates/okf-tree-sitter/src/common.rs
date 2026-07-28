@@ -117,3 +117,57 @@ pub fn smallest_containing(candidates: &[(String, Range<usize>)], byte: usize) -
         .min_by_key(|(_, range)| range.end - range.start)
         .map(|(id, _)| id.as_str())
 }
+
+/// A definition node's source text up to (not including) its body,
+/// whitespace-collapsed to a single line — the common shape of a
+/// function/method signature across languages whose grammar exposes a
+/// `body` field on the definition node. Some grammars need their own
+/// variant instead of this one: Python's signature also has a trailing
+/// `:` to trim, and Kotlin's function node has no `body` field, only a
+/// `function_body` child by kind.
+pub fn signature_before_body(src: &str, def_node: Node) -> String {
+    let end = def_node
+        .child_by_field_name("body")
+        .map(|b| b.start_byte())
+        .unwrap_or(def_node.end_byte());
+    src[def_node.start_byte()..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A type-declaration node's source text up to (not including) its body,
+/// whitespace-collapsed to a single line. Rust needs its own variant
+/// instead of this one: a trait/extern item can end in `;` with no body
+/// at all, which this version doesn't stop at.
+pub fn type_signature(src: &str, def_node: Node) -> String {
+    let text = node_text(src, def_node);
+    text.split('{')
+        .next()
+        .unwrap_or(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Builds the file-level `Module` concept every language extractor emits
+/// exactly one of: its qualified name and displayed name both come from
+/// [`module_path`], its location spans the whole file, and it starts out
+/// with no signature and no relationships (a caller that resolves imports
+/// pushes those onto the returned concept's `relationships` itself).
+pub fn module_concept(language: Language, relative_path: &str, source: &str) -> Concept {
+    let module = module_path(relative_path);
+    make_concept(
+        ConceptKind::Module,
+        language,
+        module.rsplit('.').next().unwrap_or(&module),
+        &module,
+        Location {
+            file: relative_path.to_string(),
+            start_line: 1,
+            end_line: source.lines().count().max(1),
+        },
+        None,
+        true,
+    )
+}

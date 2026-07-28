@@ -17,7 +17,8 @@
 //!   feeding to a single-file-oriented tool.
 
 use anyhow::Result;
-use okf_parser::{Concept, ConceptKind, RelationKind};
+use okf_parser::{Concept, RelationKind};
+use okf_render::{capitalize, contains_members, group_by_kind_dir};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -65,17 +66,7 @@ const RELATIONSHIP_HEADINGS: [(RelationKind, &str); 7] = [
 /// instead.
 pub fn generate_html(concepts: &[Concept], output_dir: &Path) -> Result<()> {
     let bundle_ids: HashSet<&str> = concepts.iter().map(|c| c.id.as_str()).collect();
-
-    let mut by_dir: BTreeMap<&str, Vec<&Concept>> = BTreeMap::new();
-    for concept in concepts {
-        by_dir
-            .entry(concept.kind.bundle_dir())
-            .or_default()
-            .push(concept);
-    }
-    for entries in by_dir.values_mut() {
-        entries.sort_by(|a, b| a.id.cmp(&b.id));
-    }
+    let by_dir = group_by_kind_dir(concepts);
 
     fs::create_dir_all(output_dir)?;
 
@@ -99,14 +90,12 @@ pub fn generate_html(concepts: &[Concept], output_dir: &Path) -> Result<()> {
 }
 
 /// Relative link from the page for `from_pseudo_id` (a concept id, or
-/// `"<dir>/{DIR_INDEX_NAME}"` / `"index"` for an index page) to `to_pseudo_id`.
-/// Always correct (walks up to the site root and back down), though not
-/// always the shortest possible path — the same trade-off
-/// `okf-generator`'s own `relative_link` makes for the markdown bundle.
+/// `"<dir>/{DIR_INDEX_NAME}"` / `"index"` for an index page) to
+/// `to_pseudo_id`, always with an `.html` extension — see
+/// `okf_render::relative_link` for the shared depth-walking logic
+/// `okf-generator` uses the same way for the `.md` bundle.
 fn relative_link(from_pseudo_id: &str, to_pseudo_id: &str) -> String {
-    let depth = from_pseudo_id.matches('/').count();
-    let up = "../".repeat(depth);
-    format!("{up}{to_pseudo_id}.html")
+    okf_render::relative_link(from_pseudo_id, to_pseudo_id, "html")
 }
 
 /// Escapes text for safe inclusion in HTML — signatures routinely contain
@@ -167,24 +156,7 @@ fn render_concept_html(concept: &Concept, all: &[Concept], bundle_ids: &HashSet<
         ));
     }
 
-    // A Module's members are every other concept declared in the same
-    // file; a Package's are every Module that named it in a `MemberOf`
-    // relationship (see `okf-analyzer`'s workspace/monorepo aggregation).
-    let contains: Vec<&Concept> = match concept.kind {
-        ConceptKind::Module => all
-            .iter()
-            .filter(|c| c.id != concept.id && c.location.file == concept.location.file)
-            .collect(),
-        ConceptKind::Package => all
-            .iter()
-            .filter(|c| {
-                c.relationships
-                    .iter()
-                    .any(|r| r.kind == RelationKind::MemberOf && r.target == concept.id)
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
+    let contains = contains_members(concept, all);
     render_link_section(&mut body, "Contains", &contains, &concept.id);
 
     for (kind, heading) in RELATIONSHIP_HEADINGS {
@@ -288,16 +260,7 @@ fn write_root_index_html(output_dir: &Path, by_dir: &BTreeMap<&str, Vec<&Concept
 /// layout, for consumers that want a single file (a wiki page, a README
 /// section, a search-in-one-document reference) rather than a directory.
 pub fn generate_markdown(concepts: &[Concept]) -> String {
-    let mut by_dir: BTreeMap<&str, Vec<&Concept>> = BTreeMap::new();
-    for concept in concepts {
-        by_dir
-            .entry(concept.kind.bundle_dir())
-            .or_default()
-            .push(concept);
-    }
-    for entries in by_dir.values_mut() {
-        entries.sort_by(|a, b| a.id.cmp(&b.id));
-    }
+    let by_dir = group_by_kind_dir(concepts);
 
     let mut out = String::from("# Documentation\n\n## Contents\n\n");
     for (dir, entries) in &by_dir {
@@ -348,14 +311,6 @@ pub fn generate_markdown(concepts: &[Concept]) -> String {
     out
 }
 
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
 /// A GitHub-flavored-markdown-style heading anchor: lowercase,
 /// non-alphanumerics collapsed to `-`. `dir` values here (`functions`,
 /// `classes`, ...) are already simple lowercase words, so this is really
@@ -375,7 +330,7 @@ fn slug(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use okf_parser::{Language, Location, Relationship};
+    use okf_parser::{ConceptKind, Language, Location, Relationship};
 
     fn concept(kind: ConceptKind, name: &str, qualified: &str, file: &str) -> Concept {
         Concept {

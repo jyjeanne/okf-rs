@@ -421,65 +421,41 @@ fn cmd_validate(bundle: Option<PathBuf>, project: &std::path::Path, ci: bool) ->
     }
 }
 
-fn cmd_search(query: &str, bundle: Option<PathBuf>, project: &std::path::Path) -> Result<ExitCode> {
+/// Resolves `bundle`/`project` the same way `validate` does — an explicit
+/// bundle path wins, otherwise `okf.toml`'s recorded output relative to
+/// the (canonicalized) project root.
+fn resolve_query_bundle(bundle: Option<PathBuf>, project: &std::path::Path) -> PathBuf {
     let project_root = project
         .canonicalize()
         .unwrap_or_else(|_| project.to_path_buf());
-    let bundle = resolve_bundle_arg(&project_root, bundle);
-    let index = okf_search::SearchIndex::build(&bundle)?;
-    let hits = index.search(query);
+    resolve_bundle_arg(&project_root, bundle)
+}
 
-    if hits.is_empty() {
-        println!("No matches for `{query}` in {}", bundle.display());
-        return Ok(ExitCode::SUCCESS);
+/// Prints an `okf-query` result the same way every `search`/`graph`
+/// subcommand does: the text on success, or the error on stderr with a
+/// non-zero exit — one place for that pairing instead of one per
+/// subcommand.
+fn print_query_result(result: Result<String>) -> Result<ExitCode> {
+    match result {
+        Ok(text) => {
+            println!("{text}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            Ok(ExitCode::FAILURE)
+        }
     }
+}
 
-    for hit in hits {
-        println!(
-            "{:>3}  {:<24} {:<20} {}",
-            hit.score, hit.entry.title, hit.entry.concept_type, hit.entry.id
-        );
-    }
-    Ok(ExitCode::SUCCESS)
+fn cmd_search(query: &str, bundle: Option<PathBuf>, project: &std::path::Path) -> Result<ExitCode> {
+    let bundle = resolve_query_bundle(bundle, project);
+    print_query_result(okf_query::search(&bundle, query))
 }
 
 fn analyze_path(path: &std::path::Path) -> Result<okf_analyzer::AnalysisResult> {
     let project = Project::load(path)?;
     okf_analyzer::analyze(&project)
-}
-
-/// Resolves `bundle`/`project` the same way `search`/`validate` do, then
-/// reads the bundle's concepts (relationships included) back off disk.
-/// Errors with a pointer to `okf-rs generate` rather than an opaque I/O
-/// error if the bundle doesn't exist yet.
-fn load_graph_concepts(
-    bundle: Option<PathBuf>,
-    project: &std::path::Path,
-) -> Result<Vec<okf_parser::Concept>> {
-    let project_root = project
-        .canonicalize()
-        .unwrap_or_else(|_| project.to_path_buf());
-    let bundle = resolve_bundle_arg(&project_root, bundle);
-    if !bundle.is_dir() {
-        anyhow::bail!(
-            "no bundle found at {} — run `okf-rs generate` first",
-            bundle.display()
-        );
-    }
-    okf_parser::read_bundle(&bundle)
-}
-
-fn require_concept<'a>(
-    graph: &okf_graph::Graph<'a>,
-    id: &str,
-) -> Result<&'a okf_parser::Concept, ExitCode> {
-    match graph.get(id) {
-        Some(concept) => Ok(concept),
-        None => {
-            eprintln!("error: no concept with id `{id}` (use `okf-rs search` to find valid ids)");
-            Err(ExitCode::FAILURE)
-        }
-    }
 }
 
 fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
@@ -489,74 +465,28 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             bundle,
             project,
         } => {
-            let concepts = load_graph_concepts(bundle, &project)?;
-            let graph = okf_graph::Graph::build(&concepts);
-            let Ok(_) = require_concept(&graph, &id) else {
-                return Ok(ExitCode::FAILURE);
-            };
-            let callers = graph.callers(&id);
-            if callers.is_empty() {
-                println!("No callers found for `{id}`");
-            }
-            for caller in callers {
-                println!("{} — {}", caller.id, caller.frontmatter_type());
-            }
-            Ok(ExitCode::SUCCESS)
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_callers(&bundle, &id))
         }
         GraphQuery::Callees {
             id,
             bundle,
             project,
         } => {
-            let concepts = load_graph_concepts(bundle, &project)?;
-            let graph = okf_graph::Graph::build(&concepts);
-            let Ok(_) = require_concept(&graph, &id) else {
-                return Ok(ExitCode::FAILURE);
-            };
-            let callees = graph.callees(&id);
-            if callees.is_empty() {
-                println!(
-                    "`{id}` doesn't call anything (or only calls unresolved/ambiguous targets)"
-                );
-            }
-            for callee in callees {
-                println!("{} — {}", callee.id, callee.frontmatter_type());
-            }
-            Ok(ExitCode::SUCCESS)
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_callees(&bundle, &id))
         }
         GraphQuery::Cycles { bundle, project } => {
-            let concepts = load_graph_concepts(bundle, &project)?;
-            let graph = okf_graph::Graph::build(&concepts);
-            let cycles = graph.cycles();
-            if cycles.is_empty() {
-                println!("No cycles found in the call graph");
-            }
-            for cycle in cycles {
-                println!("{}", cycle.join(" -> "));
-            }
-            Ok(ExitCode::SUCCESS)
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_cycles(&bundle))
         }
         GraphQuery::Api { bundle, project } => {
-            let concepts = load_graph_concepts(bundle, &project)?;
-            let graph = okf_graph::Graph::build(&concepts);
-            let api = graph.public_api();
-            println!("{} public concepts:", api.len());
-            for concept in api {
-                println!("  {:<12} {}", concept.frontmatter_type(), concept.id);
-            }
-            Ok(ExitCode::SUCCESS)
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_api(&bundle))
         }
         GraphQuery::Modules { bundle, project } => {
-            let concepts = load_graph_concepts(bundle, &project)?;
-            let graph = okf_graph::Graph::build(&concepts);
-            let deps = graph.module_dependencies();
-            if deps.is_empty() {
-                println!("No cross-module call dependencies found");
-            }
-            for (from, to) in deps {
-                println!("{from} -> {to}");
-            }
-            Ok(ExitCode::SUCCESS)
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_modules(&bundle))
         }
         GraphQuery::Path {
             from,
@@ -564,24 +494,8 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             bundle,
             project,
         } => {
-            let concepts = load_graph_concepts(bundle, &project)?;
-            let graph = okf_graph::Graph::build(&concepts);
-            let Ok(_) = require_concept(&graph, &from) else {
-                return Ok(ExitCode::FAILURE);
-            };
-            let Ok(_) = require_concept(&graph, &to) else {
-                return Ok(ExitCode::FAILURE);
-            };
-            match graph.shortest_call_path(&from, &to) {
-                Some(steps) => {
-                    println!("{}", steps.join(" -> "));
-                    Ok(ExitCode::SUCCESS)
-                }
-                None => {
-                    println!("No call path found from `{from}` to `{to}`");
-                    Ok(ExitCode::SUCCESS)
-                }
-            }
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_path(&bundle, &from, &to))
         }
     }
 }
@@ -592,7 +506,8 @@ fn cmd_docs(
     output: Option<PathBuf>,
     format: DocsFormat,
 ) -> Result<ExitCode> {
-    let concepts = load_graph_concepts(bundle, project)?;
+    let bundle = resolve_query_bundle(bundle, project);
+    let concepts = okf_query::load_concepts(&bundle)?;
     match format {
         DocsFormat::Html => {
             let output = output.unwrap_or_else(|| PathBuf::from("docs"));
