@@ -1,14 +1,14 @@
 //! Cross-module, ownership, API-surface, and cycle queries over an
 //! okf-rs concept graph.
 //!
-//! Unlike `okf-search` and `okf-validator`, which each re-read a bundle
-//! off disk, `Graph` is built directly from the in-memory
-//! `Vec<Concept>` an analysis run produces — the bundle's `Calls`/
-//! `CalledBy`/`Imports` relationships aren't (yet) serialized into
-//! frontmatter, so querying the fully relationship-rich concept model
-//! means using it before it's written out, not after. `okf-rs graph`
-//! re-analyzes its target project for this reason, the same way `scan`
-//! and `generate` do, rather than reading a previously written bundle.
+//! `Graph` is built directly from a `&[Concept]` slice and doesn't care
+//! where those concepts came from: a fresh `okf-analyzer` run, or a
+//! previously written bundle read back with `okf_parser::read_bundle`
+//! (which restores the `Calls`/`CalledBy`/`Imports`/... relationships
+//! from the bundle's `relationships` frontmatter field). `okf-rs graph`
+//! uses the latter — it queries an existing bundle on disk rather than
+//! re-analyzing the project from source, the same way `okf-search` and
+//! `okf-validator` do.
 
 use okf_parser::{Concept, ConceptKind, RelationKind};
 use std::collections::{HashMap, HashSet};

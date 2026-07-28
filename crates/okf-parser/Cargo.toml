@@ -9,3 +9,9 @@ description = "Shared OKF concept/relationship data model for okf-rs"
 [dependencies]
 serde.workspace = true
 chrono.workspace = true
+anyhow.workspace = true
+serde_yaml.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

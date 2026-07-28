@@ -1,7 +1,12 @@
 //! Writes a set of [`okf_parser::Concept`]s out as a conformant OKF bundle:
 //! one markdown file with YAML frontmatter per concept, grouped into
 //! per-kind directories, with an `index.md` at the bundle root and at each
-//! directory.
+//! directory. Each concept's relationships are rendered both into the
+//! markdown body (human-readable `# Calls` / `# Imports` / ... sections,
+//! cross-linked where the target is in the bundle) and into a
+//! `relationships` frontmatter field (machine-readable target ids grouped
+//! by kind), so `okf_parser::read_bundle` can reconstruct the full graph
+//! from a bundle on disk without re-analyzing the project from source.
 
 mod agents;
 
@@ -33,6 +38,54 @@ struct Frontmatter {
     visibility: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<DateTime<Utc>>,
+    /// Target concept ids grouped by relation kind, so a bundle on disk
+    /// carries the full call/import graph without needing to re-analyze
+    /// the project from source (see `okf_parser::read_bundle`, the
+    /// reverse of this). Only emitted when non-empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relationships: Option<RelationshipsFrontmatter>,
+}
+
+#[derive(Serialize, Default)]
+struct RelationshipsFrontmatter {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    imports: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    calls: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    called_by: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    implements: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    inherits: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    depends_on: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    member_of: Vec<String>,
+}
+
+/// Groups `concept`'s relationship targets by kind for frontmatter,
+/// preserving each kind's original relative order. `None` when the
+/// concept has no relationships, so the frontmatter field is omitted
+/// entirely rather than emitted as an empty mapping.
+fn relationships_frontmatter(concept: &Concept) -> Option<RelationshipsFrontmatter> {
+    if concept.relationships.is_empty() {
+        return None;
+    }
+    let mut grouped = RelationshipsFrontmatter::default();
+    for rel in &concept.relationships {
+        let bucket = match rel.kind {
+            RelationKind::Imports => &mut grouped.imports,
+            RelationKind::Calls => &mut grouped.calls,
+            RelationKind::CalledBy => &mut grouped.called_by,
+            RelationKind::Implements => &mut grouped.implements,
+            RelationKind::Inherits => &mut grouped.inherits,
+            RelationKind::DependsOn => &mut grouped.depends_on,
+            RelationKind::MemberOf => &mut grouped.member_of,
+        };
+        bucket.push(rel.target.clone());
+    }
+    Some(grouped)
 }
 
 /// Writes `concepts` to `output_dir` as an OKF bundle. Fails fast (before
@@ -117,6 +170,7 @@ fn render_concept(
             Some("private")
         },
         timestamp: concept.timestamp,
+        relationships: relationships_frontmatter(concept),
     };
     let yaml = serde_yaml::to_string(&frontmatter)?;
     let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
@@ -332,5 +386,84 @@ mod tests {
 
         let private_content = fs::read_to_string(dir.path().join("functions/helper.md")).unwrap();
         assert!(private_content.contains("visibility: private"));
+    }
+
+    #[test]
+    fn serializes_relationships_into_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut caller = concept(
+            ConceptKind::Function,
+            "verify_token",
+            "auth.verify_token",
+            "src/auth.rs",
+        );
+        let callee = concept(
+            ConceptKind::Function,
+            "decode_jwt",
+            "auth.decode_jwt",
+            "src/auth.rs",
+        );
+        caller.relationships.push(Relationship {
+            kind: RelationKind::Calls,
+            target: callee.id.clone(),
+            target_display: "decode_jwt".to_string(),
+        });
+
+        write_bundle(&[caller, callee], dir.path()).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
+        assert!(content.contains("relationships:\n  calls:\n  - functions/auth/decode_jwt\n"));
+    }
+
+    #[test]
+    fn frontmatter_relationships_round_trip_through_read_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut caller = concept(
+            ConceptKind::Function,
+            "verify_token",
+            "auth.verify_token",
+            "src/auth.rs",
+        );
+        let mut callee = concept(
+            ConceptKind::Function,
+            "decode_jwt",
+            "auth.decode_jwt",
+            "src/auth.rs",
+        );
+        caller.relationships.push(Relationship {
+            kind: RelationKind::Calls,
+            target: callee.id.clone(),
+            target_display: "decode_jwt".to_string(),
+        });
+        callee.relationships.push(Relationship {
+            kind: RelationKind::CalledBy,
+            target: caller.id.clone(),
+            target_display: "verify_token".to_string(),
+        });
+
+        write_bundle(&[caller.clone(), callee.clone()], dir.path()).unwrap();
+        let read_back = okf_parser::read_bundle(dir.path()).unwrap();
+
+        assert_eq!(read_back.len(), 2);
+        let read_caller = read_back.iter().find(|c| c.id == caller.id).unwrap();
+        assert_eq!(read_caller.relationships.len(), 1);
+        assert_eq!(read_caller.relationships[0].kind, RelationKind::Calls);
+        assert_eq!(read_caller.relationships[0].target, callee.id);
+        assert_eq!(read_caller.relationships[0].target_display, "decode_jwt");
+
+        let read_callee = read_back.iter().find(|c| c.id == callee.id).unwrap();
+        assert_eq!(read_callee.relationships[0].kind, RelationKind::CalledBy);
+        assert_eq!(read_callee.relationships[0].target_display, "verify_token");
+    }
+
+    #[test]
+    fn omits_relationships_field_when_concept_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let solo = concept(ConceptKind::Function, "run", "run", "src/a.rs");
+        write_bundle(&[solo], dir.path()).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("functions/run.md")).unwrap();
+        assert!(!content.contains("relationships"));
     }
 }

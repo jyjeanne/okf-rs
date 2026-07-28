@@ -468,8 +468,12 @@ dependencies = [
 name = "okf-parser"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "serde",
+ "serde_yaml",
+ "tempfile",
+ "walkdir",
 ]
 
 [[package]]

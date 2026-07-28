@@ -129,7 +129,7 @@ Commands:
   diff      Compare the OKF concepts between two git refs (added/removed/changed)
 ```
 
-Run `okf-rs <command> --help` for each command's options. `okf-rs graph` has its own subcommands (`callers`, `callees`, `cycles`, `api`, `modules`, `path`) — e.g. `okf-rs graph callers functions/src/auth/verify_token` lists everything that calls it, and `okf-rs graph cycles` flags any call-graph cycles. `okf-rs diff <ref-a> <ref-b>` compares two git refs' concepts without touching your working tree (it uses a temporary `git worktree` checkout for each ref). `okf-rs init` also writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md` to point AI coding agents at the bundle — pass `--no-agent-files` to skip that.
+Run `okf-rs <command> --help` for each command's options. `okf-rs graph` has its own subcommands (`callers`, `callees`, `cycles`, `api`, `modules`, `path`) — e.g. `okf-rs graph callers functions/src/auth/verify_token` lists everything that calls it, and `okf-rs graph cycles` flags any call-graph cycles. Like `search` and `validate`, `graph` reads a previously generated bundle rather than re-analyzing the project, so run `okf-rs generate` first (and again after source changes). `okf-rs diff <ref-a> <ref-b>` compares two git refs' concepts without touching your working tree (it uses a temporary `git worktree` checkout for each ref). `okf-rs init` also writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md` to point AI coding agents at the bundle — pass `--no-agent-files` to skip that.
 
 ## Architecture
 

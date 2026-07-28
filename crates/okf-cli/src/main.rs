@@ -68,8 +68,10 @@ enum Command {
         project: PathBuf,
     },
     /// Query the concept graph: callers, callees, cycles, public API, and
-    /// cross-module dependencies. Re-analyzes the project fresh each run
-    /// (relationships aren't yet serialized into the bundle on disk).
+    /// cross-module dependencies. Reads relationships directly from a
+    /// previously generated OKF bundle on disk — run `okf-rs generate`
+    /// first (and re-run it after source changes, to keep the bundle's
+    /// relationships current).
     Graph {
         #[command(subcommand)]
         query: GraphQuery,
@@ -89,36 +91,54 @@ enum GraphQuery {
     /// List concepts that directly call the given concept id.
     Callers {
         id: String,
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
     /// List concepts the given concept id directly calls.
     Callees {
         id: String,
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
     /// List groups of concepts that call each other in a cycle.
     Cycles {
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
     /// List the public API surface (public functions/methods/types).
     Api {
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
     /// List cross-module dependency edges (which modules call into which).
     Modules {
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
     /// Find the shortest call path between two concept ids.
     Path {
         from: String,
         to: String,
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
 }
 
@@ -301,6 +321,27 @@ fn analyze_path(path: &std::path::Path) -> Result<okf_analyzer::AnalysisResult> 
     okf_analyzer::analyze(&project)
 }
 
+/// Resolves `bundle`/`project` the same way `search`/`validate` do, then
+/// reads the bundle's concepts (relationships included) back off disk.
+/// Errors with a pointer to `okf-rs generate` rather than an opaque I/O
+/// error if the bundle doesn't exist yet.
+fn load_graph_concepts(
+    bundle: Option<PathBuf>,
+    project: &std::path::Path,
+) -> Result<Vec<okf_parser::Concept>> {
+    let project_root = project
+        .canonicalize()
+        .unwrap_or_else(|_| project.to_path_buf());
+    let bundle = resolve_bundle_arg(&project_root, bundle);
+    if !bundle.is_dir() {
+        anyhow::bail!(
+            "no bundle found at {} — run `okf-rs generate` first",
+            bundle.display()
+        );
+    }
+    okf_parser::read_bundle(&bundle)
+}
+
 fn require_concept<'a>(
     graph: &okf_graph::Graph<'a>,
     id: &str,
@@ -316,9 +357,13 @@ fn require_concept<'a>(
 
 fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
     match query {
-        GraphQuery::Callers { id, path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
+        GraphQuery::Callers {
+            id,
+            bundle,
+            project,
+        } => {
+            let concepts = load_graph_concepts(bundle, &project)?;
+            let graph = okf_graph::Graph::build(&concepts);
             let Ok(_) = require_concept(&graph, &id) else {
                 return Ok(ExitCode::FAILURE);
             };
@@ -331,9 +376,13 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        GraphQuery::Callees { id, path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
+        GraphQuery::Callees {
+            id,
+            bundle,
+            project,
+        } => {
+            let concepts = load_graph_concepts(bundle, &project)?;
+            let graph = okf_graph::Graph::build(&concepts);
             let Ok(_) = require_concept(&graph, &id) else {
                 return Ok(ExitCode::FAILURE);
             };
@@ -348,9 +397,9 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        GraphQuery::Cycles { path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
+        GraphQuery::Cycles { bundle, project } => {
+            let concepts = load_graph_concepts(bundle, &project)?;
+            let graph = okf_graph::Graph::build(&concepts);
             let cycles = graph.cycles();
             if cycles.is_empty() {
                 println!("No cycles found in the call graph");
@@ -360,9 +409,9 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        GraphQuery::Api { path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
+        GraphQuery::Api { bundle, project } => {
+            let concepts = load_graph_concepts(bundle, &project)?;
+            let graph = okf_graph::Graph::build(&concepts);
             let api = graph.public_api();
             println!("{} public concepts:", api.len());
             for concept in api {
@@ -370,9 +419,9 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        GraphQuery::Modules { path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
+        GraphQuery::Modules { bundle, project } => {
+            let concepts = load_graph_concepts(bundle, &project)?;
+            let graph = okf_graph::Graph::build(&concepts);
             let deps = graph.module_dependencies();
             if deps.is_empty() {
                 println!("No cross-module call dependencies found");
@@ -382,9 +431,14 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        GraphQuery::Path { from, to, path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
+        GraphQuery::Path {
+            from,
+            to,
+            bundle,
+            project,
+        } => {
+            let concepts = load_graph_concepts(bundle, &project)?;
+            let graph = okf_graph::Graph::build(&concepts);
             let Ok(_) = require_concept(&graph, &from) else {
                 return Ok(ExitCode::FAILURE);
             };

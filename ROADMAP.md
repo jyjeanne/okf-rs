@@ -49,8 +49,9 @@ Verified by dogfooding: running `okf-rs generate .` on this repository itself pr
 
 Verified by dogfooding: `okf-rs graph api .` on this repository lists 71 public concepts, `okf-rs graph cycles .` correctly finds none, `okf-rs graph modules .` shows real cross-crate dependency edges, and `okf-rs diff <commit> <commit> .` against this repo's own history correctly reports added/changed functions using non-destructive worktrees (verified the working tree and branch were untouched afterward, including on an invalid-ref error path).
 
+Relationships (`Calls`/`CalledBy`/`Imports`/...) are now serialized into each concept's `relationships` frontmatter field (target ids grouped by kind), alongside the existing human-readable "# Calls" / "# Called by" markdown body sections. `okf_parser::read_bundle` reverses `okf-generator`'s writer to reconstruct the full relationship-rich concept model from a bundle on disk, so `okf-rs graph` now queries a previously generated bundle directly — the same way `okf-rs search` and `okf-rs validate` do — instead of re-analyzing the project from source; run `okf-rs generate` first (and after any source change, to keep the bundle current).
+
 **Known limitations:**
-- `okf-rs graph` re-analyzes the project from source on every invocation rather than reading a previously generated bundle, since `Calls`/`CalledBy`/`Imports` relationships aren't yet serialized into bundle frontmatter — only into the "# Calls" / "# Called by" markdown body sections, which aren't meant to be machine-parsed back. Serializing relationships into frontmatter (so `okf-graph` and other tools could work directly off a bundle on disk) is still open.
 - Public/private (`is_public`) detection is exact for Rust (`pub` modifier) and Go (capitalization, the language's real rule), but a naming-convention heuristic (leading underscore) for Python/JavaScript/TypeScript, pending real `export`/access-modifier tracking.
 
 ## Phase 3 — Intelligence & Extended Output

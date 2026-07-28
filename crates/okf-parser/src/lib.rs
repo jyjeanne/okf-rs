@@ -6,6 +6,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+mod bundle;
+pub use bundle::read_bundle;
+
 /// A programming language recognized by okf-rs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Language {
@@ -36,6 +39,19 @@ impl Language {
             "ts" | "tsx" => Some(Language::TypeScript),
             "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
             "go" => Some(Language::Go),
+            _ => None,
+        }
+    }
+
+    /// Reverses [`Language::display_name`], for parsing a bundle's
+    /// frontmatter `type` field back into a `Concept` (see [`crate::read_bundle`]).
+    pub fn from_display_name(name: &str) -> Option<Self> {
+        match name {
+            "Rust" => Some(Language::Rust),
+            "Python" => Some(Language::Python),
+            "TypeScript" => Some(Language::TypeScript),
+            "JavaScript" => Some(Language::JavaScript),
+            "Go" => Some(Language::Go),
             _ => None,
         }
     }
@@ -91,6 +107,25 @@ impl ConceptKind {
             ConceptKind::Variable | ConceptKind::Constant => "variables",
         }
     }
+
+    /// Reverses [`ConceptKind::as_str`], for parsing a bundle's
+    /// frontmatter `type` field back into a `Concept` (see [`crate::read_bundle`]).
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "Package" => Some(ConceptKind::Package),
+            "Module" => Some(ConceptKind::Module),
+            "Class" => Some(ConceptKind::Class),
+            "Trait" => Some(ConceptKind::Trait),
+            "Interface" => Some(ConceptKind::Interface),
+            "Struct" => Some(ConceptKind::Struct),
+            "Enum" => Some(ConceptKind::Enum),
+            "Function" => Some(ConceptKind::Function),
+            "Method" => Some(ConceptKind::Method),
+            "Variable" => Some(ConceptKind::Variable),
+            "Constant" => Some(ConceptKind::Constant),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ConceptKind {
@@ -123,6 +158,35 @@ impl RelationKind {
             RelationKind::MemberOf => "Member of",
         }
     }
+
+    /// The snake_case key this relation kind is grouped under in a
+    /// bundle's `relationships` frontmatter field (see `okf-generator`
+    /// and [`crate::read_bundle`]), e.g. `called_by`.
+    pub fn frontmatter_key(&self) -> &'static str {
+        match self {
+            RelationKind::Imports => "imports",
+            RelationKind::Calls => "calls",
+            RelationKind::CalledBy => "called_by",
+            RelationKind::Implements => "implements",
+            RelationKind::Inherits => "inherits",
+            RelationKind::DependsOn => "depends_on",
+            RelationKind::MemberOf => "member_of",
+        }
+    }
+
+    /// Reverses [`RelationKind::frontmatter_key`].
+    pub fn from_frontmatter_key(key: &str) -> Option<Self> {
+        match key {
+            "imports" => Some(RelationKind::Imports),
+            "calls" => Some(RelationKind::Calls),
+            "called_by" => Some(RelationKind::CalledBy),
+            "implements" => Some(RelationKind::Implements),
+            "inherits" => Some(RelationKind::Inherits),
+            "depends_on" => Some(RelationKind::DependsOn),
+            "member_of" => Some(RelationKind::MemberOf),
+            _ => None,
+        }
+    }
 }
 
 /// A directed edge from the owning concept to `target`.
@@ -151,6 +215,25 @@ impl fmt::Display for Location {
         } else {
             write!(f, "{}#L{}-L{}", self.file, self.start_line, self.end_line)
         }
+    }
+}
+
+impl Location {
+    /// Reverses [`Location`]'s `Display` impl, parsing a frontmatter
+    /// `resource` value like `src/main.rs#L4-L6` or `src/main.rs#L4` back
+    /// into a `Location` (see [`crate::read_bundle`]).
+    pub fn parse(resource: &str) -> Option<Self> {
+        let (file, lines) = resource.rsplit_once('#')?;
+        let lines = lines.strip_prefix('L')?;
+        let (start, end) = match lines.split_once("-L") {
+            Some((start, end)) => (start, end),
+            None => (lines, lines),
+        };
+        Some(Location {
+            file: file.to_string(),
+            start_line: start.parse().ok()?,
+            end_line: end.parse().ok()?,
+        })
     }
 }
 
@@ -193,6 +276,17 @@ impl Concept {
     /// The frontmatter `type` value, e.g. "Rust Function".
     pub fn frontmatter_type(&self) -> String {
         format!("{} {}", self.language.display_name(), self.kind.as_str())
+    }
+
+    /// Reverses [`Concept::frontmatter_type`], splitting a frontmatter
+    /// `type` value like `Rust Function` back into its language and kind
+    /// (see [`crate::read_bundle`]).
+    pub fn parse_frontmatter_type(type_: &str) -> Option<(Language, ConceptKind)> {
+        let (language, kind) = type_.split_once(' ')?;
+        Some((
+            Language::from_display_name(language)?,
+            ConceptKind::parse(kind)?,
+        ))
     }
 
     /// Builds the stable identifier used for cross-linking, e.g.
