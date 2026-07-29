@@ -102,14 +102,19 @@ fn is_public(src: &str, def_node: Node) -> bool {
 /// `navigation_expression` callee (`recv.member`), covering `this.foo()`,
 /// `obj.foo()`, and `Companion.foo()` uniformly since Kotlin uses `.` for
 /// all of them.
-fn call_target_name<'a>(src: &'a str, call_node: Node<'a>) -> Option<&'a str> {
+/// The callee's own name and the specific node it came from -- for
+/// `this.foo()`/`obj.foo()`, that's the `foo` identifier itself, not the
+/// receiver (`this`/`obj`) or the whole call expression, since an LSP
+/// `textDocument/definition` query needs to point at the callee's own
+/// name to resolve it.
+fn call_target_name<'a>(src: &'a str, call_node: Node<'a>) -> Option<(&'a str, Node<'a>)> {
     let callee = call_node.named_child(0)?;
     match callee.kind() {
-        "identifier" => Some(node_text(src, callee)),
+        "identifier" => Some((node_text(src, callee), callee)),
         "navigation_expression" => {
             let count = callee.named_child_count();
             let last = callee.named_child(count.checked_sub(1)? as u32)?;
-            (last.kind() == "identifier").then(|| node_text(src, last))
+            (last.kind() == "identifier").then(|| (node_text(src, last), last))
         }
         _ => None,
     }
@@ -225,14 +230,14 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
 
     let mut calls = Vec::new();
     for (range, call_node) in raw_calls {
-        let Some(callee_name) = call_target_name(source, call_node) else {
+        let Some((callee_name, name_node)) = call_target_name(source, call_node) else {
             continue;
         };
         if let Some(caller_id) = smallest_containing(&function_spans, range.start) {
             calls.push(CallCandidate {
                 caller_id: caller_id.to_string(),
                 callee_name: callee_name.to_string(),
-                call_site: lsp_position(source, call_node),
+                call_site: lsp_position(source, name_node),
             });
         }
     }
@@ -412,5 +417,25 @@ class Service {
             "expected both helper() and this.helper() to be captured, got {callee_names:?}"
         );
         assert!(callee_names.contains(&"log"), "expected Util().log(...)");
+    }
+
+    #[test]
+    fn call_site_points_at_the_callee_not_the_receiver_for_member_calls() {
+        let src = "class Service {\n    fun run() {\n        this.helper()\n    }\n    fun helper() {}\n}\n";
+        let extraction = extract(src, "src/Service.kt").unwrap();
+        let call = extraction
+            .calls
+            .iter()
+            .find(|c| c.callee_name == "helper")
+            .unwrap();
+
+        let line_text = src.lines().nth(2).unwrap();
+        let expected_character = line_text.find("helper").unwrap() as u32;
+
+        assert_eq!(call.call_site.line, 2);
+        assert_eq!(
+            call.call_site.character, expected_character,
+            "call_site should point at `helper`, not the `this` receiver"
+        );
     }
 }

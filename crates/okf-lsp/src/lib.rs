@@ -20,6 +20,14 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// How long a single request waits for its matching response before
+/// giving up -- guards against a hung or misbehaving language server
+/// blocking a caller forever with no diagnostic.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The command, its arguments, and the LSP `languageId` for the one
 /// dominant language server this crate knows how to drive for `language`.
@@ -60,17 +68,42 @@ pub fn is_available(language: Language) -> bool {
 
 fn which(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    let candidates = executable_candidates(cmd);
     std::env::split_paths(&path).find_map(|dir| {
-        let candidate = dir.join(cmd);
-        candidate.is_file().then_some(candidate)
+        candidates.iter().find_map(|name| {
+            let candidate = dir.join(name);
+            candidate.is_file().then_some(candidate)
+        })
     })
+}
+
+/// File names to check for `cmd` in a single PATH directory. On Windows,
+/// an executable's real file name almost always carries a `PATHEXT`
+/// suffix (`.exe`, `.cmd`, ...) -- a bare `cmd` file is rarely what's
+/// actually on disk there even when the command is genuinely installed.
+fn executable_candidates(cmd: &str) -> Vec<String> {
+    if !cfg!(windows) {
+        return vec![cmd.to_string()];
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string());
+    let mut names = vec![cmd.to_string()];
+    names.extend(
+        pathext
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| format!("{cmd}{ext}")),
+    );
+    names
 }
 
 /// A running language server, initialized against `project_root`.
 pub struct LspClient {
     child: Child,
     stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    /// Messages read by a dedicated background thread (see [`LspClient::start`]),
+    /// so [`LspClient::read_response`] can enforce a timeout via
+    /// `recv_timeout` instead of blocking on the pipe forever.
+    rx: Receiver<std::result::Result<Value, String>>,
     next_id: i64,
     project_root: PathBuf,
     language: Language,
@@ -103,10 +136,28 @@ impl LspClient {
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
 
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                match read_message(&mut reader) {
+                    Ok(message) => {
+                        if tx.send(Ok(message)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
+
         let mut client = LspClient {
             child,
             stdin,
-            reader: BufReader::new(stdout),
+            rx,
             next_id: 1,
             project_root: project_root.to_path_buf(),
             language,
@@ -207,52 +258,121 @@ impl LspClient {
         Ok(())
     }
 
-    /// Reads LSP messages until one whose `id` matches `want_id` arrives,
+    /// Waits (up to [`RESPONSE_TIMEOUT`], across the whole call -- not
+    /// per message) for the message whose `id` matches `want_id`,
     /// skipping over notifications (e.g. `textDocument/publishDiagnostics`,
     /// which this client has no use for) and any response to a
-    /// previously-abandoned request.
+    /// previously-abandoned request. Errors, rather than blocking forever,
+    /// if the server never sends it or the stream closes first.
     fn read_response(&mut self, want_id: i64) -> Result<Value> {
-        loop {
-            let message = self.read_message()?;
-            if message.get("id").and_then(Value::as_i64) == Some(want_id) {
-                if let Some(error) = message.get("error") {
-                    bail!("language server returned an error: {error}");
-                }
-                return Ok(message.get("result").cloned().unwrap_or(Value::Null));
-            }
-        }
+        wait_for_response(&self.rx, want_id, RESPONSE_TIMEOUT)
     }
+}
 
-    fn read_message(&mut self) -> Result<Value> {
-        let mut content_length = None;
-        loop {
-            let mut line = String::new();
-            let n = self.reader.read_line(&mut line)?;
-            if n == 0 {
-                bail!("language server closed its output stream");
+/// The core of [`LspClient::read_response`], factored out as a free
+/// function purely so its timeout/skip-unrelated-messages/disconnect
+/// logic can be unit-tested directly against a plain channel, without
+/// needing a real (or fake) language server process to exercise it.
+fn wait_for_response(
+    rx: &Receiver<std::result::Result<Value, String>>,
+    want_id: i64,
+    timeout: Duration,
+) -> Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out after {timeout:?} waiting for a response from the language server");
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(message)) => {
+                if message.get("id").and_then(Value::as_i64) == Some(want_id) {
+                    if let Some(error) = message.get("error") {
+                        bail!("language server returned an error: {error}");
+                    }
+                    return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+                }
             }
-            let line = line.trim_end();
-            if line.is_empty() {
-                break;
+            Ok(Err(e)) => bail!("language server stream error: {e}"),
+            Err(RecvTimeoutError::Timeout) => {
+                bail!("timed out after {timeout:?} waiting for a response from the language server")
             }
-            if let Some(value) = line.strip_prefix("Content-Length:") {
-                content_length = value.trim().parse::<usize>().ok();
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("language server closed its output stream")
             }
         }
-        let content_length =
-            content_length.ok_or_else(|| anyhow!("missing Content-Length header"))?;
-        let mut buf = vec![0u8; content_length];
-        self.reader.read_exact(&mut buf)?;
-        serde_json::from_slice(&buf).context("malformed LSP message body")
     }
+}
+
+/// Reads one full LSP message (headers + JSON body) from `reader`. A
+/// free function (not an `LspClient` method) so the background reader
+/// thread spawned in [`LspClient::start`] can call it without holding a
+/// reference to the client itself.
+fn read_message(reader: &mut BufReader<ChildStdout>) -> Result<Value> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            bail!("language server closed its output stream");
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            content_length = value.trim().parse::<usize>().ok();
+        }
+    }
+    let content_length = content_length.ok_or_else(|| anyhow!("missing Content-Length header"))?;
+    let mut buf = vec![0u8; content_length];
+    reader.read_exact(&mut buf)?;
+    serde_json::from_slice(&buf).context("malformed LSP message body")
 }
 
 fn path_to_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+    format!("file://{}", percent_encode(&path.display().to_string()))
 }
 
 fn uri_to_path(uri: &str) -> String {
-    uri.strip_prefix("file://").unwrap_or(uri).to_string()
+    percent_decode(uri.strip_prefix("file://").unwrap_or(uri))
+}
+
+/// Percent-encodes a path for inclusion in a `file://` URI, leaving `/`
+/// and `:` (e.g. for a Windows drive letter) untouched. Real language
+/// servers do this too for paths containing spaces or non-ASCII
+/// characters (the LSP `DocumentUri` type is defined in terms of RFC
+/// 3986), so this client's own URIs need to follow the same convention
+/// to round-trip correctly against a server's own returned URIs.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Converts an absolute `file://` URI back into a path relative to
@@ -357,6 +477,74 @@ mod tests {
         let root = Path::new("/a/b");
         let uri = path_to_uri(&root.join("src/lib.rs"));
         assert_eq!(relativize(root, &uri), "src/lib.rs");
+    }
+
+    #[test]
+    fn relativize_round_trips_paths_with_spaces_and_non_ascii() {
+        let root = Path::new("/a/My Projects/caf\u{e9}");
+        let uri = path_to_uri(&root.join("src/lib.rs"));
+        assert!(
+            uri.contains("%20") || !uri.contains(' '),
+            "the space in the path must be percent-encoded in the URI: {uri}"
+        );
+        assert_eq!(relativize(root, &uri), "src/lib.rs");
+    }
+
+    #[test]
+    fn percent_encode_and_decode_round_trip_special_characters() {
+        let original = "/a/My Projects/caf\u{e9}/src/lib.rs";
+        let encoded = percent_encode(original);
+        assert!(encoded.contains("%20"));
+        assert_eq!(percent_decode(&encoded), original);
+    }
+
+    #[test]
+    fn wait_for_response_returns_the_matching_message_and_skips_others() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(
+            json!({ "jsonrpc": "2.0", "id": 99, "result": "not mine" }),
+        ))
+        .unwrap();
+        tx.send(Ok(json!({ "jsonrpc": "2.0", "id": 1, "result": "mine" })))
+            .unwrap();
+
+        let result = wait_for_response(&rx, 1, Duration::from_secs(5)).unwrap();
+        assert_eq!(result, json!("mine"));
+    }
+
+    #[test]
+    fn wait_for_response_surfaces_a_json_rpc_error() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(
+            json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -1, "message": "boom" } }),
+        ))
+        .unwrap();
+
+        let err = wait_for_response(&rx, 1, Duration::from_secs(5)).unwrap_err();
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn wait_for_response_times_out_instead_of_blocking_forever() {
+        let (_tx, rx) = mpsc::channel::<std::result::Result<Value, String>>();
+        let start = Instant::now();
+
+        let err = wait_for_response(&rx, 1, Duration::from_millis(100)).unwrap_err();
+
+        assert!(err.to_string().contains("timed out"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "should not block far past the timeout"
+        );
+    }
+
+    #[test]
+    fn wait_for_response_errors_when_the_stream_disconnects() {
+        let (tx, rx) = mpsc::channel::<std::result::Result<Value, String>>();
+        drop(tx);
+
+        let err = wait_for_response(&rx, 1, Duration::from_secs(5)).unwrap_err();
+        assert!(err.to_string().contains("closed"));
     }
 
     /// End-to-end smoke test against a *real* `rust-analyzer`, skipped

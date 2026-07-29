@@ -104,6 +104,11 @@ pub fn analyze_with_cache_lsp(
     let mut calls: Vec<(CallCandidate, Language, String)> = Vec::new();
     let mut stats = IncrementalStats::default();
     let mut fresh_cache = AnalysisCache::default();
+    // Only populated when `use_lsp` is set, so a plain `generate` doesn't
+    // pay the extra memory of retaining every file's source text: lets
+    // `resolve_ambiguous_calls` reuse the source already read here instead
+    // of reading each file a second time itself.
+    let mut file_sources: HashMap<String, String> = HashMap::new();
 
     for file in &project.files {
         let source = fs::read_to_string(&file.absolute_path)
@@ -126,6 +131,9 @@ pub fn analyze_with_cache_lsp(
             calls.push((call, file.language, file.relative_path.clone()));
         }
         concepts.extend(extraction.concepts);
+        if use_lsp {
+            file_sources.insert(file.relative_path.clone(), source);
+        }
     }
     *cache = fresh_cache;
 
@@ -168,6 +176,7 @@ pub fn analyze_with_cache_lsp(
         lsp::resolve_ambiguous_calls(
             project,
             &ambiguous,
+            &file_sources,
             &id_to_location,
             &symbol_table,
             &mut resolved_edges,
