@@ -118,6 +118,75 @@ resource: src/main.rs#L4-L6
 
 Just a markdown file. Open it in any editor, render it on GitHub, or point an AI coding agent at the `knowledge/` directory and let it follow the links.
 
+## Tutorial: adding okf-rs to an existing codebase
+
+The quick start above uses a toy example. This walks through adopting `okf-rs` in a real, already-existing project — install once, then wire it into how you and your AI coding agent actually work day to day.
+
+### 1. Install the binary
+
+Pick one (see [Installation](#installation) for details):
+
+```sh
+# Prebuilt binary — download from https://github.com/jyjeanne/okf-rs/releases,
+# extract, and put `okf-rs` on your PATH, or:
+cargo install --git https://github.com/jyjeanne/okf-rs okf-cli
+```
+
+### 2. Initialize it in your project
+
+From your project's root:
+
+```sh
+cd /path/to/your-existing-project
+okf-rs init .
+```
+
+This writes `okf.toml` (recording `knowledge/` as the default bundle location, so later commands don't need `--output`/`--project` repeated), and creates or idempotently updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md` with a marked section pointing AI agents at the bundle — existing content in those files is preserved untouched. Skip the agent files with `okf-rs init . --no-agent-files` if you'd rather add that section yourself, or aren't using an AI agent.
+
+### 3. Generate the bundle
+
+```sh
+okf-rs generate
+```
+
+This is safe to run on a large, real codebase: it's `.gitignore`-aware (never descends into `node_modules`, `target`, `vendor`, ...), aggregates a multi-package workspace/monorepo into one bundle automatically, and caches each file's extraction by content hash in `.okf-cache.json` — the first run parses everything, every run after that only re-parses files that actually changed. Add `.okf-cache.json` to `.gitignore`; it's a disposable local performance cache, not part of the bundle.
+
+Decide whether `knowledge/` itself belongs in git. Both are reasonable: committing it means the bundle reviews alongside the code that produced it (and is diffable, per PR, in `git diff`); `.gitignore`-ing it means treating it as a build artifact regenerated in CI. Either way, run `okf-rs validate --ci` in CI (see step 6) so a stale or broken bundle never ships silently.
+
+### 4. Explore it
+
+```sh
+okf-rs search verify_token                              # find a symbol by name
+okf-rs graph callers functions/src/auth/verify_token     # who calls it
+okf-rs graph api                                         # the whole public API surface
+okf-rs docs --format html                                # a browsable static site, into docs/
+```
+
+Concept ids (like `functions/src/auth/verify_token` above) come from `search`'s output — copy one from there rather than guessing the path convention.
+
+### 5. Keep it current while you work
+
+```sh
+okf-rs watch
+```
+
+Regenerates once immediately, then again each time a burst of file changes settles (default 300ms debounce), reusing the same incremental cache `generate` does. Leave it running in a terminal alongside your editor; stop with Ctrl+C.
+
+### 6. Wire it into CI
+
+```yaml
+- name: Validate OKF bundle
+  run: |
+    okf-rs generate --no-cache
+    okf-rs validate --ci
+```
+
+`--ci` treats orphaned-concept warnings as failures too, not just schema errors — useful once the bundle is something other tooling (docs, agents) actually depends on being correct. `--no-cache` in CI ensures a clean, from-scratch parse rather than trusting a cache that may not exist on that runner; drop it if you cache `.okf-cache.json` between CI runs and want the speed-up instead.
+
+### 7. Register it with your AI coding agent
+
+See [MCP server](#mcp-server) below — this is the step that turns "an agent can technically read these files" into "an agent can query the graph directly," and is where most of the token savings in day-to-day agent use come from.
+
 ## CLI reference
 
 ```
@@ -152,6 +221,14 @@ claude mcp add okf-rs -- /path/to/okf-mcp /path/to/project
 ```
 
 or point any other MCP client's stdio transport at the same binary and argument.
+
+#### Why this reduces token consumption
+
+Without `okf-rs`, an agent answering "who calls `verify_token`?" has to `grep` for the name, then open every file that matches to read enough surrounding code to confirm which hits are real call sites — each opened file costs its full size in context tokens, and a large file costs that every single time it's reopened across a session, including after a context compaction.
+
+With `okf-mcp`, the same question is one `graph_callers` tool call returning just the answer — no source file enters the agent's context at all. Concretely, on this repository itself: asking "who calls `cmd_generate`?" by hand means `grep`-ing to `crates/okf-cli/src/main.rs` and reading enough of that 672-line, ~24 KB file to find the answer (`run`) — roughly 6,000 tokens by the common ~4-chars-per-token rule of thumb. `okf-rs graph callers functions/crates/okf-cli/src/cmd_generate` (or the equivalent `graph_callers` MCP call) returns exactly one line, `functions/crates/okf-cli/src/run — Rust Function` — on the order of 15 tokens. That's not a one-off: it's the same gap on every call-graph/API-surface question an agent asks, and it compounds over a long session, since each `grep`-and-read round re-pays a whole file's token cost while each MCP call stays cheap regardless of how many times it's made — the expensive part (parsing and resolving the call graph) already happened once, at `okf-rs generate` time, not on every query.
+
+The same logic applies beyond MCP: even just pointing an agent at the `knowledge/` bundle's `index.md` files (no MCP server registered) means it's skimming pre-extracted signatures and relationships instead of full implementation bodies, comments, and boilerplate — a smaller, more targeted read for the same "what does this module expose" question.
 
 ## Contributing
 
