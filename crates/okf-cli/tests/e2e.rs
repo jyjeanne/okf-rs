@@ -78,6 +78,23 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Whether a real, runnable `rust-analyzer` is on `PATH` — checked the
+/// same way `okf-lsp::probe_available` does (a rustup proxy stub for an
+/// uninstalled component is present as a file but exits immediately with
+/// an "unknown binary" error, so merely finding the name isn't enough).
+/// Duplicated here rather than depending on `okf-lsp` from this crate's
+/// tests, since a plain subprocess probe is all a CLI-level test needs.
+fn rust_analyzer_available() -> bool {
+    Command::new("rust-analyzer")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn assert_success(output: &Output, args: &[&str]) {
     assert!(
         output.status.success(),
@@ -324,6 +341,80 @@ fn standalone_binary_diff_reports_added_and_removed_concepts() {
     let no_diff = run(&repo, &["diff", &c2, &c2, "."]);
     assert_success(&no_diff, &["diff (no-op)"]);
     assert!(stdout_of(&no_diff).contains("No concept-level changes"));
+}
+
+/// `okf-rs generate --lsp` asks a real language server
+/// (`textDocument/definition`) to disambiguate call edges Tree-sitter's
+/// own name-only matching can't: two `run` functions in different
+/// modules (`a` and `b`), with `a::caller` calling the bare name `run()`.
+/// Real Rust scoping makes that genuinely unambiguous — `a` never imports
+/// `b::run` — which is exactly what `rust-analyzer` (and a real compiler)
+/// resolves it to, but Tree-sitter alone can't tell the two `run`s apart
+/// and drops the edge. Skipped, not failed, when `rust-analyzer` isn't
+/// installed, matching how `okf-analyzer`'s and `okf-lsp`'s own tests
+/// treat this optional, best-effort integration.
+#[test]
+fn standalone_binary_generate_lsp_disambiguates_a_call_via_rust_analyzer() {
+    if !rust_analyzer_available() {
+        eprintln!("skipping: rust-analyzer not installed");
+        return;
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/lib.rs"), "mod a;\nmod b;\n").unwrap();
+    fs::write(
+        project.join("src/a.rs"),
+        "pub fn run() {}\npub fn caller() { run(); }\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/b.rs"), "pub fn run() {}\n").unwrap();
+
+    // Without `--lsp`: two same-named `run` functions make the call
+    // genuinely ambiguous by name alone, so Tree-sitter resolution leaves
+    // it unresolved rather than guessing.
+    let generate = run(&project, &["generate", "."]);
+    assert_success(&generate, &["generate"]);
+    let callees = run(
+        &project,
+        &[
+            "graph",
+            "callees",
+            "functions/src/a/caller",
+            "--project",
+            ".",
+        ],
+    );
+    assert_success(&callees, &["graph callees (pre-lsp)"]);
+    assert!(stdout_of(&callees).contains("doesn't call anything"));
+
+    // With `--lsp`: rust-analyzer resolves the same call specifically to
+    // `a::run`, never `b::run` — proven by regenerating in place (this
+    // also exercises the LSP path alongside the incremental-index cache
+    // from the prior run, which caches Tree-sitter extraction only, not
+    // resolved relationships) and re-querying the same callee edge.
+    let generate_lsp = run(&project, &["generate", ".", "--lsp"]);
+    assert_success(&generate_lsp, &["generate --lsp"]);
+    let callees_lsp = run(
+        &project,
+        &[
+            "graph",
+            "callees",
+            "functions/src/a/caller",
+            "--project",
+            ".",
+        ],
+    );
+    assert_success(&callees_lsp, &["graph callees (post-lsp)"]);
+    let callees_lsp_out = stdout_of(&callees_lsp);
+    assert!(callees_lsp_out.contains("functions/src/a/run"));
+    assert!(!callees_lsp_out.contains("functions/src/b/run"));
 }
 
 /// `okf-rs watch` regenerates the bundle once immediately on startup and
