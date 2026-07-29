@@ -1,0 +1,9 @@
+# Configuration for `cargo audit`, run in CI by .github/workflows/ci.yml.
+# https://docs.rs/cargo-audit/latest/cargo_audit/config/index.html
+
+[advisories]
+# Advisory IDs to temporarily allow, e.g. "RUSTSEC-2023-0001". Add an entry
+# here (with a comment linking to the tracking issue or upstream fix) when a
+# vulnerable dependency can't be upgraded away from immediately, so CI on
+# unrelated PRs isn't blocked while a fix is worked out.
+ignore = []

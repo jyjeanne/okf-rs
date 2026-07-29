@@ -25,44 +25,34 @@ jobs:
   check-version:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify tag matches workspace version
+      # Resolve the actual released package's version via cargo, rather than
+      # grepping Cargo.toml text, so this stays correct even if okf-cli ever
+      # stops inheriting workspace.package.version. Skipped (not failed) on
+      # workflow_dispatch, which has no tag to check.
+      - name: Verify tag matches okf-cli version
+        if: github.event_name == 'push'
         shell: bash
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          crate_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          if [ "$tag" != "$crate_version" ]; then
-            echo "::error::Tag v$tag does not match workspace.package.version ($crate_version) in Cargo.toml"
+          pkg_version=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "okf-cli") | .version')
+          if [ "$tag" != "$pkg_version" ]; then
+            echo "::error::Tag v$tag does not match okf-cli version ($pkg_version)"
             exit 1
           fi
 
   test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Test
-        run: cargo test --workspace --locked
+    uses: ./.github/workflows/reusable-test.yml
+    with:
+      os: ubuntu-latest
+      lint: false
 
   build:
     needs:
       - test
       - check-version
-    # `check-version` is skipped on workflow_dispatch runs; only require it to
-    # have succeeded, never to have run.
-    if: always() && needs.test.result == 'success' && needs.check-version.result != 'failure'
     strategy:
       fail-fast: false
       matrix:
