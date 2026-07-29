@@ -234,6 +234,8 @@ Provide semantic search by:
 - Relationship
 - Tag
 
+Phase 1/2 search is exact/substring matching over these fields. Phase 3 adds a ranked, relevance-scored full-text index (via [Tantivy](https://github.com/quickwit-oss/tantivy), an embedded pure-Rust library — no new external runtime dependency) over concept names, signatures, descriptions, and body text, so a query can match on wording rather than only an exact identifier.
+
 ---
 
 ### MCP Server
@@ -276,6 +278,8 @@ When enabled, an LLM may generate:
 - Glossary entries
 
 The generated OKF remains valid even without AI enrichment.
+
+The enrichment backend is pluggable via any OpenAI-compatible endpoint — a local runner ([Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), LocalAI), [Crustly](https://github.com/jyjeanne/crustly) (a terminal-based Rust coding assistant with the same local-LLM-first design), or a cloud provider — so enrichment never depends on one vendor, and offline/privacy-sensitive projects can enrich entirely locally. Matches the [Design Principles](#design-principles) this project already commits to: plugin-based and offline-first, with the deterministic core (Phases 1–2) completely unaffected either way — enrichment only ever adds an explicit, optional layer on top, never mixed into base extraction.
 
 ---
 
@@ -364,7 +368,7 @@ okf-rs/
 | `okf-validator` | Validates bundle conformance to the OKF schema (see [Validation](#validation)) |
 | `okf-search` | Indexes and queries the bundle by symbol, package, module, type, API, relationship, and tag |
 | `okf-mcp` | Model Context Protocol server exposing the bundle/graph to AI agents |
-| `okf-server` | HTTP server for browsing, visualization, and serving the bundle/search/MCP endpoints |
+| `okf-server` | REST + GraphQL API and HTTP server for browsing, visualization, and serving the bundle/search/MCP endpoints, built on `okf-graph`'s public library API |
 | `okf-watch` | Filesystem watcher for continuous re-indexing during local development |
 
 ---
@@ -410,22 +414,26 @@ Each phase builds strictly on the previous one's output; a feature is only liste
 - Basic documentation generation (Markdown, HTML) templated directly from the bundle — no LLM required
 - Continuous indexing in local development (`okf-watch`)
 
-### Phase 3 — Intelligence & Extended Output
+### Phase 3 — Search, Interop & Intelligence
 
-- Optional AI enrichment: function summaries, module descriptions, architecture explanations, usage examples, glossary entries
+Ordered deterministic/offline work first (no new runtime dependency, no external service, nothing optional), then interop, then the genuinely optional AI-dependent items last — each later item builds on a stable knowledge graph the earlier ones establish, and none of them are required for the ones before to be useful:
+
+- Full-text search engine: ranked, relevance-scored search (via [Tantivy](https://github.com/quickwit-oss/tantivy)) layered onto today's exact/substring `okf-search` — see [Search Engine](#search-engine)
+- Stable, versioned public library API: `okf-graph`/`okf-query` promoted from an internal implementation detail of `okf-cli`/`okf-mcp` to a documented, semver'd crate other Rust tools — including `okf-server` in Phase 4 — can embed directly, without shelling out to the CLI
+- DITA ⇄ OKF converter: export an OKF bundle to DITA (as before), plus *import* existing DITA XML as a source — so a technical-writing team with an existing DITA corpus can bring it into the same bundle/CLI/MCP/graph queries every other source already works with
+- Optional AI enrichment: function summaries, module descriptions, architecture explanations, usage examples, glossary entries — pluggable via any OpenAI-compatible endpoint, never a hard dependency on one vendor; see [Optional AI Enrichment](#optional-ai-enrichment)
 - Architecture extraction: architectural layers, domain boundaries, design patterns
 - REST endpoint, database model, and event-flow detection (feeds the architecture-dependent MCP queries noted in [MCP Server](#mcp-server))
-- DITA export
 - PDF export
 
 ### Phase 4 — Ecosystem
 
-- IDE plugins (VS Code, JetBrains) consuming the bundle and `okf-mcp`
-- Distributed knowledge server (`okf-server`): multi-repository, organization-wide serving
+Both items below build directly on Phase 3's stable `okf-graph`/`okf-query` library API rather than re-implementing graph access:
+
+- `okf-server`: REST + GraphQL API over the knowledge graph — multi-repository, organization-wide serving
+- `okf-rs` as an LSP server: hover, go-to-definition, and find-references backed by the OKF bundle, reachable from any LSP-capable editor (VS Code, JetBrains, Neovim, ...) through one server implementation rather than a bespoke plugin per IDE; dedicated VS Code/JetBrains extensions remain useful afterward as thin, editor-native wrappers around it
 - Visualization: interactive graph explorer over `okf-server`
 - Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
-
-Language ecosystems not yet scheduled in a phase (DITA XML as a *source* format, for example) remain future work and are tracked separately from the DITA *export* format above.
 
 ---
 
