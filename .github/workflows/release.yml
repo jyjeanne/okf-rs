@@ -1,8 +1,9 @@
 name: Release
 
-# Builds standalone `okf-rs` CLI binaries for Linux, macOS, and Windows and
-# attaches them to the GitHub Release for the pushed tag. Triggered by
-# pushing a tag like `v0.1.0`.
+# Verifies the tag matches the crate version and the full test suite passes,
+# then builds standalone `okf-rs` CLI binaries (with sha256 checksums) for
+# Linux, macOS, and Windows and attaches them to the GitHub Release for the
+# pushed tag. Triggered by pushing a tag like `v0.1.0`.
 
 on:
   push:
@@ -10,11 +11,58 @@ on:
       - "v*"
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches workspace version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$tag" != "$crate_version" ]; then
+            echo "::error::Tag v$tag does not match workspace.package.version ($crate_version) in Cargo.toml"
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace --locked
+
   build:
+    needs:
+      - test
+      - check-version
+    # `check-version` is skipped on workflow_dispatch runs; only require it to
+    # have succeeded, never to have run.
+    if: always() && needs.test.result == 'success' && needs.check-version.result != 'failure'
     strategy:
       fail-fast: false
       matrix:
@@ -36,6 +84,7 @@ jobs:
             archive_ext: zip
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -70,6 +119,18 @@ jobs:
           mkdir -p dist
           (cd "$bin_dir" && 7z a -tzip "${GITHUB_WORKSPACE}/dist/${name}.zip" okf-rs.exe)
 
+      - name: Generate checksum
+        shell: bash
+        run: |
+          cd dist
+          for f in *; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: okf-rs-${{ matrix.target }}
@@ -78,6 +139,9 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
