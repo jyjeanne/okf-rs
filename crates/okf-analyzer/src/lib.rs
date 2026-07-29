@@ -469,7 +469,7 @@ fn link_modules_to_packages(concepts: &mut [Concept]) {
     if packages.is_empty() {
         return;
     }
-    packages.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    packages.sort_by_key(|(dir, _, _)| std::cmp::Reverse(dir.len()));
 
     for concept in concepts.iter_mut() {
         if concept.kind != ConceptKind::Module {

@@ -8,11 +8,11 @@
 //! Entirely optional and best-effort, by design: [`server_command`] only
 //! covers the one dominant server per language it's been verified against
 //! (`rust-analyzer` for Rust, `pyright-langserver` for Python — see the
-//! crate's tests), [`is_available`] checks the binary actually exists
-//! before anything tries to spawn it, and every caller in `okf-analyzer`
-//! treats "no server" and "server returned nothing useful" identically:
-//! fall back to Tree-sitter's own unambiguous-name-only resolution, never
-//! guess.
+//! crate's tests), [`is_available`] confirms the binary is actually
+//! runnable (not just a name on `PATH`) before anything tries to spawn it
+//! for real, and every caller in `okf-analyzer` treats "no server" and
+//! "server returned nothing useful" identically: fall back to
+//! Tree-sitter's own unambiguous-name-only resolution, never guess.
 
 use anyhow::{anyhow, bail, Context, Result};
 use okf_parser::Language;
@@ -61,8 +61,25 @@ fn language_id(language: Language) -> &'static str {
 /// runnable in this environment — checked cheaply before paying the cost
 /// of spawning (or failing to spawn) a real server process.
 pub fn is_available(language: Language) -> bool {
-    server_command(language)
-        .map(|(cmd, _)| which(cmd).is_some())
+    server_command(language).is_some_and(|(cmd, _)| probe_available(cmd))
+}
+
+/// Confirms `cmd` isn't just a name on `PATH` but actually runs. A binary
+/// can be present yet non-functional -- e.g. a rustup proxy for a
+/// component (`rust-analyzer`) that was never installed exits immediately
+/// with an "unknown binary" error rather than behaving like a real
+/// language server, which `which()` alone can't detect.
+fn probe_available(cmd: &str) -> bool {
+    if which(cmd).is_none() {
+        return false;
+    }
+    Command::new(cmd)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
         .unwrap_or(false)
 }
 
@@ -121,7 +138,7 @@ impl LspClient {
         let Some((cmd, args)) = server_command(language) else {
             return Ok(None);
         };
-        if which(cmd).is_none() {
+        if !probe_available(cmd) {
             return Ok(None);
         }
 
