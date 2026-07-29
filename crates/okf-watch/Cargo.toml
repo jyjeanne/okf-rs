@@ -1,26 +1,17 @@
 [package]
-name = "okf-cli"
+name = "okf-watch"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "okf-rs command-line interface"
-
-[[bin]]
-name = "okf-rs"
-path = "src/main.rs"
+description = "Continuous re-indexing during local development for okf-rs"
 
 [dependencies]
 okf-core.workspace = true
-okf-parser.workspace = true
 okf-analyzer.workspace = true
 okf-generator.workspace = true
-okf-validator.workspace = true
-okf-watch.workspace = true
-okf-docs.workspace = true
-okf-query.workspace = true
 anyhow.workspace = true
-clap.workspace = true
+notify = "6"
 
 [dev-dependencies]
 tempfile = "3"

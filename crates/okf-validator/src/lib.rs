@@ -223,8 +223,17 @@ fn check_duplicate_ids(files: &[ScannedFile], report: &mut ValidationReport) {
 /// *different* paths (e.g. a stale file left behind after a rename, or a
 /// hand-edited copy) — that's detected here by two concept files sharing
 /// the same `resource` (source location).
+///
+/// A `Module` concept's `resource` is definitionally the whole file, so it
+/// legitimately coincides with a member's location whenever that member is
+/// the file's only top-level item (a common shape: a file containing
+/// exactly one function/class/struct) — that's expected containment, not
+/// a duplicate identity. So `Module` resources and non-`Module` resources
+/// are checked for collisions separately: a real duplicate (two `Function`
+/// files sharing a resource, or two `Module` files sharing one) is still
+/// caught, but a `Module` overlapping its own sole member never is.
 fn check_duplicate_resources(files: &[ScannedFile], report: &mut ValidationReport) {
-    let mut by_resource: HashMap<String, Vec<&str>> = HashMap::new();
+    let mut by_resource: HashMap<String, Vec<(&str, bool)>> = HashMap::new();
     for file in files {
         if is_index(&file.relative) {
             continue;
@@ -235,21 +244,38 @@ fn check_duplicate_resources(files: &[ScannedFile], report: &mut ValidationRepor
         let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
             continue;
         };
-        let Some(resource) = value
-            .as_mapping()
-            .and_then(|m| m.get("resource"))
-            .and_then(|v| v.as_str())
-        else {
+        let Some(mapping) = value.as_mapping() else {
             continue;
         };
+        let Some(resource) = mapping.get("resource").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let is_module = mapping
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t.ends_with(" Module"));
         by_resource
             .entry(resource.to_string())
             .or_default()
-            .push(&file.relative);
+            .push((&file.relative, is_module));
     }
 
-    for (resource, paths) in by_resource {
-        if paths.len() > 1 {
+    for (resource, entries) in by_resource {
+        let modules: Vec<&str> = entries
+            .iter()
+            .filter(|(_, is_module)| *is_module)
+            .map(|(path, _)| *path)
+            .collect();
+        let others: Vec<&str> = entries
+            .iter()
+            .filter(|(_, is_module)| !*is_module)
+            .map(|(path, _)| *path)
+            .collect();
+
+        for paths in [modules, others] {
+            if paths.len() <= 1 {
+                continue;
+            }
             let mut sorted = paths.clone();
             sorted.sort();
             for path in &sorted {
@@ -500,6 +526,70 @@ mod tests {
                 .count(),
             2,
             "both files sharing the resource should be flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn a_module_spanning_its_sole_member_is_not_a_duplicate() {
+        // A file containing exactly one top-level item (common for small
+        // single-purpose files) makes the Module concept's whole-file
+        // `resource` span identical to that lone member's — that's
+        // expected containment, not a duplicate identity.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [mod](modules/auth.md)\n- [fn](functions/auth/verify_token.md)\n",
+        );
+        write(
+            dir.path(),
+            "modules/auth.md",
+            "---\ntype: Rust Module\ntitle: auth\nresource: src/auth.rs#L1-L3\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/auth/verify_token.md",
+            "---\ntype: Rust Function\ntitle: verify_token\nresource: src/auth.rs#L1-L3\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "Module-vs-sole-member overlap should not be flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn two_modules_sharing_a_resource_is_still_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [a](modules/a.md)\n- [b](modules/b.md)\n",
+        );
+        write(
+            dir.path(),
+            "modules/a.md",
+            "---\ntype: Rust Module\ntitle: a\nresource: src/lib.rs#L1-L3\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "modules/b.md",
+            "---\ntype: Rust Module\ntitle: b\nresource: src/lib.rs#L1-L3\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.has_errors());
+        assert_eq!(
+            report
+                .issues
+                .iter()
+                .filter(|i| i.message.contains("duplicate concept identity"))
+                .count(),
+            2,
+            "two Module concepts sharing a resource should still be flagged: {:?}",
             report.issues
         );
     }

@@ -1,16 +1,15 @@
 [package]
-name = "okf-core"
+name = "okf-docs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Repository scanning and project loading for okf-rs"
+description = "Static HTML and consolidated Markdown documentation generation for okf-rs, templated directly from a bundle"
 
 [dependencies]
 okf-parser.workspace = true
+okf-render.workspace = true
 anyhow.workspace = true
-ignore.workspace = true
-toml.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

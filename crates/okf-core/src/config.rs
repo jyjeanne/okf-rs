@@ -80,3 +80,12 @@ pub fn write_default(project_root: &Path, output: &Path) -> Result<PathBuf> {
     fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
 }
+
+/// Resolves a bundle directory the way every okf-rs command does: an
+/// explicit path always wins (used as-is, relative to the caller's
+/// current directory — standard CLI convention); otherwise falls back to
+/// `okf.toml`'s `output`, joined against `project_root` — not the current
+/// directory — since that's what it was recorded against.
+pub fn resolve_bundle(project_root: &Path, explicit: Option<PathBuf>) -> PathBuf {
+    explicit.unwrap_or_else(|| project_root.join(load(project_root).output))
+}

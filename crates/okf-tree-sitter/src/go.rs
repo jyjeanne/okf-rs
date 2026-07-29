@@ -1,8 +1,9 @@
 use crate::common::{
-    import_relationship, is_public_by_go_convention, location, make_concept, module_path,
-    node_text, smallest_containing, strip_quotes,
+    import_relationship, is_public_by_go_convention, location, lsp_position, make_concept,
+    module_concept, module_path, node_text, signature_before_body, smallest_containing,
+    strip_quotes,
 };
-use crate::{CallCandidate, FileExtraction};
+use crate::{CallCandidate, CallSite, FileExtraction};
 use anyhow::Context;
 use anyhow::Result;
 use okf_parser::{Concept, ConceptKind, Language};
@@ -18,17 +19,6 @@ const QUERY_SRC: &str = r#"
 (call_expression function: (identifier) @call.name) @call.def
 (call_expression function: (selector_expression field: (field_identifier) @call.name)) @call.def
 "#;
-
-fn signature_before_body(src: &str, def_node: Node) -> String {
-    let end = def_node
-        .child_by_field_name("body")
-        .map(|b| b.start_byte())
-        .unwrap_or(def_node.end_byte());
-    src[def_node.start_byte()..end]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
 /// `type_spec` nodes (struct/interface definitions) have no `body` field,
 /// so `signature_before_body` can't be used for them — this truncates at
@@ -54,19 +44,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         .context("failed to parse Go source")?;
 
     let module = module_path(relative_path);
-    let mut module_concept = make_concept(
-        ConceptKind::Module,
-        Language::Go,
-        module.rsplit('.').next().unwrap_or(&module),
-        &module,
-        okf_parser::Location {
-            file: relative_path.to_string(),
-            start_line: 1,
-            end_line: source.lines().count().max(1),
-        },
-        None,
-        true,
-    );
+    let mut module_concept = module_concept(Language::Go, relative_path, source);
 
     let query = Query::new(&ts_lang, QUERY_SRC).context("invalid Go query")?;
     let mut cursor = QueryCursor::new();
@@ -74,7 +52,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
 
     let mut concepts: Vec<Concept> = Vec::new();
     let mut function_spans: Vec<(String, Range<usize>)> = Vec::new();
-    let mut raw_calls: Vec<(Range<usize>, String)> = Vec::new();
+    let mut raw_calls: Vec<(Range<usize>, String, CallSite)> = Vec::new();
 
     while let Some(m) = matches.next() {
         let mut import_path = None;
@@ -179,16 +157,21 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         }
 
         if let Some(node) = call_name {
-            raw_calls.push((node.byte_range(), node_text(source, node).to_string()));
+            raw_calls.push((
+                node.byte_range(),
+                node_text(source, node).to_string(),
+                lsp_position(source, node),
+            ));
         }
     }
 
     let mut calls = Vec::new();
-    for (range, callee_name) in raw_calls {
+    for (range, callee_name, call_site) in raw_calls {
         if let Some(caller_id) = smallest_containing(&function_spans, range.start) {
             calls.push(CallCandidate {
                 caller_id: caller_id.to_string(),
                 callee_name,
+                call_site,
             });
         }
     }

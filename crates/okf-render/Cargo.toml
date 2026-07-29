@@ -1,0 +1,10 @@
+[package]
+name = "okf-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared bundle-rendering traversal helpers used by okf-generator and okf-docs"
+
+[dependencies]
+okf-parser.workspace = true
