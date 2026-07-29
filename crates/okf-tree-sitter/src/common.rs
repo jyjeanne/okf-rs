@@ -14,6 +14,22 @@ pub fn location(relative_path: &str, node: Node) -> Location {
     }
 }
 
+/// Converts `node`'s start position into the Language Server Protocol's
+/// `Position` convention: 0-based line, 0-based *UTF-16 code unit* column.
+/// Not just a field rename from tree-sitter's own `Point` -- tree-sitter's
+/// `column` is a byte offset, so a line with any non-ASCII text before
+/// `node` needs its prefix actually re-encoded to know where a real LSP
+/// server would consider the node to start.
+pub fn lsp_position(src: &str, node: Node) -> crate::CallSite {
+    let start_byte = node.start_byte();
+    let line_start = src[..start_byte].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let character = src[line_start..start_byte].encode_utf16().count() as u32;
+    crate::CallSite {
+        line: node.start_position().row as u32,
+        character,
+    }
+}
+
 /// Derives a dotted module path from a file's relative path: drops the
 /// extension and collapses directory-index-like filenames (`mod`, `lib`,
 /// `main`, `__init__`, `index`) into their parent module, so
@@ -170,4 +186,64 @@ pub fn module_concept(language: Language, relative_path: &str, source: &str) -> 
         None,
         true,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    /// Parses `src` as Rust and returns the byte range of the first
+    /// occurrence of `needle`, used to locate a specific call/identifier
+    /// to check `lsp_position` against without hand-computing offsets.
+    fn find_byte_range(src: &str, needle: &str) -> Range<usize> {
+        let start = src.find(needle).expect("needle not found in source");
+        start..start + needle.len()
+    }
+
+    fn node_at<'a>(tree: &'a tree_sitter::Tree, byte: usize) -> Node<'a> {
+        tree.root_node()
+            .descendant_for_byte_range(byte, byte)
+            .expect("no node at byte")
+    }
+
+    #[test]
+    fn lsp_position_matches_line_and_ascii_column() {
+        let src = "fn a() {\n    b();\n}\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        let range = find_byte_range(src, "b()");
+        let node = node_at(&tree, range.start);
+        let pos = lsp_position(src, node);
+
+        assert_eq!(pos.line, 1, "call is on the second (0-based) line");
+        assert_eq!(pos.character, 4, "call starts after 4 leading spaces");
+    }
+
+    #[test]
+    fn lsp_position_counts_utf16_not_bytes_before_non_ascii_text_on_the_same_line() {
+        // "é" is 2 bytes in UTF-8 but 1 UTF-16 code unit -- a byte-offset
+        // column (tree-sitter's own convention) would overcount by 1 for
+        // anything after it on the same line; LSP needs the UTF-16 count.
+        let src = "fn a() {\n    let é = 1; b();\n}\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        let range = find_byte_range(src, "b()");
+        let node = node_at(&tree, range.start);
+        let pos = lsp_position(src, node);
+
+        assert_eq!(pos.line, 1);
+        assert_eq!(
+            pos.character, 15,
+            "UTF-16 code units before `b()`, not UTF-8 bytes (which would be 16)"
+        );
+    }
 }

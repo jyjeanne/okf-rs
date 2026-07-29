@@ -4,6 +4,7 @@ members = [
     "crates/okf-core",
     "crates/okf-parser",
     "crates/okf-tree-sitter",
+    "crates/okf-lsp",
     "crates/okf-analyzer",
     "crates/okf-generator",
     "crates/okf-render",
@@ -27,6 +28,7 @@ repository = "https://github.com/jyjeanne/okf-rs"
 okf-core = { path = "crates/okf-core" }
 okf-parser = { path = "crates/okf-parser" }
 okf-tree-sitter = { path = "crates/okf-tree-sitter" }
+okf-lsp = { path = "crates/okf-lsp" }
 okf-analyzer = { path = "crates/okf-analyzer" }
 okf-generator = { path = "crates/okf-generator" }
 okf-render = { path = "crates/okf-render" }

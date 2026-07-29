@@ -50,6 +50,15 @@ enum Command {
         /// independent of cache state.
         #[arg(long)]
         no_cache: bool,
+        /// Resolve calls whose callee name is ambiguous project-wide by
+        /// asking each call site's real language server
+        /// (`textDocument/definition`), on top of Tree-sitter's own
+        /// unambiguous-name-only resolution. Optional and best-effort: a
+        /// language with no available server is simply skipped. Spawns
+        /// real language server processes, so this is meaningfully slower
+        /// than a plain `generate`.
+        #[arg(long)]
+        lsp: bool,
     },
     /// Watch a project and keep its OKF bundle up to date as files change.
     /// Runs until interrupted (Ctrl+C). Regenerates once immediately, then
@@ -206,7 +215,8 @@ fn run(command: Command) -> Result<ExitCode> {
             path,
             output,
             no_cache,
-        } => cmd_generate(&path, output, no_cache),
+            lsp,
+        } => cmd_generate(&path, output, no_cache, lsp),
         Command::Watch {
             path,
             output,
@@ -316,6 +326,7 @@ fn cmd_generate(
     path: &std::path::Path,
     output: Option<PathBuf>,
     no_cache: bool,
+    lsp: bool,
 ) -> Result<ExitCode> {
     let project = Project::load(path)?;
     let output = resolve_bundle_arg(&project.root, output);
@@ -326,7 +337,7 @@ fn cmd_generate(
     } else {
         okf_analyzer::AnalysisCache::load(&cache_path)
     };
-    let (result, stats) = okf_analyzer::analyze_with_cache(&project, &mut cache)?;
+    let (result, stats) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache, lsp)?;
     okf_generator::write_bundle(&result.concepts, &output)?;
     if !no_cache {
         cache.save(&cache_path)?;

@@ -516,6 +516,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "okf-core",
+ "okf-lsp",
  "okf-parser",
  "okf-tree-sitter",
  "serde",
@@ -580,6 +581,16 @@ name = "okf-graph"
 version = "0.1.0"
 dependencies = [
  "okf-parser",
+]
+
+[[package]]
+name = "okf-lsp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "okf-parser",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -8,22 +8,26 @@
 //! has been extracted, each call candidate's callee name is looked up
 //! against every known function/method name in the project. A call is only
 //! resolved when the name is *unambiguous* (exactly one function/method
-//! with that name project-wide) — with no type information available yet
-//! (that arrives with LSP integration in Phase 2), resolving an ambiguous
-//! name would risk drawing a wrong edge, so it is deliberately left
-//! unresolved rather than guessed.
+//! with that name project-wide) — resolving an ambiguous name by guessing
+//! would risk drawing a wrong edge, so by default it's left unresolved
+//! instead. [`analyze_with_cache_lsp`] can do better for an ambiguous call
+//! by asking the project's real language server (`okf-lsp`) exactly which
+//! definition that specific call site resolves to — real type/scope
+//! resolution Tree-sitter's own name-matching has no way to approximate.
 //!
 //! Per-file extraction (the expensive tree-sitter parse) can be skipped
 //! for files that haven't changed since a previous run — see
 //! [`analyze_with_cache`] and [`AnalysisCache`].
 
 mod cache;
+mod lsp;
 
 pub use cache::AnalysisCache;
 
 use anyhow::{Context, Result};
 use okf_core::{ManifestKind, Project};
 use okf_parser::{Concept, ConceptKind, Language, Location, RelationKind, Relationship};
+use okf_tree_sitter::CallCandidate;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -74,9 +78,30 @@ pub fn analyze_with_cache(
     project: &Project,
     cache: &mut AnalysisCache,
 ) -> Result<(AnalysisResult, IncrementalStats)> {
+    analyze_with_cache_lsp(project, cache, false)
+}
+
+/// Like [`analyze_with_cache`], but when `use_lsp` is true, also attempts
+/// to resolve calls whose callee name matches more than one candidate
+/// project-wide by asking that call site's real language server exactly
+/// which definition it resolves to (`textDocument/definition`, via
+/// `okf-lsp`) — real type/scope resolution Tree-sitter's own name-matching
+/// has no way to approximate. Entirely additive and best-effort: a
+/// language with no available server, or a call the server can't answer
+/// for, is simply left unresolved exactly as [`analyze_with_cache`] (which
+/// passes `use_lsp: false`) always leaves it — this can only resolve
+/// *more* edges than the base algorithm, never fewer or different ones.
+/// Spawning and querying real language server processes makes this
+/// meaningfully slower than [`analyze_with_cache`]; it's opt-in for that
+/// reason, not just because a server may be unavailable.
+pub fn analyze_with_cache_lsp(
+    project: &Project,
+    cache: &mut AnalysisCache,
+    use_lsp: bool,
+) -> Result<(AnalysisResult, IncrementalStats)> {
     let mut concepts = detect_packages(project)?;
 
-    let mut calls = Vec::new();
+    let mut calls: Vec<(CallCandidate, Language, String)> = Vec::new();
     let mut stats = IncrementalStats::default();
     let mut fresh_cache = AnalysisCache::default();
 
@@ -97,7 +122,9 @@ pub fn analyze_with_cache(
             }
         };
         fresh_cache.insert(&file.relative_path, hash, extraction.clone());
-        calls.extend(extraction.calls);
+        for call in extraction.calls {
+            calls.push((call, file.language, file.relative_path.clone()));
+        }
         concepts.extend(extraction.concepts);
     }
     *cache = fresh_cache;
@@ -115,17 +142,36 @@ pub fn analyze_with_cache(
     }
 
     let mut resolved_edges: Vec<(String, String)> = Vec::new();
-    for call in &calls {
+    let mut ambiguous: Vec<&(CallCandidate, Language, String)> = Vec::new();
+    for entry in &calls {
+        let (call, _, _) = entry;
         let Some(candidates) = symbol_table.get(call.callee_name.as_str()) else {
             continue;
         };
         if candidates.len() != 1 {
+            if use_lsp {
+                ambiguous.push(entry);
+            }
             continue;
         }
         let callee_id = candidates[0].to_string();
         if callee_id != call.caller_id {
             resolved_edges.push((call.caller_id.clone(), callee_id));
         }
+    }
+
+    if use_lsp && !ambiguous.is_empty() {
+        let id_to_location: HashMap<&str, &Location> = concepts
+            .iter()
+            .map(|c| (c.id.as_str(), &c.location))
+            .collect();
+        lsp::resolve_ambiguous_calls(
+            project,
+            &ambiguous,
+            &id_to_location,
+            &symbol_table,
+            &mut resolved_edges,
+        );
     }
 
     let index_of: HashMap<String, usize> = concepts
@@ -511,6 +557,53 @@ mod tests {
             .relationships
             .iter()
             .any(|r| r.kind == RelationKind::Calls));
+    }
+
+    /// The same ambiguous-by-name shape as `does_not_resolve_ambiguous_call_names`
+    /// (two `run` functions, one bare `run()` call), but this time real
+    /// Rust scoping makes the call genuinely unambiguous: `caller` lives in
+    /// module `a`, which never imports `b::run`, so a real compiler (and
+    /// `rust-analyzer`) resolves the bare call to `a::run` specifically.
+    /// `use_lsp: true` should recover that edge; skipped, not failed, when
+    /// `rust-analyzer` isn't installed.
+    #[test]
+    fn resolves_an_ambiguous_call_via_a_real_rust_analyzer_when_scoping_disambiguates_it() {
+        if !okf_lsp::is_available(Language::Rust) {
+            eprintln!("skipping: rust-analyzer not installed");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "mod a;\nmod b;\n").unwrap();
+        fs::write(
+            dir.path().join("src/a.rs"),
+            "pub fn run() {}\npub fn caller() { run(); }\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("src/b.rs"), "pub fn run() {}\n").unwrap();
+
+        let project = Project::load(dir.path()).unwrap();
+        let mut cache = AnalysisCache::default();
+        // `analyze_with_cache_lsp` itself retries a slow-to-index server
+        // internally, so one call is enough here.
+        let (result, _) = analyze_with_cache_lsp(&project, &mut cache, true).unwrap();
+
+        let caller = result.concepts.iter().find(|c| c.name == "caller").unwrap();
+        let call = caller
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("caller should have exactly one resolved Calls edge");
+        assert_eq!(
+            call.target, "functions/src/a/run",
+            "should resolve specifically to a::run, not b::run"
+        );
     }
 
     fn make_concept(id: &str, signature: &str) -> Concept {

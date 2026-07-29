@@ -29,6 +29,17 @@ use okf_parser::{Concept, Language};
 use serde::{Deserialize, Serialize};
 use std::fs;
 
+/// A call expression's position, 0-based in UTF-16 code units the way the
+/// Language Server Protocol's `Position` is — not tree-sitter's own byte-
+/// offset convention — so `okf-lsp` can query `textDocument/definition`
+/// at this exact spot without a second conversion step. See
+/// `common::lsp_position`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CallSite {
+    pub line: u32,
+    pub character: u32,
+}
+
 /// A call expression found in a function/method body, not yet resolved to
 /// a target concept id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +48,11 @@ pub struct CallCandidate {
     pub caller_id: String,
     /// Bare (unqualified) name of the called function.
     pub callee_name: String,
+    /// Where the call itself appears — used only for LSP-based
+    /// disambiguation of calls whose name is ambiguous project-wide (see
+    /// `okf_lsp`); Tree-sitter's own unambiguous-name resolution in
+    /// `okf-analyzer` doesn't need it.
+    pub call_site: CallSite,
 }
 
 /// Everything extracted from a single source file.

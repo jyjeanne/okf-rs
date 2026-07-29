@@ -16,10 +16,10 @@
 //! called identifier regardless of receiver.
 
 use crate::common::{
-    import_relationship, location, make_concept, module_concept, module_path, node_text,
-    signature_before_body, smallest_containing, type_signature,
+    import_relationship, location, lsp_position, make_concept, module_concept, module_path,
+    node_text, signature_before_body, smallest_containing, type_signature,
 };
-use crate::{CallCandidate, FileExtraction};
+use crate::{CallCandidate, CallSite, FileExtraction};
 use anyhow::{Context, Result};
 use okf_parser::{Concept, ConceptKind, Language};
 use std::ops::Range;
@@ -80,7 +80,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
 
     let mut concepts: Vec<Concept> = Vec::new();
     let mut function_spans: Vec<(String, Range<usize>)> = Vec::new();
-    let mut raw_calls: Vec<(Range<usize>, String)> = Vec::new();
+    let mut raw_calls: Vec<(Range<usize>, String, CallSite)> = Vec::new();
 
     while let Some(m) = matches.next() {
         let mut import_node = None;
@@ -201,16 +201,21 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         }
 
         if let Some(node) = call_name {
-            raw_calls.push((node.byte_range(), node_text(source, node).to_string()));
+            raw_calls.push((
+                node.byte_range(),
+                node_text(source, node).to_string(),
+                lsp_position(source, node),
+            ));
         }
     }
 
     let mut calls = Vec::new();
-    for (range, callee_name) in raw_calls {
+    for (range, callee_name, call_site) in raw_calls {
         if let Some(caller_id) = smallest_containing(&function_spans, range.start) {
             calls.push(CallCandidate {
                 caller_id: caller_id.to_string(),
                 callee_name,
+                call_site,
             });
         }
     }

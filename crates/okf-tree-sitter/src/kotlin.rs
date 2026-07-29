@@ -24,8 +24,8 @@
 //! other extractor's "capture the def, capture the name" shape.
 
 use crate::common::{
-    import_relationship, location, make_concept, module_concept, module_path, node_text,
-    smallest_containing, type_signature,
+    import_relationship, location, lsp_position, make_concept, module_concept, module_path,
+    node_text, smallest_containing, type_signature,
 };
 use crate::{CallCandidate, FileExtraction};
 use anyhow::{Context, Result};
@@ -232,6 +232,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
             calls.push(CallCandidate {
                 caller_id: caller_id.to_string(),
                 callee_name: callee_name.to_string(),
+                call_site: lsp_position(source, call_node),
             });
         }
     }
