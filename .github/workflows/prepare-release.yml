@@ -64,7 +64,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git commit -m "Release v$version"
+          # Cargo.toml can already be at `version` -- e.g. the very first
+          # release, cut before anything ever bumped it off the crate
+          # template's default -- in which case there's nothing to commit.
+          # `git commit` would fail on that ("nothing to commit"), so only
+          # commit/push a branch update when the bump actually changed
+          # something; either way, still tag and push from current HEAD.
+          if git diff --cached --quiet; then
+            echo "Cargo.toml/Cargo.lock already at $version -- nothing to bump, tagging current HEAD."
+          else
+            git commit -m "Release v$version"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
           git tag "v$version"
-          git push origin "HEAD:${{ github.ref_name }}"
           git push origin "v$version"
