@@ -1,0 +1,48 @@
+name: Reusable Test
+
+# Shared build/lint/test steps called by both ci.yml (full OS matrix) and
+# release.yml (pre-release safety check), so the two never drift apart.
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        required: true
+        type: string
+      lint:
+        description: Run `cargo fmt --check` and clippy in addition to build/test.
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        if: inputs.lint
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        if: inputs.lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked

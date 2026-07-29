@@ -1,8 +1,9 @@
 name: Release
 
-# Builds standalone `okf-rs` CLI binaries for Linux, macOS, and Windows and
-# attaches them to the GitHub Release for the pushed tag. Triggered by
-# pushing a tag like `v0.1.0`.
+# Verifies the tag matches the crate version and the full test suite passes,
+# then builds standalone `okf-rs` CLI binaries (with sha256 checksums) for
+# Linux, macOS, and Windows and attaches them to the GitHub Release for the
+# pushed tag. Triggered by pushing a tag like `v0.1.0`.
 
 on:
   push:
@@ -14,11 +15,48 @@ on:
         description: "Tag to publish the release for, e.g. v0.1.0 (required for manual runs; ignored on tag pushes)"
         required: true
 
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Resolve the actual released package's version via cargo, rather than
+      # grepping Cargo.toml text, so this stays correct even if okf-cli ever
+      # stops inheriting workspace.package.version. Skipped (not failed) on
+      # workflow_dispatch, which has no tag to check.
+      - name: Verify tag matches okf-cli version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg_version=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "okf-cli") | .version')
+          if [ "$tag" != "$pkg_version" ]; then
+            echo "::error::Tag v$tag does not match okf-cli version ($pkg_version)"
+            exit 1
+          fi
+
+  test:
+    uses: ./.github/workflows/reusable-test.yml
+    with:
+      os: ubuntu-latest
+      lint: false
+
   build:
+    needs:
+      - test
+      - check-version
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +78,7 @@ jobs:
             archive_ext: zip
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -74,6 +113,18 @@ jobs:
           mkdir -p dist
           (cd "$bin_dir" && 7z a -tzip "${GITHUB_WORKSPACE}/dist/${name}.zip" okf-rs.exe)
 
+      - name: Generate checksum
+        shell: bash
+        run: |
+          cd dist
+          for f in *; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: okf-rs-${{ matrix.target }}
@@ -82,6 +133,9 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
