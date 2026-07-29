@@ -1,13 +1,19 @@
 //! Writes a set of [`okf_parser::Concept`]s out as a conformant OKF bundle:
 //! one markdown file with YAML frontmatter per concept, grouped into
 //! per-kind directories, with an `index.md` at the bundle root and at each
-//! directory.
+//! directory. Each concept's relationships are rendered both into the
+//! markdown body (human-readable `# Calls` / `# Imports` / ... sections,
+//! cross-linked where the target is in the bundle) and into a
+//! `relationships` frontmatter field (machine-readable target ids grouped
+//! by kind), so `okf_parser::read_bundle` can reconstruct the full graph
+//! from a bundle on disk without re-analyzing the project from source.
 
 mod agents;
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use okf_parser::{Concept, ConceptKind, RelationKind};
+use okf_parser::{Concept, RelationKind};
+use okf_render::{capitalize, contains_members, group_by_kind_dir, relative_link};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -33,6 +39,54 @@ struct Frontmatter {
     visibility: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<DateTime<Utc>>,
+    /// Target concept ids grouped by relation kind, so a bundle on disk
+    /// carries the full call/import graph without needing to re-analyze
+    /// the project from source (see `okf_parser::read_bundle`, the
+    /// reverse of this). Only emitted when non-empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relationships: Option<RelationshipsFrontmatter>,
+}
+
+#[derive(Serialize, Default)]
+struct RelationshipsFrontmatter {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    imports: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    calls: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    called_by: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    implements: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    inherits: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    depends_on: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    member_of: Vec<String>,
+}
+
+/// Groups `concept`'s relationship targets by kind for frontmatter,
+/// preserving each kind's original relative order. `None` when the
+/// concept has no relationships, so the frontmatter field is omitted
+/// entirely rather than emitted as an empty mapping.
+fn relationships_frontmatter(concept: &Concept) -> Option<RelationshipsFrontmatter> {
+    if concept.relationships.is_empty() {
+        return None;
+    }
+    let mut grouped = RelationshipsFrontmatter::default();
+    for rel in &concept.relationships {
+        let bucket = match rel.kind {
+            RelationKind::Imports => &mut grouped.imports,
+            RelationKind::Calls => &mut grouped.calls,
+            RelationKind::CalledBy => &mut grouped.called_by,
+            RelationKind::Implements => &mut grouped.implements,
+            RelationKind::Inherits => &mut grouped.inherits,
+            RelationKind::DependsOn => &mut grouped.depends_on,
+            RelationKind::MemberOf => &mut grouped.member_of,
+        };
+        bucket.push(rel.target.clone());
+    }
+    Some(grouped)
 }
 
 /// Writes `concepts` to `output_dir` as an OKF bundle. Fails fast (before
@@ -58,17 +112,7 @@ pub fn write_bundle(concepts: &[Concept], output_dir: &Path) -> Result<()> {
     }
 
     let bundle_ids: HashSet<&str> = concepts.iter().map(|c| c.id.as_str()).collect();
-
-    let mut by_dir: BTreeMap<&str, Vec<&Concept>> = BTreeMap::new();
-    for concept in concepts {
-        by_dir
-            .entry(concept.kind.bundle_dir())
-            .or_default()
-            .push(concept);
-    }
-    for entries in by_dir.values_mut() {
-        entries.sort_by(|a, b| a.id.cmp(&b.id));
-    }
+    let by_dir = group_by_kind_dir(concepts);
 
     fs::create_dir_all(output_dir)?;
 
@@ -90,16 +134,6 @@ pub fn write_bundle(concepts: &[Concept], output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Relative markdown link from the file at `from_pseudo_id` (a concept id,
-/// or `"<dir>/index"` / `"index"` for an index file) to `to_id`. Always
-/// correct (walks up to the bundle root and back down), though not always
-/// the shortest possible path.
-fn relative_link(from_pseudo_id: &str, to_id: &str) -> String {
-    let depth = from_pseudo_id.matches('/').count();
-    let up = "../".repeat(depth);
-    format!("{up}{to_id}.md")
-}
-
 fn render_concept(
     concept: &Concept,
     all: &[Concept],
@@ -117,6 +151,7 @@ fn render_concept(
             Some("private")
         },
         timestamp: concept.timestamp,
+        relationships: relationships_frontmatter(concept),
     };
     let yaml = serde_yaml::to_string(&frontmatter)?;
     let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
@@ -129,22 +164,17 @@ fn render_concept(
         body.push_str("`\n\n");
     }
 
-    if concept.kind == ConceptKind::Module {
-        let members: Vec<&Concept> = all
-            .iter()
-            .filter(|c| c.id != concept.id && c.location.file == concept.location.file)
-            .collect();
-        if !members.is_empty() {
-            body.push_str("# Contains\n\n");
-            for member in members {
-                body.push_str(&format!(
-                    "- [{}]({})\n",
-                    member.name,
-                    relative_link(&concept.id, &member.id)
-                ));
-            }
-            body.push('\n');
+    let members = contains_members(concept, all);
+    if !members.is_empty() {
+        body.push_str("# Contains\n\n");
+        for member in members {
+            body.push_str(&format!(
+                "- [{}]({})\n",
+                member.name,
+                relative_link(&concept.id, &member.id, "md")
+            ));
         }
+        body.push('\n');
     }
 
     for (kind, heading) in [
@@ -171,7 +201,7 @@ fn render_concept(
                 body.push_str(&format!(
                     "- [{}]({})\n",
                     rel.target_display,
-                    relative_link(&concept.id, &rel.target)
+                    relative_link(&concept.id, &rel.target, "md")
                 ));
             } else {
                 body.push_str(&format!("- `{}`\n", rel.target_display));
@@ -190,7 +220,7 @@ fn write_dir_index(output_dir: &Path, dir: &str, entries: &[&Concept]) -> Result
         content.push_str(&format!(
             "- [{}]({}) — {}\n",
             concept.name,
-            relative_link(&pseudo_id, &concept.id),
+            relative_link(&pseudo_id, &concept.id, "md"),
             concept.frontmatter_type()
         ));
     }
@@ -210,14 +240,6 @@ fn write_root_index(output_dir: &Path, by_dir: &BTreeMap<&str, Vec<&Concept>>) -
     }
     fs::write(output_dir.join("index.md"), content)?;
     Ok(())
-}
-
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
 }
 
 #[cfg(test)]
@@ -332,5 +354,111 @@ mod tests {
 
         let private_content = fs::read_to_string(dir.path().join("functions/helper.md")).unwrap();
         assert!(private_content.contains("visibility: private"));
+    }
+
+    #[test]
+    fn serializes_relationships_into_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut caller = concept(
+            ConceptKind::Function,
+            "verify_token",
+            "auth.verify_token",
+            "src/auth.rs",
+        );
+        let callee = concept(
+            ConceptKind::Function,
+            "decode_jwt",
+            "auth.decode_jwt",
+            "src/auth.rs",
+        );
+        caller.relationships.push(Relationship {
+            kind: RelationKind::Calls,
+            target: callee.id.clone(),
+            target_display: "decode_jwt".to_string(),
+        });
+
+        write_bundle(&[caller, callee], dir.path()).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
+        assert!(content.contains("relationships:\n  calls:\n  - functions/auth/decode_jwt\n"));
+    }
+
+    #[test]
+    fn frontmatter_relationships_round_trip_through_read_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut caller = concept(
+            ConceptKind::Function,
+            "verify_token",
+            "auth.verify_token",
+            "src/auth.rs",
+        );
+        let mut callee = concept(
+            ConceptKind::Function,
+            "decode_jwt",
+            "auth.decode_jwt",
+            "src/auth.rs",
+        );
+        caller.relationships.push(Relationship {
+            kind: RelationKind::Calls,
+            target: callee.id.clone(),
+            target_display: "decode_jwt".to_string(),
+        });
+        callee.relationships.push(Relationship {
+            kind: RelationKind::CalledBy,
+            target: caller.id.clone(),
+            target_display: "verify_token".to_string(),
+        });
+
+        write_bundle(&[caller.clone(), callee.clone()], dir.path()).unwrap();
+        let read_back = okf_parser::read_bundle(dir.path()).unwrap();
+
+        assert_eq!(read_back.len(), 2);
+        let read_caller = read_back.iter().find(|c| c.id == caller.id).unwrap();
+        assert_eq!(read_caller.relationships.len(), 1);
+        assert_eq!(read_caller.relationships[0].kind, RelationKind::Calls);
+        assert_eq!(read_caller.relationships[0].target, callee.id);
+        assert_eq!(read_caller.relationships[0].target_display, "decode_jwt");
+
+        let read_callee = read_back.iter().find(|c| c.id == callee.id).unwrap();
+        assert_eq!(read_callee.relationships[0].kind, RelationKind::CalledBy);
+        assert_eq!(read_callee.relationships[0].target_display, "verify_token");
+    }
+
+    #[test]
+    fn omits_relationships_field_when_concept_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let solo = concept(ConceptKind::Function, "run", "run", "src/a.rs");
+        write_bundle(&[solo], dir.path()).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("functions/run.md")).unwrap();
+        assert!(!content.contains("relationships"));
+    }
+
+    #[test]
+    fn package_contains_lists_its_member_modules_via_reverse_member_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = concept(ConceptKind::Package, "demo", "demo", "Cargo.toml");
+        let mut module = concept(ConceptKind::Module, "lib", "lib", "src/lib.rs");
+        module.relationships.push(Relationship {
+            kind: RelationKind::MemberOf,
+            target: package.id.clone(),
+            target_display: "demo".to_string(),
+        });
+
+        write_bundle(&[package.clone(), module.clone()], dir.path()).unwrap();
+
+        let package_content = fs::read_to_string(dir.path().join("packages/demo.md")).unwrap();
+        assert!(package_content.contains("# Contains"));
+        assert!(package_content.contains(&format!(
+            "[lib]({})",
+            relative_link(&package.id, &module.id, "md")
+        )));
+
+        let module_content = fs::read_to_string(dir.path().join("modules/lib.md")).unwrap();
+        assert!(
+            module_content.contains("# Member of"),
+            "the generic relationship rendering should show the module's own Member of section: {module_content}"
+        );
     }
 }

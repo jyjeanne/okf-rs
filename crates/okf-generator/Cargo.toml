@@ -8,6 +8,7 @@ description = "OKF bundle writer for okf-rs"
 
 [dependencies]
 okf-parser.workspace = true
+okf-render.workspace = true
 anyhow.workspace = true
 serde_yaml.workspace = true
 serde.workspace = true

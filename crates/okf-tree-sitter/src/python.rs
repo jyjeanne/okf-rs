@@ -1,8 +1,8 @@
 use crate::common::{
-    import_relationship, is_public_by_underscore_convention, location, make_concept, module_path,
-    node_text, smallest_containing,
+    import_relationship, is_public_by_underscore_convention, location, lsp_position, make_concept,
+    module_concept, module_path, node_text, smallest_containing,
 };
-use crate::{CallCandidate, FileExtraction};
+use crate::{CallCandidate, CallSite, FileExtraction};
 use anyhow::{Context, Result};
 use okf_parser::{Concept, ConceptKind, Language};
 use std::ops::Range;
@@ -60,19 +60,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         .context("failed to parse Python source")?;
 
     let module = module_path(relative_path);
-    let mut module_concept = make_concept(
-        ConceptKind::Module,
-        Language::Python,
-        module.rsplit('.').next().unwrap_or(&module),
-        &module,
-        okf_parser::Location {
-            file: relative_path.to_string(),
-            start_line: 1,
-            end_line: source.lines().count().max(1),
-        },
-        None,
-        true,
-    );
+    let mut module_concept = module_concept(Language::Python, relative_path, source);
 
     let query = Query::new(&ts_lang, QUERY_SRC).context("invalid Python query")?;
     let mut cursor = QueryCursor::new();
@@ -80,7 +68,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
 
     let mut concepts: Vec<Concept> = Vec::new();
     let mut function_spans: Vec<(String, Range<usize>)> = Vec::new();
-    let mut raw_calls: Vec<(Range<usize>, String)> = Vec::new();
+    let mut raw_calls: Vec<(Range<usize>, String, CallSite)> = Vec::new();
 
     while let Some(m) = matches.next() {
         let mut import_name = None;
@@ -148,16 +136,21 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         }
 
         if let Some(node) = call_name {
-            raw_calls.push((node.byte_range(), node_text(source, node).to_string()));
+            raw_calls.push((
+                node.byte_range(),
+                node_text(source, node).to_string(),
+                lsp_position(source, node),
+            ));
         }
     }
 
     let mut calls = Vec::new();
-    for (range, callee_name) in raw_calls {
+    for (range, callee_name, call_site) in raw_calls {
         if let Some(caller_id) = smallest_containing(&function_spans, range.start) {
             calls.push(CallCandidate {
                 caller_id: caller_id.to_string(),
                 callee_name,
+                call_site,
             });
         }
     }

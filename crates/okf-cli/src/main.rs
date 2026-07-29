@@ -1,5 +1,3 @@
-mod config;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use okf_core::Project;
@@ -46,6 +44,36 @@ enum Command {
         /// Bundle output directory. Defaults to the value in `okf.toml`, or `knowledge`.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Ignore and don't update the `.okf-cache.json` incremental-index
+        /// cache — every file is re-parsed from scratch. Useful to rule
+        /// out a stale/corrupt cache, or to verify output determinism
+        /// independent of cache state.
+        #[arg(long)]
+        no_cache: bool,
+        /// Resolve calls whose callee name is ambiguous project-wide by
+        /// asking each call site's real language server
+        /// (`textDocument/definition`), on top of Tree-sitter's own
+        /// unambiguous-name-only resolution. Optional and best-effort: a
+        /// language with no available server is simply skipped. Spawns
+        /// real language server processes, so this is meaningfully slower
+        /// than a plain `generate`.
+        #[arg(long)]
+        lsp: bool,
+    },
+    /// Watch a project and keep its OKF bundle up to date as files change.
+    /// Runs until interrupted (Ctrl+C). Regenerates once immediately, then
+    /// again after each burst of filesystem activity settles, reusing the
+    /// same `.okf-cache.json` incremental-index cache `generate` does.
+    Watch {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Bundle output directory. Defaults to the value in `okf.toml`, or `knowledge`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// How long a quiet period must last, in milliseconds, before a
+        /// burst of filesystem events triggers a regenerate.
+        #[arg(long, default_value_t = 300)]
+        debounce_ms: u64,
     },
     /// Validate that a directory is a conformant OKF bundle.
     Validate {
@@ -68,8 +96,10 @@ enum Command {
         project: PathBuf,
     },
     /// Query the concept graph: callers, callees, cycles, public API, and
-    /// cross-module dependencies. Re-analyzes the project fresh each run
-    /// (relationships aren't yet serialized into the bundle on disk).
+    /// cross-module dependencies. Reads relationships directly from a
+    /// previously generated OKF bundle on disk — run `okf-rs generate`
+    /// first (and re-run it after source changes, to keep the bundle's
+    /// relationships current).
     Graph {
         #[command(subcommand)]
         query: GraphQuery,
@@ -82,6 +112,28 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Generate human-readable documentation from a previously generated OKF
+    /// bundle: either a browsable static HTML site, or a single consolidated
+    /// Markdown document.
+    Docs {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+        /// Output path: a directory for `--format html`, a file for
+        /// `--format markdown`. Defaults to `docs/` or `docs.md` respectively.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(short, long, value_enum, default_value_t = DocsFormat::Html)]
+        format: DocsFormat,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DocsFormat {
+    Html,
+    Markdown,
 }
 
 #[derive(Subcommand)]
@@ -89,36 +141,54 @@ enum GraphQuery {
     /// List concepts that directly call the given concept id.
     Callers {
         id: String,
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
     /// List concepts the given concept id directly calls.
     Callees {
         id: String,
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
     /// List groups of concepts that call each other in a cycle.
     Cycles {
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
     /// List the public API surface (public functions/methods/types).
     Api {
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
     /// List cross-module dependency edges (which modules call into which).
     Modules {
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
     /// Find the shortest call path between two concept ids.
     Path {
         from: String,
         to: String,
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
 }
 
@@ -141,7 +211,17 @@ fn run(command: Command) -> Result<ExitCode> {
             no_agent_files,
         } => cmd_init(&path, &output, no_agent_files),
         Command::Scan { path } => cmd_scan(&path),
-        Command::Generate { path, output } => cmd_generate(&path, output),
+        Command::Generate {
+            path,
+            output,
+            no_cache,
+            lsp,
+        } => cmd_generate(&path, output, no_cache, lsp),
+        Command::Watch {
+            path,
+            output,
+            debounce_ms,
+        } => cmd_watch(&path, output, debounce_ms),
         Command::Validate {
             bundle,
             project,
@@ -158,6 +238,12 @@ fn run(command: Command) -> Result<ExitCode> {
             to_ref,
             path,
         } => cmd_diff(&from_ref, &to_ref, &path),
+        Command::Docs {
+            bundle,
+            project,
+            output,
+            format,
+        } => cmd_docs(bundle, &project, output, format),
     }
 }
 
@@ -168,7 +254,7 @@ fn run(command: Command) -> Result<ExitCode> {
 /// what it was recorded against, so it's joined here rather than left to
 /// resolve against whatever directory the command happens to run from.
 fn resolve_bundle_arg(project_root: &std::path::Path, explicit: Option<PathBuf>) -> PathBuf {
-    explicit.unwrap_or_else(|| project_root.join(config::load(project_root).output))
+    okf_core::config::resolve_bundle(project_root, explicit)
 }
 
 fn cmd_init(
@@ -177,7 +263,7 @@ fn cmd_init(
     no_agent_files: bool,
 ) -> Result<ExitCode> {
     let project = Project::load(path)?;
-    let config_path = config::write_default(&project.root, output)?;
+    let config_path = okf_core::config::write_default(&project.root, output)?;
     println!(
         "Initialized okf-rs project at {} ({} source files detected)",
         project.root.display(),
@@ -199,9 +285,22 @@ fn cmd_init(
 fn cmd_scan(path: &std::path::Path) -> Result<ExitCode> {
     let project = Project::load(path)?;
     println!("Project root: {}", project.root.display());
-    match project.manifest {
-        Some(kind) => println!("Manifest: {kind:?}"),
-        None => println!("Manifest: none detected"),
+    match project.packages.as_slice() {
+        [] => println!("Manifest: none detected"),
+        // A single manifest at the project root: the common single-package
+        // case, reported the same way it always was.
+        [pkg] if pkg.relative_dir.is_empty() => println!("Manifest: {:?}", pkg.manifest),
+        packages => {
+            println!("{} packages detected:", packages.len());
+            for pkg in packages {
+                let dir = if pkg.relative_dir.is_empty() {
+                    "."
+                } else {
+                    &pkg.relative_dir
+                };
+                println!("  {:<30} {:?}", dir, pkg.manifest);
+            }
+        }
     }
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
@@ -215,25 +314,84 @@ fn cmd_scan(path: &std::path::Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_generate(path: &std::path::Path, output: Option<PathBuf>) -> Result<ExitCode> {
+/// Where `generate` persists its incremental-indexing cache: a hidden
+/// file at the project root, sibling to `okf.toml`, so it survives
+/// between invocations regardless of `--output`. Not part of the OKF
+/// bundle itself (it's not `.md`, and lives outside `--output` entirely)
+/// — a purely local, disposable performance cache, safe to delete or
+/// `.gitignore` like `target/`.
+const CACHE_FILE: &str = ".okf-cache.json";
+
+fn cmd_generate(
+    path: &std::path::Path,
+    output: Option<PathBuf>,
+    no_cache: bool,
+    lsp: bool,
+) -> Result<ExitCode> {
     let project = Project::load(path)?;
     let output = resolve_bundle_arg(&project.root, output);
+    let cache_path = project.root.join(CACHE_FILE);
 
-    let result = okf_analyzer::analyze(&project)?;
+    let mut cache = if no_cache {
+        okf_analyzer::AnalysisCache::default()
+    } else {
+        okf_analyzer::AnalysisCache::load(&cache_path)
+    };
+    let (result, stats) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache, lsp)?;
     okf_generator::write_bundle(&result.concepts, &output)?;
+    if !no_cache {
+        cache.save(&cache_path)?;
+    }
 
     let mut by_kind: BTreeMap<ConceptKind, usize> = BTreeMap::new();
     for concept in &result.concepts {
         *by_kind.entry(concept.kind).or_default() += 1;
     }
     println!(
-        "Generated {} concepts into {}",
+        "Generated {} concepts into {} ({} files parsed, {} reused from cache)",
         result.concepts.len(),
-        output.display()
+        output.display(),
+        stats.reparsed,
+        stats.reused
     );
     for (kind, count) in by_kind {
         println!("  {:<12} {count}", kind.as_str());
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_watch(
+    path: &std::path::Path,
+    output: Option<PathBuf>,
+    debounce_ms: u64,
+) -> Result<ExitCode> {
+    // Just the canonicalized root is needed here -- `okf_watch::watch`
+    // does its own full `Project::load` scan for the baseline regenerate,
+    // so doing another one here first would walk the whole directory
+    // tree twice before the first bundle is even produced.
+    let project_root = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve project root {}", path.display()))?;
+    let output = resolve_bundle_arg(&project_root, output);
+    let cache_path = project_root.join(CACHE_FILE);
+
+    println!(
+        "Watching {} for changes (bundle: {}, Ctrl+C to stop)...",
+        project_root.display(),
+        output.display()
+    );
+    okf_watch::watch(
+        &project_root,
+        &output,
+        &cache_path,
+        std::time::Duration::from_millis(debounce_ms),
+        |event| {
+            println!(
+                "Regenerated {} concepts ({} files parsed, {} reused from cache)",
+                event.concepts, event.stats.reparsed, event.stats.reused
+            );
+        },
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -274,26 +432,36 @@ fn cmd_validate(bundle: Option<PathBuf>, project: &std::path::Path, ci: bool) ->
     }
 }
 
-fn cmd_search(query: &str, bundle: Option<PathBuf>, project: &std::path::Path) -> Result<ExitCode> {
+/// Resolves `bundle`/`project` the same way `validate` does — an explicit
+/// bundle path wins, otherwise `okf.toml`'s recorded output relative to
+/// the (canonicalized) project root.
+fn resolve_query_bundle(bundle: Option<PathBuf>, project: &std::path::Path) -> PathBuf {
     let project_root = project
         .canonicalize()
         .unwrap_or_else(|_| project.to_path_buf());
-    let bundle = resolve_bundle_arg(&project_root, bundle);
-    let index = okf_search::SearchIndex::build(&bundle)?;
-    let hits = index.search(query);
+    resolve_bundle_arg(&project_root, bundle)
+}
 
-    if hits.is_empty() {
-        println!("No matches for `{query}` in {}", bundle.display());
-        return Ok(ExitCode::SUCCESS);
+/// Prints an `okf-query` result the same way every `search`/`graph`
+/// subcommand does: the text on success, or the error on stderr with a
+/// non-zero exit — one place for that pairing instead of one per
+/// subcommand.
+fn print_query_result(result: Result<String>) -> Result<ExitCode> {
+    match result {
+        Ok(text) => {
+            println!("{text}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            Ok(ExitCode::FAILURE)
+        }
     }
+}
 
-    for hit in hits {
-        println!(
-            "{:>3}  {:<24} {:<20} {}",
-            hit.score, hit.entry.title, hit.entry.concept_type, hit.entry.id
-        );
-    }
-    Ok(ExitCode::SUCCESS)
+fn cmd_search(query: &str, bundle: Option<PathBuf>, project: &std::path::Path) -> Result<ExitCode> {
+    let bundle = resolve_query_bundle(bundle, project);
+    print_query_result(okf_query::search(&bundle, query))
 }
 
 fn analyze_path(path: &std::path::Path) -> Result<okf_analyzer::AnalysisResult> {
@@ -301,108 +469,79 @@ fn analyze_path(path: &std::path::Path) -> Result<okf_analyzer::AnalysisResult> 
     okf_analyzer::analyze(&project)
 }
 
-fn require_concept<'a>(
-    graph: &okf_graph::Graph<'a>,
-    id: &str,
-) -> Result<&'a okf_parser::Concept, ExitCode> {
-    match graph.get(id) {
-        Some(concept) => Ok(concept),
-        None => {
-            eprintln!("error: no concept with id `{id}` (use `okf-rs search` to find valid ids)");
-            Err(ExitCode::FAILURE)
+fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
+    match query {
+        GraphQuery::Callers {
+            id,
+            bundle,
+            project,
+        } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_callers(&bundle, &id))
+        }
+        GraphQuery::Callees {
+            id,
+            bundle,
+            project,
+        } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_callees(&bundle, &id))
+        }
+        GraphQuery::Cycles { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_cycles(&bundle))
+        }
+        GraphQuery::Api { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_api(&bundle))
+        }
+        GraphQuery::Modules { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_modules(&bundle))
+        }
+        GraphQuery::Path {
+            from,
+            to,
+            bundle,
+            project,
+        } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_path(&bundle, &from, &to))
         }
     }
 }
 
-fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
-    match query {
-        GraphQuery::Callers { id, path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
-            let Ok(_) = require_concept(&graph, &id) else {
-                return Ok(ExitCode::FAILURE);
-            };
-            let callers = graph.callers(&id);
-            if callers.is_empty() {
-                println!("No callers found for `{id}`");
-            }
-            for caller in callers {
-                println!("{} — {}", caller.id, caller.frontmatter_type());
-            }
-            Ok(ExitCode::SUCCESS)
+fn cmd_docs(
+    bundle: Option<PathBuf>,
+    project: &std::path::Path,
+    output: Option<PathBuf>,
+    format: DocsFormat,
+) -> Result<ExitCode> {
+    let bundle = resolve_query_bundle(bundle, project);
+    let concepts = okf_query::load_concepts(&bundle)?;
+    match format {
+        DocsFormat::Html => {
+            let output = output.unwrap_or_else(|| PathBuf::from("docs"));
+            okf_docs::generate_html(&concepts, &output)?;
+            println!(
+                "Generated HTML documentation for {} concepts into {}",
+                concepts.len(),
+                output.display()
+            );
         }
-        GraphQuery::Callees { id, path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
-            let Ok(_) = require_concept(&graph, &id) else {
-                return Ok(ExitCode::FAILURE);
-            };
-            let callees = graph.callees(&id);
-            if callees.is_empty() {
-                println!(
-                    "`{id}` doesn't call anything (or only calls unresolved/ambiguous targets)"
-                );
-            }
-            for callee in callees {
-                println!("{} — {}", callee.id, callee.frontmatter_type());
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        GraphQuery::Cycles { path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
-            let cycles = graph.cycles();
-            if cycles.is_empty() {
-                println!("No cycles found in the call graph");
-            }
-            for cycle in cycles {
-                println!("{}", cycle.join(" -> "));
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        GraphQuery::Api { path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
-            let api = graph.public_api();
-            println!("{} public concepts:", api.len());
-            for concept in api {
-                println!("  {:<12} {}", concept.frontmatter_type(), concept.id);
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        GraphQuery::Modules { path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
-            let deps = graph.module_dependencies();
-            if deps.is_empty() {
-                println!("No cross-module call dependencies found");
-            }
-            for (from, to) in deps {
-                println!("{from} -> {to}");
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        GraphQuery::Path { from, to, path } => {
-            let result = analyze_path(&path)?;
-            let graph = okf_graph::Graph::build(&result.concepts);
-            let Ok(_) = require_concept(&graph, &from) else {
-                return Ok(ExitCode::FAILURE);
-            };
-            let Ok(_) = require_concept(&graph, &to) else {
-                return Ok(ExitCode::FAILURE);
-            };
-            match graph.shortest_call_path(&from, &to) {
-                Some(steps) => {
-                    println!("{}", steps.join(" -> "));
-                    Ok(ExitCode::SUCCESS)
-                }
-                None => {
-                    println!("No call path found from `{from}` to `{to}`");
-                    Ok(ExitCode::SUCCESS)
-                }
-            }
+        DocsFormat::Markdown => {
+            let output = output.unwrap_or_else(|| PathBuf::from("docs.md"));
+            let markdown = okf_docs::generate_markdown(&concepts);
+            std::fs::write(&output, markdown)
+                .with_context(|| format!("failed to write {}", output.display()))?;
+            println!(
+                "Generated Markdown documentation for {} concepts into {}",
+                concepts.len(),
+                output.display()
+            );
         }
     }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// A `git worktree` checkout of a specific ref, non-destructively created

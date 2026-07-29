@@ -1,19 +1,14 @@
 [package]
-name = "okf-analyzer"
+name = "okf-lsp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Project-wide analysis orchestration for okf-rs"
+description = "Minimal, synchronous Language Server Protocol client for optional call-graph disambiguation"
 
 [dependencies]
-okf-core.workspace = true
 okf-parser.workspace = true
-okf-tree-sitter.workspace = true
-okf-lsp.workspace = true
 anyhow.workspace = true
-toml.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
