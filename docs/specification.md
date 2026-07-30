@@ -19,19 +19,20 @@ The project follows four principles:
 
 ## About the Open Knowledge Format (OKF)
 
-The Open Knowledge Format is an open, vendor-neutral specification for representing metadata, context, and curated knowledge in a way that is equally readable by humans and parseable by AI agents. It formalizes the "knowledge as a living wiki" pattern: a shared library of files that both people and LLMs can read, cross-reference, and keep up to date over time.
+The Open Knowledge Format is an open, vendor-neutral specification for representing metadata, context, and curated knowledge in a way that is equally readable by humans and parseable by AI agents. It formalizes the "knowledge as a living wiki" pattern: a shared library of files that both people and LLMs can read, cross-reference, and keep up to date over time. "okf-rs" targets [OKF v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md), declared per bundle via `okf_version: "0.2"` in the bundle root's `index.md` frontmatter.
 
 Key characteristics of the OKF standard that "okf-rs" targets:
 
 - **Concepts as files** — Each unit of knowledge (a module, a class, a function, a metric, an API, …) is one markdown file with a YAML frontmatter header and a markdown body.
-- **One required field** — The frontmatter's only mandatory key is `type`. Everything else (`title`, `description`, `resource`, `tags`, `timestamp`, …) is optional, which keeps the format minimally opinionated about content models.
+- **One required field** — The frontmatter's only mandatory key is `type`. Everything else (`title`, `description`, `resource`, `tags`, …) is optional, which keeps the format minimally opinionated about content models.
 - **Bundle as a directory** — An OKF bundle is a directory of concept files, typically grouped by kind (`modules/`, `functions/`, `apis/`, …), with optional `index.md` files for progressive disclosure and optional `log.md` files for chronological change history.
 - **Graph via links** — Concepts reference each other through ordinary markdown links; the directory structure implies parent/child relationships while cross-links create a richer graph on top of the filesystem hierarchy.
 - **Just files, just markdown** — A bundle is readable in any editor, renders natively on GitHub, is indexable by any search tool, and ships as a plain tarball or git repository — no proprietary runtime, database, or SDK is required to read or write it.
 - **Producer/consumer independence** — The format is the contract, not the tooling. A human-authored bundle can be consumed by an AI agent, a metadata pipeline can feed a visualizer, and one LLM can synthesize knowledge that another LLM later queries — each side is free to swap implementations.
 - **Format, not platform** — OKF is not tied to any cloud provider, database, model vendor, or agent framework, which is what "okf-rs" means by "Open" in its own design principles.
+- **Trust, provenance, and lifecycle (v0.2)** — The optional `generated`, `verified`, `sources`, `status`, and `stale_after` frontmatter families make "who produced this," "who confirmed it," and "is it still current" answerable without leaving the frontmatter. `okf-rs` fills in `generated.by` (the `okf-rs/<version>` actor, per the spec's actor convention) on every concept it emits; the rest are optional and, per the spec's conformance rules, a concept missing any of them is still fully valid.
 
-"okf-rs" applies this specification to source code: instead of documenting datasets and tables, it extracts packages, modules, types, functions, and their relationships from a codebase and emits them as a conformant OKF bundle.
+"okf-rs" applies this specification to source code: instead of documenting datasets and tables, it extracts packages, modules, types, functions, and their relationships from a codebase and emits them as a conformant OKF bundle. The spec also defines an `Attested Computation` concept type for sanctioned, verifiably-executed computations (BigQuery/dbt/Python queries and the like) — outside what static code extraction produces, so `okf-rs` doesn't generate it, but `okf-rs validate` recognizes and checks one if a bundle is hand-edited to include it.
 
 ---
 
@@ -162,7 +163,7 @@ title: verify_token
 description: Validates a JWT and returns the decoded claims.
 resource: src/auth/token.rs#L42
 tags: [auth, security]
-timestamp: 2026-07-28T10:00:00Z
+generated: { by: okf-rs/0.1.0, at: 2026-07-28T10:00:00Z }
 ---
 
 # Signature
@@ -176,7 +177,7 @@ timestamp: 2026-07-28T10:00:00Z
 - [authenticate_request](../functions/authenticate_request.md)
 ```
 
-Only `type` is mandatory; `okf-rs` populates the remaining frontmatter fields (`title`, `description`, `resource`, `tags`, `timestamp`) and body sections (signature, relationships, documentation) from static analysis, and cross-links concepts using regular markdown links so the bundle forms a navigable graph.
+Only `type` is mandatory; `okf-rs` populates the remaining frontmatter fields (`title`, `description`, `resource`, `tags`, `generated.by`) and body sections (signature, relationships, documentation) from static analysis, and cross-links concepts using regular markdown links so the bundle forms a navigable graph. `generated.at` is populated when a deterministic source-control timestamp (e.g. the file's git commit date) is available; otherwise it's omitted, since `okf-rs` never stamps concepts with the wall-clock extraction time.
 
 ---
 
@@ -187,11 +188,12 @@ Validate that a generated (or hand-edited) bundle is a conformant OKF bundle bef
 `okf-rs validate` checks:
 
 - Every concept file has a valid YAML frontmatter block with the mandatory `type` field
-- Frontmatter values match expected types (e.g. `tags` is a list, `timestamp` is RFC 3339)
+- Frontmatter values match expected types (e.g. `tags` is a list, `generated.at`/`verified[].at` are RFC 3339, `stale_after` is `YYYY-MM-DD`, `status` is `draft`/`stable`/`deprecated`)
+- The optional trust/provenance/lifecycle families (`generated`, `verified`, `sources`, `status`, `stale_after`), when present, match their v0.2 shape, and actor identities follow the `<producer>/<version>` / `human:<id>` / `process:<id>` convention (flagged as a warning, not an error, since it's producer guidance rather than a hard requirement)
+- A bundle-root `index.md`'s optional `okf_version` declaration is a well-formed `<major>.<minor>` string, and no other `index.md` carries frontmatter
 - Markdown links between concepts resolve to files that exist in the bundle (no dangling references)
 - Every concept is reachable from an `index.md` (no orphaned files)
 - No duplicate concept identity (same source symbol emitted twice)
-- Bundle structure matches the OKF schema version declared for the project
 
 Validation is deterministic and fully offline, and is designed to run in CI (e.g. `okf-rs validate --ci`) to fail a pipeline on a broken or stale bundle.
 

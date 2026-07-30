@@ -94,7 +94,7 @@ mod tests {
             signature: None,
             tags: Vec::new(),
             is_public: true,
-            timestamp: None,
+            generated_at: None,
             relationships: Vec::new(),
         }
     }

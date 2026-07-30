@@ -127,8 +127,13 @@ fn parse_concept(id: String, content: &str) -> Option<Concept> {
 
     let is_public = mapping.get("visibility").and_then(|v| v.as_str()) != Some("private");
 
-    let timestamp = mapping
-        .get("timestamp")
+    // OKF v0.2 records this under `generated.at` (spec §5.2); a v0.1
+    // bundle's flat `timestamp` is the sanctioned fallback (spec §13.1).
+    let generated_at = mapping
+        .get("generated")
+        .and_then(|v| v.as_mapping())
+        .and_then(|g| g.get("at"))
+        .or_else(|| mapping.get("timestamp"))
         .and_then(|v| v.as_str())
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc));
@@ -177,7 +182,7 @@ fn parse_concept(id: String, content: &str) -> Option<Concept> {
         signature: parse_signature(body),
         tags,
         is_public,
-        timestamp,
+        generated_at,
         relationships,
     })
 }

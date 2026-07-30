@@ -305,7 +305,7 @@ mod tests {
             signature: None,
             tags: Vec::new(),
             is_public,
-            timestamp: None,
+            generated_at: None,
             relationships: Vec::new(),
         }
     }

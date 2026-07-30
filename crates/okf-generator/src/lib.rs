@@ -21,6 +21,16 @@ use std::path::Path;
 
 pub use agents::write_agent_entrypoints;
 
+/// The OKF spec version `okf-rs` targets (see spec §12), declared once in
+/// the bundle root's `index.md` frontmatter (the only place an `index.md`
+/// may carry one).
+const OKF_SPEC_VERSION: &str = "0.2";
+
+/// The actor identity `okf-rs` fills into every concept's `generated.by`
+/// (spec §7's `<producer>/<version>` convention), since the producer of a
+/// generated bundle is always `okf-rs` itself.
+const PRODUCER: &str = concat!("okf-rs/", env!("CARGO_PKG_VERSION"));
+
 #[derive(Serialize)]
 struct Frontmatter {
     #[serde(rename = "type")]
@@ -37,14 +47,23 @@ struct Frontmatter {
     /// base entry as something worth exposing.
     #[serde(skip_serializing_if = "Option::is_none")]
     visibility: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timestamp: Option<DateTime<Utc>>,
+    /// OKF v0.2 trust family (spec §5.2), superseding the v0.1 `timestamp`
+    /// field (§13.1). `by` is always populated with the [`PRODUCER`] actor,
+    /// since it's the only always-known half of the pair.
+    generated: GeneratedFrontmatter,
     /// Target concept ids grouped by relation kind, so a bundle on disk
     /// carries the full call/import graph without needing to re-analyze
     /// the project from source (see `okf_parser::read_bundle`, the
     /// reverse of this). Only emitted when non-empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     relationships: Option<RelationshipsFrontmatter>,
+}
+
+#[derive(Serialize)]
+struct GeneratedFrontmatter {
+    by: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, Default)]
@@ -150,7 +169,10 @@ fn render_concept(
         } else {
             Some("private")
         },
-        timestamp: concept.timestamp,
+        generated: GeneratedFrontmatter {
+            by: PRODUCER,
+            at: concept.generated_at,
+        },
         relationships: relationships_frontmatter(concept),
     };
     let yaml = serde_yaml::to_string(&frontmatter)?;
@@ -229,7 +251,11 @@ fn write_dir_index(output_dir: &Path, dir: &str, entries: &[&Concept]) -> Result
 }
 
 fn write_root_index(output_dir: &Path, by_dir: &BTreeMap<&str, Vec<&Concept>>) -> Result<()> {
-    let mut content = String::from("# Knowledge Base\n\n");
+    // A bundle-root `index.md` is the one place OKF permits frontmatter on
+    // an index file (spec §8/§12), used here to declare the spec version
+    // the bundle targets.
+    let mut content =
+        format!("---\nokf_version: \"{OKF_SPEC_VERSION}\"\n---\n\n# Knowledge Base\n\n");
     for (dir, entries) in by_dir {
         content.push_str(&format!(
             "- [{}]({}/index.md) ({})\n",
@@ -263,7 +289,7 @@ mod tests {
             signature: Some(format!("fn {name}()")),
             tags: Vec::new(),
             is_public: true,
-            timestamp: None,
+            generated_at: None,
             relationships: Vec::new(),
         }
     }
