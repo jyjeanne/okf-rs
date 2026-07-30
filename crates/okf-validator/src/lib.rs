@@ -7,7 +7,18 @@
 //! - every concept file has a valid YAML frontmatter block with the
 //!   mandatory `type` field
 //! - frontmatter values match expected shapes (`tags` is a list,
-//!   `timestamp` is RFC 3339)
+//!   `timestamp`/`generated.at`/`verified[].at` are RFC 3339, `stale_after`
+//!   and `sources[].last_modified` are `YYYY-MM-DD` dates, `status` is one
+//!   of `draft`/`stable`/`deprecated`)
+//! - the OKF v0.2 trust, provenance, and lifecycle families (`generated`,
+//!   `verified`, `sources`, `status`, `stale_after`), when present, match
+//!   their spec shape, and actor identities (`generated.by`,
+//!   `verified[].by`) follow the `<producer>/<version>` / `human:<id>` /
+//!   `process:<id>` convention (a warning, not an error, since the
+//!   convention is producer guidance)
+//! - a bundle-root `index.md`'s optional `okf_version` declaration is a
+//!   well-formed `<major>.<minor>` string, and no other `index.md` carries
+//!   frontmatter at all
 //! - no duplicate concept identity: neither two files colliding on path
 //!   (case-insensitively, since paths become filesystem entries that may
 //!   not distinguish case) nor two files independently describing the
@@ -20,10 +31,6 @@
 //!   bundle (no dangling references), and a file linking to the same
 //!   target more than once is flagged as redundant
 //! - every concept is reachable from `index.md` (no orphaned files)
-//!
-//! Schema-version conformance (the sixth check named in the spec) is not
-//! implemented yet: okf-rs doesn't emit a schema version into bundles in
-//! Phase 1, so there is nothing yet to check it against.
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -94,6 +101,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> Result<ValidationReport> {
 
     check_required_index(&files, &mut report);
     check_frontmatter(&files, &mut report);
+    check_index_frontmatter(&files, &mut report);
     check_duplicate_ids(&files, &mut report);
     check_duplicate_resources(&files, &mut report);
     check_relationship_targets(&files, &known_paths, &mut report);
@@ -188,18 +196,7 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
         }
 
         if let Some(timestamp) = mapping.get("timestamp") {
-            let raw = timestamp.as_str().map(str::to_string).or_else(|| {
-                // serde_yaml may parse an unquoted RFC 3339 value as its own
-                // timestamp-like scalar; round-trip it back to a string.
-                serde_yaml::to_string(timestamp)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            });
-            let parses = raw
-                .as_deref()
-                .map(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
-                .unwrap_or(false);
-            if !parses {
+            if !is_valid_datetime_value(timestamp) {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
                     file: file.relative.clone(),
@@ -207,7 +204,337 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
                 });
             }
         }
+
+        if let Some(generated) = mapping.get("generated") {
+            check_generated(generated, &file.relative, report);
+        }
+
+        if let Some(verified) = mapping.get("verified") {
+            check_verified(verified, &file.relative, report);
+        }
+
+        if let Some(status) = mapping.get("status") {
+            if !matches!(
+                status.as_str(),
+                Some("draft") | Some("stable") | Some("deprecated")
+            ) {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    file: file.relative.clone(),
+                    message: "`status` must be one of `draft`, `stable`, or `deprecated`"
+                        .to_string(),
+                });
+            }
+        }
+
+        if let Some(stale_after) = mapping.get("stale_after") {
+            if !is_valid_date_value(stale_after) {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    file: file.relative.clone(),
+                    message: "`stale_after` must be an absolute `YYYY-MM-DD` date".to_string(),
+                });
+            }
+        }
+
+        if let Some(sources) = mapping.get("sources") {
+            check_sources(sources, &file.relative, report);
+        }
+
+        if let Some(usage_window) = mapping.get("usage_window") {
+            check_usage_window(usage_window, &file.relative, report);
+        }
+
+        if mapping.get("type").and_then(|v| v.as_str()) == Some("Attested Computation") {
+            let has_runtime = mapping
+                .get("runtime")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_runtime {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    file: file.relative.clone(),
+                    message:
+                        "an `Attested Computation` concept requires a non-empty `runtime` field"
+                            .to_string(),
+                });
+            }
+        }
     }
+}
+
+/// Renders a YAML scalar back to its string form, matching how the
+/// existing `timestamp` check handles values `serde_yaml` may have parsed
+/// as their own scalar type (e.g. an unquoted date) rather than a string.
+fn yaml_scalar_as_string(value: &serde_yaml::Value) -> Option<String> {
+    value.as_str().map(str::to_string).or_else(|| {
+        serde_yaml::to_string(value)
+            .ok()
+            .map(|s| s.trim().to_string())
+    })
+}
+
+fn is_valid_date_value(value: &serde_yaml::Value) -> bool {
+    yaml_scalar_as_string(value)
+        .as_deref()
+        .map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
+        .unwrap_or(false)
+}
+
+fn is_valid_datetime_value(value: &serde_yaml::Value) -> bool {
+    yaml_scalar_as_string(value)
+        .as_deref()
+        .map(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
+        .unwrap_or(false)
+}
+
+/// Validates the OKF v0.2 `generated` trust field (spec §5.2): a mapping
+/// with a required, non-empty `by` (an actor, §7) and an optional RFC 3339
+/// `at`.
+fn check_generated(value: &serde_yaml::Value, file: &str, report: &mut ValidationReport) {
+    let Some(mapping) = value.as_mapping() else {
+        report.issues.push(ValidationIssue {
+            severity: Severity::Error,
+            file: file.to_string(),
+            message: "`generated` must be a mapping with a `by` field".to_string(),
+        });
+        return;
+    };
+    match mapping.get("by").and_then(|v| v.as_str()) {
+        Some(by) if !by.trim().is_empty() => check_actor(by, "generated.by", file, report),
+        _ => report.issues.push(ValidationIssue {
+            severity: Severity::Error,
+            file: file.to_string(),
+            message: "`generated` is missing the required non-empty `by` field".to_string(),
+        }),
+    }
+    if let Some(at) = mapping.get("at") {
+        if !is_valid_datetime_value(at) {
+            report.issues.push(ValidationIssue {
+                severity: Severity::Error,
+                file: file.to_string(),
+                message: "`generated.at` must be an RFC 3339 datetime".to_string(),
+            });
+        }
+    }
+}
+
+/// Validates the OKF v0.2 `verified` trust field (spec §5.2): a list of
+/// `{ by, at }` entries, or a single bare mapping, which consumers MUST
+/// treat as a one-element list.
+fn check_verified(value: &serde_yaml::Value, file: &str, report: &mut ValidationReport) {
+    let owned_single;
+    let entries: &[serde_yaml::Value] = match value.as_sequence() {
+        Some(seq) => seq,
+        None => {
+            owned_single = [value.clone()];
+            &owned_single
+        }
+    };
+    for entry in entries {
+        let Some(mapping) = entry.as_mapping() else {
+            report.issues.push(ValidationIssue {
+                severity: Severity::Error,
+                file: file.to_string(),
+                message: "each `verified` entry must be a mapping with a `by` field".to_string(),
+            });
+            continue;
+        };
+        match mapping.get("by").and_then(|v| v.as_str()) {
+            Some(by) if !by.trim().is_empty() => check_actor(by, "verified[].by", file, report),
+            _ => report.issues.push(ValidationIssue {
+                severity: Severity::Error,
+                file: file.to_string(),
+                message: "a `verified` entry is missing the required non-empty `by` field"
+                    .to_string(),
+            }),
+        }
+        if let Some(at) = mapping.get("at") {
+            if !is_valid_datetime_value(at) {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    file: file.to_string(),
+                    message: "`verified[].at` must be an RFC 3339 datetime".to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// Validates the OKF v0.2 `sources` provenance field (spec §5.1): a list of
+/// entries, each requiring a non-empty `resource` and allowing the optional
+/// credibility signals `last_modified`, `usage_count`, and `usage_window`.
+fn check_sources(value: &serde_yaml::Value, file: &str, report: &mut ValidationReport) {
+    let Some(seq) = value.as_sequence() else {
+        report.issues.push(ValidationIssue {
+            severity: Severity::Error,
+            file: file.to_string(),
+            message: "`sources` must be a list".to_string(),
+        });
+        return;
+    };
+    for entry in seq {
+        let Some(mapping) = entry.as_mapping() else {
+            report.issues.push(ValidationIssue {
+                severity: Severity::Error,
+                file: file.to_string(),
+                message: "each `sources` entry must be a mapping".to_string(),
+            });
+            continue;
+        };
+        match mapping.get("resource").and_then(|v| v.as_str()) {
+            Some(r) if !r.trim().is_empty() => {}
+            _ => report.issues.push(ValidationIssue {
+                severity: Severity::Error,
+                file: file.to_string(),
+                message: "a `sources` entry is missing the required non-empty `resource` field"
+                    .to_string(),
+            }),
+        }
+        if let Some(last_modified) = mapping.get("last_modified") {
+            if !is_valid_date_value(last_modified) {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    file: file.to_string(),
+                    message: "a `sources` entry's `last_modified` must be a `YYYY-MM-DD` date"
+                        .to_string(),
+                });
+            }
+        }
+        if let Some(usage_count) = mapping.get("usage_count") {
+            if usage_count.as_u64().is_none() {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    file: file.to_string(),
+                    message: "a `sources` entry's `usage_count` must be a non-negative integer"
+                        .to_string(),
+                });
+            }
+        }
+        if let Some(window) = mapping.get("usage_window") {
+            check_usage_window(window, file, report);
+        }
+    }
+}
+
+fn check_usage_window(value: &serde_yaml::Value, file: &str, report: &mut ValidationReport) {
+    let Some(mapping) = value.as_mapping() else {
+        report.issues.push(ValidationIssue {
+            severity: Severity::Error,
+            file: file.to_string(),
+            message: "`usage_window` must be a mapping with `from`/`to` dates".to_string(),
+        });
+        return;
+    };
+    for key in ["from", "to"] {
+        match mapping.get(key) {
+            Some(v) if is_valid_date_value(v) => {}
+            _ => report.issues.push(ValidationIssue {
+                severity: Severity::Error,
+                file: file.to_string(),
+                message: format!("`usage_window.{key}` must be a `YYYY-MM-DD` date"),
+            }),
+        }
+    }
+}
+
+/// Warns (does not error) when an actor identity doesn't follow the OKF
+/// convention (spec §7): `<producer>/<version>`, `human:<id>`, or
+/// `process:<id>`. This is producer guidance, not a hard requirement, so a
+/// mismatch is a `Warning`.
+fn check_actor(actor: &str, field: &str, file: &str, report: &mut ValidationReport) {
+    let looks_like_producer_version = actor
+        .split_once('/')
+        .is_some_and(|(producer, version)| !producer.is_empty() && !version.is_empty());
+    let valid =
+        actor.starts_with("human:") || actor.starts_with("process:") || looks_like_producer_version;
+    if !valid {
+        report.issues.push(ValidationIssue {
+            severity: Severity::Warning,
+            file: file.to_string(),
+            message: format!(
+                "`{field}` value `{actor}` doesn't follow the OKF actor convention (`<producer>/<version>`, `human:<id>`, or `process:<id>`)"
+            ),
+        });
+    }
+}
+
+/// Validates the OKF v0.2 `okf_version` declaration (spec §12), permitted
+/// only in a bundle-root `index.md`: every other `index.md` MUST NOT carry
+/// frontmatter at all (spec §8).
+fn check_index_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
+    for file in files {
+        if !is_index(&file.relative) {
+            continue;
+        }
+        let has_frontmatter = file.content.starts_with("---\n");
+        if file.relative != "index.md" {
+            if has_frontmatter {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    file: file.relative.clone(),
+                    message: "only the bundle-root index.md may carry YAML frontmatter (an `okf_version` declaration); other index.md files must not".to_string(),
+                });
+            }
+            continue;
+        }
+        if !has_frontmatter {
+            continue;
+        }
+        let Some((yaml, _)) = split_frontmatter(&file.content) else {
+            report.issues.push(ValidationIssue {
+                severity: Severity::Error,
+                file: file.relative.clone(),
+                message: "malformed YAML frontmatter in the bundle-root index.md (expected a `---` delimited block)".to_string(),
+            });
+            continue;
+        };
+        let value: serde_yaml::Value = match serde_yaml::from_str(yaml) {
+            Ok(v) => v,
+            Err(e) => {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    file: file.relative.clone(),
+                    message: format!("invalid YAML frontmatter in the bundle-root index.md: {e}"),
+                });
+                continue;
+            }
+        };
+        let Some(mapping) = value.as_mapping() else {
+            report.issues.push(ValidationIssue {
+                severity: Severity::Error,
+                file: file.relative.clone(),
+                message: "the bundle-root index.md frontmatter must be a YAML mapping".to_string(),
+            });
+            continue;
+        };
+        if let Some(version) = mapping.get("okf_version") {
+            // serde_yaml may parse an unquoted `okf_version: 0.2` as its own
+            // numeric scalar rather than a string; round-trip it back, same
+            // as every other version/date/timestamp check in this file.
+            let valid = yaml_scalar_as_string(version)
+                .as_deref()
+                .is_some_and(is_valid_okf_version);
+            if !valid {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    file: file.relative.clone(),
+                    message: "`okf_version` must be a `<major>.<minor>` string (e.g. \"0.2\")"
+                        .to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn is_valid_okf_version(s: &str) -> bool {
+    let Some((major, minor)) = s.split_once('.') else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.chars().all(|c| c.is_ascii_digit())
+        && minor.chars().all(|c| c.is_ascii_digit())
 }
 
 fn check_duplicate_ids(files: &[ScannedFile], report: &mut ValidationReport) {
@@ -766,5 +1093,177 @@ mod tests {
             .issues
             .iter()
             .any(|i| { i.severity == Severity::Warning && i.message.contains("redundant link") }));
+    }
+
+    #[test]
+    fn accepts_a_fully_populated_v0_2_trust_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "---\nokf_version: \"0.2\"\n---\n\n- [run](functions/run.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\n\
+             type: Rust Function\n\
+             title: run\n\
+             resource: src/main.rs#L1\n\
+             status: stable\n\
+             stale_after: 2027-01-01\n\
+             generated: { by: okf-rs/0.1.0, at: 2026-07-30T00:00:00Z }\n\
+             verified: { by: human:ahormati, at: 2026-07-30T00:00:00Z }\n\
+             sources:\n  \
+               - resource: https://example.com/spec\n    \
+                 last_modified: 2026-01-01\n    \
+                 usage_count: 5\n\
+             usage_window: { from: 2026-01-01, to: 2026-02-01 }\n\
+             ---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "unexpected errors: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn flags_malformed_trust_and_lifecycle_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\n\
+             type: Rust Function\n\
+             title: run\n\
+             resource: src/main.rs#L1\n\
+             status: nope\n\
+             stale_after: not-a-date\n\
+             generated: { at: 2026-07-30T00:00:00Z }\n\
+             verified:\n  - { by: '', at: 2026-07-30T00:00:00Z }\n\
+             sources:\n  - { title: no-resource }\n\
+             ---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.has_errors());
+        let messages: Vec<&str> = report.issues.iter().map(|i| i.message.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("`status`")));
+        assert!(messages.iter().any(|m| m.contains("`stale_after`")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("`generated` is missing")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("`verified` entry is missing")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("`sources` entry is missing")));
+    }
+
+    #[test]
+    fn warns_on_actor_not_following_convention() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L1\ngenerated: { by: some-random-name }\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(!report.has_errors());
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.severity == Severity::Warning && i.message.contains("actor convention")));
+    }
+
+    #[test]
+    fn attested_computation_requires_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [rev](computations/rev.md)\n");
+        write(
+            dir.path(),
+            "computations/rev.md",
+            "---\ntype: Attested Computation\ntitle: Revenue\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.has_errors());
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.message.contains("requires a non-empty `runtime`")));
+    }
+
+    #[test]
+    fn rejects_malformed_root_okf_version() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "---\nokf_version: not-a-version\n---\n\n- [run](functions/run.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.message.contains("`okf_version` must be")));
+    }
+
+    #[test]
+    fn accepts_unquoted_numeric_okf_version() {
+        // YAML parses a bare `okf_version: 0.2` as a numeric scalar, not a
+        // string; this is still a semantically valid version declaration
+        // and must not be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "---\nokf_version: 0.2\n---\n\n- [run](functions/run.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "unquoted okf_version should validate cleanly: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn rejects_frontmatter_on_non_root_index() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [fns](functions/index.md)\n");
+        write(
+            dir.path(),
+            "functions/index.md",
+            "---\nokf_version: \"0.2\"\n---\n\n- [run](run.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.issues.iter().any(|i| i.file == "functions/index.md"
+            && i.message.contains("only the bundle-root index.md")));
     }
 }

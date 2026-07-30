@@ -8,7 +8,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 |---|---|
 | Phase 1 — Foundations | ✅ Complete |
 | Phase 2 — Depth & Integration | ✅ Complete (11/11) |
-| Phase 3 — Intelligence & Extended Output | ⬜ Not started |
+| Phase 3 — Search, Interop & Intelligence | ⬜ Not started |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -80,12 +80,16 @@ Hardened following an internal code review of the LSP integration: `okf-lsp`'s r
 - A `Module`'s owning package is resolved purely by directory-prefix containment against each `Package`'s manifest location, not by actually parsing which source paths a package's manifest declares as its own (e.g. Cargo's `include`/`exclude`, npm's `"files"`) — accurate for the overwhelmingly common "package = its own directory tree" shape, but not for a manifest that deliberately claims files outside (or excludes files inside) its own directory.
 - Tree-sitter extraction is `#[cfg(...)]`-blind: it parses raw source text without evaluating conditional-compilation attributes, so two differently-cfg-gated definitions with the *same name* in the same file (e.g. `#[cfg(windows)] fn f() {}` next to `#[cfg(not(windows))] fn f() {}`) are both extracted as concepts sharing one id, which `okf-generator` correctly refuses to write as a silent duplicate-overwrite. Found while dogfooding this repo's own `--lsp` work; the fix is to keep one definition per name per file (a single function with an internal runtime branch, e.g. `cfg!(windows)`, works fine) rather than parallel `#[cfg]`-gated siblings.
 
-## Phase 3 — Intelligence & Extended Output
+## Phase 3 — Search, Interop & Intelligence
 
-- [ ] Optional AI enrichment: function summaries, module descriptions, architecture explanations, usage examples, glossary entries
+Ordered deterministic/offline work first (no new runtime dependency, no external service, nothing optional), then interop, then the genuinely optional AI-dependent items last — each later item builds on a stable knowledge graph the earlier ones establish, and none of them are required for the ones before to be useful.
+
+- [ ] Full-text search engine: ranked, relevance-scored search (via [Tantivy](https://github.com/quickwit-oss/tantivy)) layered onto today's exact/substring `okf-search`
+- [ ] Stable, versioned public library API: `okf-graph`/`okf-query` promoted from an internal implementation detail of `okf-cli`/`okf-mcp` to a documented, semver'd crate other Rust tools — including `okf-server` in Phase 4 — can embed directly
+- [ ] DITA ⇄ OKF converter: export an OKF bundle to DITA (as before), plus *import* existing DITA XML as a source
+- [ ] Optional AI enrichment: function summaries, module descriptions, architecture explanations, usage examples, glossary entries — pluggable via any OpenAI-compatible endpoint ([Ollama](https://ollama.com)/LM Studio/LocalAI, [Crustly](https://github.com/jyjeanne/crustly), or a cloud provider), never a hard dependency on one vendor
 - [ ] Architecture extraction: architectural layers, domain boundaries, design patterns
 - [ ] REST endpoint, database model, and event-flow detection
-- [ ] DITA export
 - [ ] PDF export
 - [ ] Validator/graph quality tooling — extends `okf-validator`/`okf-graph` rather than opening new crates, since the parser and internal concept graph already exist:
   - [x] Validate relationship targets, not just markdown body links: a `Calls`/`CalledBy`/`Imports`/`MemberOf` frontmatter target that doesn't resolve to a real concept is now a validator error (external targets, prefixed `external/`, are exempt), instead of disappearing silently in `okf-graph` (`Graph::get` returned `None`, filtered out)
@@ -103,8 +107,10 @@ Verified by dogfooding: an initial `okf-rs generate .` (474 concepts) followed b
 
 ## Phase 4 — Ecosystem
 
-- [ ] IDE plugins (VS Code, JetBrains) consuming the bundle and `okf-mcp`
-- [ ] Distributed knowledge server (`okf-server`): multi-repository, organization-wide serving
+Both items below build directly on Phase 3's stable `okf-graph`/`okf-query` library API rather than re-implementing graph access.
+
+- [ ] `okf-server`: REST + GraphQL API over the knowledge graph — multi-repository, organization-wide serving
+- [ ] `okf-rs` as an LSP server: hover, go-to-definition, and find-references backed by the OKF bundle, reachable from any LSP-capable editor through one server implementation rather than a bespoke plugin per IDE; dedicated VS Code/JetBrains extensions remain useful afterward as thin wrappers around it
 - [ ] Visualization: interactive graph explorer over `okf-server`
 - [ ] Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
 

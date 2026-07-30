@@ -397,7 +397,7 @@ fn detect_packages(project: &Project) -> Result<Vec<Concept>> {
             signature: None,
             tags: Vec::new(),
             is_public: true,
-            timestamp: None,
+            generated_at: None,
             relationships: Vec::new(),
         });
     }
@@ -631,7 +631,7 @@ mod tests {
             signature: Some(signature.to_string()),
             tags: Vec::new(),
             is_public: true,
-            timestamp: None,
+            generated_at: None,
             relationships: Vec::new(),
         }
     }

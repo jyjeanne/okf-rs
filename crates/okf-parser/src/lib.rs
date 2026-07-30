@@ -291,13 +291,16 @@ pub struct Concept {
     /// tracking lands. `Module` and `Package` concepts are always public
     /// — they're structural, not something a language marks private.
     pub is_public: bool,
-    /// Last-modified time, if it can be derived deterministically from
-    /// source control (e.g. the git commit date of the file). `None` when
-    /// no such source is available — okf-rs never stamps concepts with the
-    /// wall-clock extraction time, since that would make the bundle
-    /// non-reproducible for identical source, violating the project's
-    /// determinism principle.
-    pub timestamp: Option<DateTime<Utc>>,
+    /// The content's last meaningful change, if it can be derived
+    /// deterministically from source control (e.g. the git commit date of
+    /// the file). Rendered into the OKF v0.2 `generated.at` frontmatter
+    /// field (`okf-generator` always fills in the sibling `generated.by`
+    /// with the `okf-rs/<version>` actor, since the producer is always
+    /// known). `None` when no such source is available — okf-rs never
+    /// stamps concepts with the wall-clock extraction time, since that
+    /// would make the bundle non-reproducible for identical source,
+    /// violating the project's determinism principle.
+    pub generated_at: Option<DateTime<Utc>>,
     pub relationships: Vec<Relationship>,
 }
 

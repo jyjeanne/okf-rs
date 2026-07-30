@@ -104,7 +104,7 @@ pub fn make_concept(
         signature,
         tags: Vec::new(),
         is_public,
-        timestamp: None,
+        generated_at: None,
         relationships: Vec::new(),
     }
 }
