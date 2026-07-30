@@ -20,9 +20,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: prepare-release
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,13 +35,12 @@ jobs:
 
       - name: Validate version format
         run: |
-          version="${{ github.event.inputs.version }}"
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::version must be X.Y.Z (no leading v), got '$version'"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be X.Y.Z (no leading v), got '$VERSION'"
             exit 1
           fi
-          if git rev-parse "v$version" >/dev/null 2>&1; then
-            echo "::error::tag v$version already exists"
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag v$VERSION already exists"
             exit 1
           fi
 
@@ -47,20 +51,18 @@ jobs:
 
       - name: Bump workspace version
         run: |
-          version="${{ github.event.inputs.version }}"
           # The only `version = "..."` line in the root manifest is
           # `[workspace.package]`'s -- every crate inherits it via
           # `version.workspace = true` -- so an unscoped substitution is
           # safe here.
-          sed -i "s/^version = \".*\"/version = \"$version\"/" Cargo.toml
-          grep -q "version = \"$version\"" Cargo.toml
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          grep -q "version = \"$VERSION\"" Cargo.toml
 
       - name: Refresh Cargo.lock
         run: cargo check --workspace
 
       - name: Commit and tag
         run: |
-          version="${{ github.event.inputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
@@ -71,10 +73,10 @@ jobs:
           # commit/push a branch update when the bump actually changed
           # something; either way, still tag and push from current HEAD.
           if git diff --cached --quiet; then
-            echo "Cargo.toml/Cargo.lock already at $version -- nothing to bump, tagging current HEAD."
+            echo "Cargo.toml/Cargo.lock already at $VERSION -- nothing to bump, tagging current HEAD."
           else
-            git commit -m "Release v$version"
+            git commit -m "Release v$VERSION"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          git tag "v$version"
-          git push origin "v$version"
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
