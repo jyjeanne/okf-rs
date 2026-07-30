@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use okf_parser::{Concept, RelationKind};
 use okf_render::{capitalize, contains_members, group_by_kind_dir, relative_link};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -130,60 +130,16 @@ fn unique_by_kind_and_target<'a>(
         .collect()
 }
 
-/// Assigns a unique id to every concept after the first occurrence of a
-/// given id (compared case-insensitively, matching [`write_bundle`]'s own
-/// collision check below), by appending `-2`, `-3`, ... to each repeat.
-///
-/// This is common for conditionally-compiled definitions that share one
-/// name in one file but are never actually compiled together — e.g.
-/// Rust's `#[cfg(feature = "x")]` / `#[cfg(not(feature = "x"))]` stub
-/// pair for the same function name — so treating them as distinct
-/// concepts reflects the source faithfully, rather than refusing to
-/// generate a bundle at all just because Tree-sitter (unlike `rustc`)
-/// doesn't evaluate `cfg` attributes.
-///
-/// Renamed in a deterministic order — sorted by `(file, start_line)`
-/// rather than `concepts`' incoming order — so which occurrence is
-/// considered "first" (and so keeps the unsuffixed id) never depends on
-/// extraction order, matching the rest of `okf-rs`'s determinism
-/// guarantee.
-fn disambiguate_duplicate_ids(concepts: &[Concept]) -> Vec<Concept> {
-    let mut concepts = concepts.to_vec();
-
-    let mut order: Vec<usize> = (0..concepts.len()).collect();
-    order.sort_by(|&a, &b| {
-        concepts[a]
-            .location
-            .file
-            .cmp(&concepts[b].location.file)
-            .then(
-                concepts[a]
-                    .location
-                    .start_line
-                    .cmp(&concepts[b].location.start_line),
-            )
-    });
-
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    for idx in order {
-        let count = seen
-            .entry(concepts[idx].id.to_ascii_lowercase())
-            .or_insert(0);
-        *count += 1;
-        if *count > 1 {
-            concepts[idx].id = format!("{}-{}", concepts[idx].id, count);
-        }
-    }
-
-    concepts
-}
-
 /// Writes `concepts` to `output_dir` as an OKF bundle. Duplicate-id
-/// concepts (see [`disambiguate_duplicate_ids`]) are renamed rather than
+/// concepts (see [`Concept::disambiguate_ids`]) are renamed rather than
 /// silently overwriting one another; if a rename still can't produce a
 /// fully unique set (in practice, only if a generated `-N` suffix itself
 /// happens to already be a distinct concept's id), this fails fast before
-/// writing anything rather than overwrite a file.
+/// writing anything rather than overwrite a file. Callers that already go
+/// through `okf-analyzer` (which disambiguates earlier, before resolving
+/// call relationships — see there for why that ordering matters) will
+/// never hit this path; it's a safety net for any other caller that
+/// assembles a concept list some other way.
 ///
 /// The collision check is case-insensitive, even though ids are compared
 /// exactly everywhere else: ids become file paths, and the most common
@@ -192,7 +148,8 @@ fn disambiguate_duplicate_ids(concepts: &[Concept]) -> Vec<Concept> {
 /// `run`) would still collide on disk even though a case-sensitive check
 /// wouldn't catch it.
 pub fn write_bundle(concepts: &[Concept], output_dir: &Path) -> Result<()> {
-    let concepts = disambiguate_duplicate_ids(concepts);
+    let mut concepts = concepts.to_vec();
+    Concept::disambiguate_ids(&mut concepts);
     let concepts = concepts.as_slice();
 
     let mut seen = HashSet::new();
