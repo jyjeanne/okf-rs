@@ -88,13 +88,16 @@ Hardened following an internal code review of the LSP integration: `okf-lsp`'s r
 - [ ] DITA export
 - [ ] PDF export
 - [ ] Validator/graph quality tooling — extends `okf-validator`/`okf-graph` rather than opening new crates, since the parser and internal concept graph already exist:
-  - [ ] Validate relationship targets, not just markdown body links: a `Calls`/`CalledBy`/`Imports`/`MemberOf` frontmatter target that doesn't resolve to a real concept currently disappears silently in `okf-graph` (`Graph::get` returns `None`, filtered out) instead of being reported as a broken reference
-  - [ ] Isolated-concept detection in the relationship graph itself (zero `Calls`/`CalledBy` edges in or out) — distinct from the existing `index.md`-reachability orphan check, which only catches concepts unreachable via markdown links
-  - [ ] Redundant/inconsistent link detection (e.g. duplicate markdown links to the same target from one file, a `Calls` edge with no matching reverse `CalledBy`)
-  - [ ] Required-document presence check (e.g. `index.md` itself, or project-configured mandatory concepts), as its own explicit validator error rather than manifesting only as a wave of "orphaned" warnings when it's missing
+  - [x] Validate relationship targets, not just markdown body links: a `Calls`/`CalledBy`/`Imports`/`MemberOf` frontmatter target that doesn't resolve to a real concept is now a validator error (external targets, prefixed `external/`, are exempt), instead of disappearing silently in `okf-graph` (`Graph::get` returned `None`, filtered out)
+  - [x] Isolated-concept detection in the relationship graph itself (zero `Calls`/`CalledBy` edges in or out), via `Graph::isolated_concepts()` — distinct from the existing `index.md`-reachability orphan check, which only catches concepts unreachable via markdown links. Exposed as `okf-rs graph isolated` and the `graph_isolated` MCP tool
+  - [x] Redundant link detection: a file linking to the same resolved target more than once is now a validator warning
+  - [x] Required-document presence check: a missing root `index.md` is now its own explicit validator error, instead of manifesting only as a wave of "orphaned" warnings on every other concept
+  - [ ] Inconsistent-relationship detection (e.g. a `Calls` edge with no matching reverse `CalledBy`) — not yet implemented; deferred since `okf-generator` already writes both sides of every resolved edge, so this would only ever fire on hand-edited bundles
   - [ ] Knowledge-base coverage metric: proportion of extracted symbols with a description/tags, proportion of concepts linked into the graph vs. total
   - [ ] `okf-rs graph stats`: node/edge counts, per-kind breakdown, max depth, connected components
   - [ ] AI-suggested missing links between semantically close concepts, building on the optional AI enrichment above
+
+Verified by dogfooding: `okf-rs generate .` (474 concepts) followed by `okf-rs validate` on this repository reports 0 errors and 584 redundant-link warnings — genuine repeated bullets in generated `# Calls` sections, from a symbol being called more than once within one function body (`okf-generator` currently emits one relationship per call site, not deduplicated per target); `okf-rs graph isolated .` correctly lists real never-called/never-calling concepts (e.g. top-level `Struct`/`Enum` types, which never appear as `Calls`/`CalledBy` targets).
 
 ## Phase 4 — Ecosystem
 

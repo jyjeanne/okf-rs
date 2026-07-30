@@ -186,12 +186,16 @@ Validate that a generated (or hand-edited) bundle is a conformant OKF bundle bef
 
 `okf-rs validate` checks:
 
+- The bundle has a root `index.md`
 - Every concept file has a valid YAML frontmatter block with the mandatory `type` field
 - Frontmatter values match expected types (e.g. `tags` is a list, `timestamp` is RFC 3339)
-- Markdown links between concepts resolve to files that exist in the bundle (no dangling references)
-- Every concept is reachable from an `index.md` (no orphaned files)
 - No duplicate concept identity (same source symbol emitted twice)
+- Frontmatter `relationships` targets (`calls`, `called_by`, `imports`, `member_of`, ...) resolve to concepts that exist in the bundle (external targets exempted)
+- Markdown links between concepts resolve to files that exist in the bundle (no dangling references), and a file linking to the same target more than once is flagged as redundant
+- Every concept is reachable from an `index.md` (no orphaned files)
 - Bundle structure matches the OKF schema version declared for the project
+
+`okf-rs graph isolated` complements this with a call-graph-level check: concepts with no `Calls`/`CalledBy` edge in either direction — a different notion of "orphan" than index-reachability, since it looks at whether a concept actually participates in the call graph rather than whether it's linked into the bundle's narrative.
 
 Validation is deterministic and fully offline, and is designed to run in CI (e.g. `okf-rs validate --ci`) to fail a pipeline on a broken or stale bundle.
 

@@ -59,6 +59,11 @@ pub fn list() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {} },
         }),
         json!({
+            "name": "graph_isolated",
+            "description": "List concepts with no Calls/CalledBy edge in either direction (never observed calling anything, and never observed being called) — candidates for dead code or unresolved calls.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
+        json!({
             "name": "graph_path",
             "description": "Find the shortest call path between two concept ids.",
             "inputSchema": {
@@ -86,6 +91,7 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
         "graph_api" => okf_query::graph_api(bundle),
         "graph_cycles" => okf_query::graph_cycles(bundle),
         "graph_modules" => okf_query::graph_modules(bundle),
+        "graph_isolated" => okf_query::graph_isolated(bundle),
         "graph_path" => okf_query::graph_path(
             bundle,
             &arg_str(arguments, "from")?,

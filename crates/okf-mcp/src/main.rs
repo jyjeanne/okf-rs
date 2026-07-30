@@ -185,6 +185,7 @@ mod tests {
         assert!(names.contains(&"graph_api"));
         assert!(names.contains(&"graph_cycles"));
         assert!(names.contains(&"graph_modules"));
+        assert!(names.contains(&"graph_isolated"));
         assert!(names.contains(&"graph_path"));
     }
 

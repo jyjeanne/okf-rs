@@ -147,6 +147,38 @@ impl<'a> Graph<'a> {
         edges
     }
 
+    /// Concepts with no `Calls`/`CalledBy` edge in either direction:
+    /// never observed calling anything, and never observed being called.
+    /// `Module`/`Package` concepts are excluded — they're structural
+    /// containers, not call-graph participants, so having no `Calls`
+    /// edge of their own is expected rather than a quality signal (see
+    /// `public_api`, which excludes them for the same reason). Sorted by
+    /// id for deterministic output.
+    ///
+    /// This is a different notion of "orphan" than `okf-validator`'s
+    /// index-reachability check: that one asks whether a concept is
+    /// linked into the bundle's markdown *narrative* starting from
+    /// `index.md`; this one asks whether it participates in the *call*
+    /// graph at all. A concept can be reachable from `index.md` (every
+    /// concept is, once `okf-generator` emits its owning module/package
+    /// index) while still calling nothing and being called by nothing —
+    /// dead code, an unused public entry point, or a call the analyzer
+    /// simply couldn't resolve.
+    pub fn isolated_concepts(&self) -> Vec<&'a Concept> {
+        let mut isolated: Vec<&Concept> = self
+            .concepts
+            .iter()
+            .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package))
+            .filter(|c| {
+                !c.relationships
+                    .iter()
+                    .any(|r| matches!(r.kind, RelationKind::Calls | RelationKind::CalledBy))
+            })
+            .collect();
+        isolated.sort_by(|a, b| a.id.cmp(&b.id));
+        isolated
+    }
+
     /// Groups of concepts that call each other in a cycle through the
     /// `Calls` graph (mutual/indirect recursion across two or more
     /// concepts, or direct self-recursion), found via Tarjan's strongly
@@ -389,6 +421,23 @@ mod tests {
         let api = graph.public_api();
         assert_eq!(api.len(), 1);
         assert_eq!(api[0].id, "functions/a/pub_fn");
+    }
+
+    #[test]
+    fn isolated_concepts_excludes_modules_and_connected_functions() {
+        let module = concept("modules/a", ConceptKind::Module, "a.rs", true);
+        let mut caller = concept("functions/a/caller", ConceptKind::Function, "a.rs", true);
+        let mut callee = concept("functions/a/callee", ConceptKind::Function, "a.rs", true);
+        let unused = concept("functions/a/unused", ConceptKind::Function, "a.rs", true);
+        add_edge(&mut caller, RelationKind::Calls, "functions/a/callee");
+        add_edge(&mut callee, RelationKind::CalledBy, "functions/a/caller");
+
+        let concepts = vec![module, caller, callee, unused];
+        let graph = Graph::build(&concepts);
+
+        let isolated = graph.isolated_concepts();
+        assert_eq!(isolated.len(), 1);
+        assert_eq!(isolated[0].id, "functions/a/unused");
     }
 
     #[test]

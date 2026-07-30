@@ -121,6 +121,18 @@ pub fn graph_cycles(bundle: &Path) -> Result<String> {
         .join("\n"))
 }
 
+/// Concepts with no `Calls`/`CalledBy` edge in either direction (never
+/// observed calling anything, and never observed being called).
+pub fn graph_isolated(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let graph = okf_graph::Graph::build(&concepts);
+    let isolated = graph.isolated_concepts();
+    if isolated.is_empty() {
+        return Ok("No isolated concepts found".to_string());
+    }
+    Ok(concept_lines(&isolated))
+}
+
 /// Cross-module call dependency edges: which modules call into which.
 pub fn graph_modules(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
@@ -248,6 +260,29 @@ mod tests {
         assert_eq!(
             graph_modules(dir.path()).unwrap(),
             "No cross-module call dependencies found"
+        );
+    }
+
+    #[test]
+    fn graph_isolated_reports_a_concept_with_no_call_edges() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/unused.md",
+            "---\ntype: Rust Function\ntitle: unused\nresource: src/auth.rs#L20\n---\n\nbody\n",
+        );
+
+        let text = graph_isolated(dir.path()).unwrap();
+        assert!(text.contains("functions/auth/unused"));
+        assert!(!text.contains("functions/auth/verify_token"));
+    }
+
+    #[test]
+    fn graph_isolated_reports_none_found_when_fully_connected() {
+        let dir = sample_bundle();
+        assert_eq!(
+            graph_isolated(dir.path()).unwrap(),
+            "No isolated concepts found"
         );
     }
 }
