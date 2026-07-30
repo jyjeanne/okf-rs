@@ -172,18 +172,7 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
         }
 
         if let Some(timestamp) = mapping.get("timestamp") {
-            let raw = timestamp.as_str().map(str::to_string).or_else(|| {
-                // serde_yaml may parse an unquoted RFC 3339 value as its own
-                // timestamp-like scalar; round-trip it back to a string.
-                serde_yaml::to_string(timestamp)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            });
-            let parses = raw
-                .as_deref()
-                .map(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
-                .unwrap_or(false);
-            if !parses {
+            if !is_valid_datetime_value(timestamp) {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
                     file: file.relative.clone(),
@@ -496,7 +485,12 @@ fn check_index_frontmatter(files: &[ScannedFile], report: &mut ValidationReport)
             continue;
         };
         if let Some(version) = mapping.get("okf_version") {
-            let valid = version.as_str().is_some_and(is_valid_okf_version);
+            // serde_yaml may parse an unquoted `okf_version: 0.2` as its own
+            // numeric scalar rather than a string; round-trip it back, same
+            // as every other version/date/timestamp check in this file.
+            let valid = yaml_scalar_as_string(version)
+                .as_deref()
+                .is_some_and(is_valid_okf_version);
             if !valid {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
@@ -1052,6 +1046,31 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.message.contains("`okf_version` must be")));
+    }
+
+    #[test]
+    fn accepts_unquoted_numeric_okf_version() {
+        // YAML parses a bare `okf_version: 0.2` as a numeric scalar, not a
+        // string; this is still a semantically valid version declaration
+        // and must not be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "---\nokf_version: 0.2\n---\n\n- [run](functions/run.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "unquoted okf_version should validate cleanly: {:?}",
+            report.issues
+        );
     }
 
     #[test]
