@@ -11,7 +11,7 @@
 //! `okf-validator` do.
 
 use okf_parser::{Concept, ConceptKind, RelationKind};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct Graph<'a> {
     concepts: &'a [Concept],
@@ -145,6 +145,113 @@ impl<'a> Graph<'a> {
         let mut edges: Vec<_> = edges.into_iter().collect();
         edges.sort();
         edges
+    }
+
+    /// Concepts with no `Calls`/`CalledBy` edge in either direction:
+    /// never observed calling anything, and never observed being called.
+    /// `Module`/`Package` concepts are excluded — they're structural
+    /// containers, not call-graph participants, so having no `Calls`
+    /// edge of their own is expected rather than a quality signal (see
+    /// `public_api`, which excludes them for the same reason). Sorted by
+    /// id for deterministic output.
+    ///
+    /// This is a different notion of "orphan" than `okf-validator`'s
+    /// index-reachability check: that one asks whether a concept is
+    /// linked into the bundle's markdown *narrative* starting from
+    /// `index.md`; this one asks whether it participates in the *call*
+    /// graph at all. A concept can be reachable from `index.md` (every
+    /// concept is, once `okf-generator` emits its owning module/package
+    /// index) while still calling nothing and being called by nothing —
+    /// dead code, an unused public entry point, or a call the analyzer
+    /// simply couldn't resolve.
+    pub fn isolated_concepts(&self) -> Vec<&'a Concept> {
+        let mut isolated: Vec<&Concept> = self
+            .concepts
+            .iter()
+            .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package))
+            .filter(|c| {
+                !c.relationships
+                    .iter()
+                    .any(|r| matches!(r.kind, RelationKind::Calls | RelationKind::CalledBy))
+            })
+            .collect();
+        isolated.sort_by(|a, b| a.id.cmp(&b.id));
+        isolated
+    }
+
+    /// Connected components of the *undirected* graph formed by treating
+    /// every `Calls`/`CalledBy` edge as bidirectional — "which clusters of
+    /// mutually-reachable-by-call concepts exist," as opposed to
+    /// `cycles()` (directed cycles only) or `isolated_concepts()` (only
+    /// the zero-edge case). Only `Calls`/`CalledBy` form the adjacency,
+    /// not every relationship kind: mixing in `Imports`/`MemberOf`/...
+    /// would conflate structural containment with call topology and
+    /// answer a different question than "how many islands of
+    /// collaborating code are there."
+    ///
+    /// A concept with no `Calls`/`CalledBy` edge at all forms its own
+    /// trivial single-concept component; those are omitted here since
+    /// they're already reported, with more context, by
+    /// `isolated_concepts()`. A self-recursive concept (`Calls`/
+    /// `CalledBy` pointing at itself — the same shape `cycles()` treats
+    /// as "direct self-recursion") is *not* omitted even though it's
+    /// also a single-concept component: it has a real edge and
+    /// `isolated_concepts()` correctly doesn't report it either (it does
+    /// have a `Calls`/`CalledBy` relationship), so dropping it here too
+    /// would make it invisible to both. Every other single-concept
+    /// component (no self-loop) is dropped. Each component's ids are
+    /// sorted; components themselves are sorted by their first id, for
+    /// deterministic output.
+    pub fn connected_components(&self) -> Vec<Vec<&'a str>> {
+        let mut adjacency: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for concept in self.concepts {
+            for rel in &concept.relationships {
+                if !matches!(rel.kind, RelationKind::Calls | RelationKind::CalledBy) {
+                    continue;
+                }
+                let Some(target) = self.get(&rel.target) else {
+                    continue;
+                };
+                adjacency
+                    .entry(concept.id.as_str())
+                    .or_default()
+                    .insert(target.id.as_str());
+                adjacency
+                    .entry(target.id.as_str())
+                    .or_default()
+                    .insert(concept.id.as_str());
+            }
+        }
+
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut components: Vec<Vec<&str>> = Vec::new();
+        for concept in self.concepts {
+            let id = concept.id.as_str();
+            if visited.contains(id) || !adjacency.contains_key(id) {
+                continue;
+            }
+            let mut component = Vec::new();
+            let mut queue = VecDeque::new();
+            queue.push_back(id);
+            visited.insert(id);
+            while let Some(current) = queue.pop_front() {
+                component.push(current);
+                for &neighbor in adjacency.get(current).into_iter().flatten() {
+                    if visited.insert(neighbor) {
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+            let has_self_loop = adjacency
+                .get(id)
+                .is_some_and(|neighbors| neighbors.contains(id));
+            if component.len() > 1 || has_self_loop {
+                component.sort();
+                components.push(component);
+            }
+        }
+        components.sort();
+        components
     }
 
     /// Groups of concepts that call each other in a cycle through the
@@ -305,7 +412,7 @@ mod tests {
             signature: None,
             tags: Vec::new(),
             is_public,
-            timestamp: None,
+            generated_at: None,
             relationships: Vec::new(),
         }
     }
@@ -389,6 +496,85 @@ mod tests {
         let api = graph.public_api();
         assert_eq!(api.len(), 1);
         assert_eq!(api[0].id, "functions/a/pub_fn");
+    }
+
+    #[test]
+    fn isolated_concepts_excludes_modules_and_connected_functions() {
+        let module = concept("modules/a", ConceptKind::Module, "a.rs", true);
+        let mut caller = concept("functions/a/caller", ConceptKind::Function, "a.rs", true);
+        let mut callee = concept("functions/a/callee", ConceptKind::Function, "a.rs", true);
+        let unused = concept("functions/a/unused", ConceptKind::Function, "a.rs", true);
+        add_edge(&mut caller, RelationKind::Calls, "functions/a/callee");
+        add_edge(&mut callee, RelationKind::CalledBy, "functions/a/caller");
+
+        let concepts = vec![module, caller, callee, unused];
+        let graph = Graph::build(&concepts);
+
+        let isolated = graph.isolated_concepts();
+        assert_eq!(isolated.len(), 1);
+        assert_eq!(isolated[0].id, "functions/a/unused");
+    }
+
+    #[test]
+    fn connected_components_groups_by_call_edges_and_excludes_singletons() {
+        // Two separate two-node clusters (a<->b, c<->d) plus one isolated
+        // concept with no Calls/CalledBy edge at all.
+        let mut a = concept("functions/a", ConceptKind::Function, "x.rs", true);
+        let mut b = concept("functions/b", ConceptKind::Function, "x.rs", true);
+        let mut c = concept("functions/c", ConceptKind::Function, "x.rs", true);
+        let mut d = concept("functions/d", ConceptKind::Function, "x.rs", true);
+        let isolated = concept("functions/isolated", ConceptKind::Function, "x.rs", true);
+        add_edge(&mut a, RelationKind::Calls, "functions/b");
+        add_edge(&mut b, RelationKind::CalledBy, "functions/a");
+        add_edge(&mut c, RelationKind::Calls, "functions/d");
+        add_edge(&mut d, RelationKind::CalledBy, "functions/c");
+
+        let concepts = vec![a, b, c, d, isolated];
+        let graph = Graph::build(&concepts);
+
+        let components = graph.connected_components();
+        assert_eq!(
+            components.len(),
+            2,
+            "expected two components: {components:?}"
+        );
+        assert_eq!(components[0], vec!["functions/a", "functions/b"]);
+        assert_eq!(components[1], vec!["functions/c", "functions/d"]);
+        assert!(
+            !components
+                .iter()
+                .flatten()
+                .any(|&id| id == "functions/isolated"),
+            "an isolated concept should not appear as its own component: {components:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_recursive_concept_is_its_own_component_not_dropped_as_a_singleton() {
+        // A concept whose only Calls/CalledBy edge points at itself has
+        // a real edge (isolated_concepts() correctly excludes it), so
+        // dropping it here too — as if it were an ordinary edgeless
+        // singleton — would make it invisible to both metrics.
+        let mut recursive = concept("functions/recursive", ConceptKind::Function, "x.rs", true);
+        add_edge(&mut recursive, RelationKind::Calls, "functions/recursive");
+        add_edge(
+            &mut recursive,
+            RelationKind::CalledBy,
+            "functions/recursive",
+        );
+
+        let concepts = vec![recursive];
+        let graph = Graph::build(&concepts);
+
+        assert!(
+            graph.isolated_concepts().is_empty(),
+            "a self-recursive concept has an edge, so it isn't isolated"
+        );
+        assert_eq!(
+            graph.connected_components(),
+            vec![vec!["functions/recursive"]],
+            "a self-recursive concept should form its own single-concept component"
+        );
     }
 
     #[test]

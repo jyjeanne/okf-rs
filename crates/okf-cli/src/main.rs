@@ -95,6 +95,17 @@ enum Command {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+    /// Report content-completeness metrics for a bundle: description/tag
+    /// coverage, and how much of the bundle participates in the call
+    /// graph. Distinct from `validate`, which is pass/fail rather than a
+    /// metrics report.
+    Coverage {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
     /// Query the concept graph: callers, callees, cycles, public API, and
     /// cross-module dependencies. Reads relationships directly from a
     /// previously generated OKF bundle on disk — run `okf-rs generate`
@@ -164,6 +175,15 @@ enum GraphQuery {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+    /// List concepts with no `Calls`/`CalledBy` edge in either direction
+    /// (never observed calling anything, and never observed being called).
+    Isolated {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
     /// List the public API surface (public functions/methods/types).
     Api {
         /// Defaults to the value in `okf.toml`, or `knowledge`.
@@ -174,6 +194,16 @@ enum GraphQuery {
     },
     /// List cross-module dependency edges (which modules call into which).
     Modules {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Report graph topology metrics: concept-kind breakdown, relationship
+    /// edge counts by kind, and connected components of the
+    /// `Calls`/`CalledBy` graph.
+    Stats {
         /// Defaults to the value in `okf.toml`, or `knowledge`.
         bundle: Option<PathBuf>,
         /// Project directory to look up `okf.toml` in (not the bundle itself).
@@ -232,6 +262,10 @@ fn run(command: Command) -> Result<ExitCode> {
             bundle,
             project,
         } => cmd_search(&query, bundle, &project),
+        Command::Coverage { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::coverage(&bundle))
+        }
         Command::Graph { query } => cmd_graph(query),
         Command::Diff {
             from_ref,
@@ -491,6 +525,10 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::graph_cycles(&bundle))
         }
+        GraphQuery::Isolated { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_isolated(&bundle))
+        }
         GraphQuery::Api { bundle, project } => {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::graph_api(&bundle))
@@ -498,6 +536,10 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
         GraphQuery::Modules { bundle, project } => {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::graph_modules(&bundle))
+        }
+        GraphQuery::Stats { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_stats(&bundle))
         }
         GraphQuery::Path {
             from,

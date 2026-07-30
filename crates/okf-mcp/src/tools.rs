@@ -44,6 +44,11 @@ pub fn list() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "coverage",
+            "description": "Content-completeness metrics for the bundle: percentage of concepts with a description, percentage with at least one tag, and percentage participating in the call graph. Distinct from validation, which is pass/fail rather than a metrics report.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
+        json!({
             "name": "graph_api",
             "description": "List the project's public API surface (public functions, methods, and types).",
             "inputSchema": { "type": "object", "properties": {} },
@@ -56,6 +61,16 @@ pub fn list() -> Vec<Value> {
         json!({
             "name": "graph_modules",
             "description": "List cross-module call dependency edges: which modules call into which.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
+        json!({
+            "name": "graph_isolated",
+            "description": "List concepts with no Calls/CalledBy edge in either direction (never observed calling anything, and never observed being called) — candidates for dead code or unresolved calls.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
+        json!({
+            "name": "graph_stats",
+            "description": "Graph topology metrics: concept-kind breakdown, relationship edge counts by kind, and connected components of the Calls/CalledBy graph.",
             "inputSchema": { "type": "object", "properties": {} },
         }),
         json!({
@@ -81,11 +96,14 @@ pub fn list() -> Vec<Value> {
 pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
     match name {
         "search" => okf_query::search(bundle, &arg_str(arguments, "query")?),
+        "coverage" => okf_query::coverage(bundle),
         "graph_callers" => okf_query::graph_callers(bundle, &arg_str(arguments, "id")?),
         "graph_callees" => okf_query::graph_callees(bundle, &arg_str(arguments, "id")?),
         "graph_api" => okf_query::graph_api(bundle),
         "graph_cycles" => okf_query::graph_cycles(bundle),
         "graph_modules" => okf_query::graph_modules(bundle),
+        "graph_isolated" => okf_query::graph_isolated(bundle),
+        "graph_stats" => okf_query::graph_stats(bundle),
         "graph_path" => okf_query::graph_path(
             bundle,
             &arg_str(arguments, "from")?,

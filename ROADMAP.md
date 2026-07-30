@@ -8,7 +8,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 |---|---|
 | Phase 1 — Foundations | ✅ Complete |
 | Phase 2 — Depth & Integration | ✅ Complete (11/11) |
-| Phase 3 — Intelligence & Extended Output | ⬜ Not started |
+| Phase 3 — Search, Interop & Intelligence | 🔶 In progress (7/15) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -80,18 +80,39 @@ Hardened following an internal code review of the LSP integration: `okf-lsp`'s r
 - A `Module`'s owning package is resolved purely by directory-prefix containment against each `Package`'s manifest location, not by actually parsing which source paths a package's manifest declares as its own (e.g. Cargo's `include`/`exclude`, npm's `"files"`) — accurate for the overwhelmingly common "package = its own directory tree" shape, but not for a manifest that deliberately claims files outside (or excludes files inside) its own directory.
 - Tree-sitter extraction is `#[cfg(...)]`-blind: it parses raw source text without evaluating conditional-compilation attributes, so two differently-cfg-gated definitions with the *same name* in the same file (e.g. `#[cfg(windows)] fn f() {}` next to `#[cfg(not(windows))] fn f() {}`) are both extracted as concepts sharing one id, which `okf-generator` correctly refuses to write as a silent duplicate-overwrite. Found while dogfooding this repo's own `--lsp` work; the fix is to keep one definition per name per file (a single function with an internal runtime branch, e.g. `cfg!(windows)`, works fine) rather than parallel `#[cfg]`-gated siblings.
 
-## Phase 3 — Intelligence & Extended Output
+## Phase 3 — Search, Interop & Intelligence
 
-- [ ] Optional AI enrichment: function summaries, module descriptions, architecture explanations, usage examples, glossary entries
+Ordered deterministic/offline work first (no new runtime dependency, no external service, nothing optional), then interop, then the genuinely optional AI-dependent items last — each later item builds on a stable knowledge graph the earlier ones establish, and none of them are required for the ones before to be useful.
+
+- [ ] Full-text search engine: ranked, relevance-scored search (via [Tantivy](https://github.com/quickwit-oss/tantivy)) layered onto today's exact/substring `okf-search`
+- [ ] Stable, versioned public library API: `okf-graph`/`okf-query` promoted from an internal implementation detail of `okf-cli`/`okf-mcp` to a documented, semver'd crate other Rust tools — including `okf-server` in Phase 4 — can embed directly
+- [ ] DITA ⇄ OKF converter: export an OKF bundle to DITA (as before), plus *import* existing DITA XML as a source
+- [ ] Optional AI enrichment: function summaries, module descriptions, architecture explanations, usage examples, glossary entries — pluggable via any OpenAI-compatible endpoint ([Ollama](https://ollama.com)/LM Studio/LocalAI, [Crustly](https://github.com/jyjeanne/crustly), or a cloud provider), never a hard dependency on one vendor
 - [ ] Architecture extraction: architectural layers, domain boundaries, design patterns
 - [ ] REST endpoint, database model, and event-flow detection
-- [ ] DITA export
 - [ ] PDF export
+- [ ] Validator/graph quality tooling — extends `okf-validator`/`okf-graph` rather than opening new crates, since the parser and internal concept graph already exist:
+  - [x] Validate relationship targets, not just markdown body links: a `Calls`/`CalledBy`/`Imports`/`MemberOf` frontmatter target that doesn't resolve to a real concept is now a validator error (external targets, prefixed `external/`, are exempt), instead of disappearing silently in `okf-graph` (`Graph::get` returned `None`, filtered out)
+  - [x] Isolated-concept detection in the relationship graph itself (zero `Calls`/`CalledBy` edges in or out), via `Graph::isolated_concepts()` — distinct from the existing `index.md`-reachability orphan check, which only catches concepts unreachable via markdown links. Exposed as `okf-rs graph isolated` and the `graph_isolated` MCP tool
+  - [x] Redundant link detection: a file linking to the same resolved target more than once is now a validator warning
+  - [x] Required-document presence check: a missing root `index.md` is now its own explicit validator error, instead of manifesting only as a wave of "orphaned" warnings on every other concept
+  - [x] Inconsistent-relationship detection: bundle-wide `Calls`/`CalledBy` symmetry (the only relationship pair `okf-analyzer` ever emits as two sides of one edge — every other kind has no reverse kind to be asymmetric against) is now a validator warning, via a two-pass cross-file `id -> outgoing`/`id -> incoming` view rather than the existing per-file checks
+  - [x] Knowledge-base coverage metric: `okf-rs coverage` reports the proportion of concepts with a description, with at least one tag, and participating in the call graph (excludes `Module`/`Package`, matching `isolated_concepts()`'s own exclusion) — computed entirely from the bundle already on disk, no re-scan of the source project
+  - [x] `okf-rs graph stats`: node count, per-kind breakdown, relationship edge counts per kind (not a single total, to sidestep whether a resolved `Calls`/`CalledBy` pair is one edge or two), and connected components of the `Calls`/`CalledBy` graph via `Graph::connected_components()` — deliberately omits a "depth" metric, since the call graph isn't guaranteed acyclic (`cycles()` already finds real ones) and no single definition of "depth" survives that
+  - [ ] AI-suggested missing links between semantically close concepts, building on the optional AI enrichment above
+
+Verified by dogfooding: an initial `okf-rs generate .` (474 concepts) followed by `okf-rs validate` on this repository reported 0 errors and 584 redundant-link warnings — genuine repeated bullets in generated `# Calls` sections, from a symbol being called more than once within one function body, since `okf-generator` emitted one relationship per call site rather than deduplicated per target. Fixed at the source (see below): `okf-rs generate .` (476 concepts, after adding the two new relationship-target/redundant-link tests themselves) followed by `okf-rs validate` now reports "no issues found" — 0 errors, 0 warnings. `okf-rs graph isolated .` correctly lists real never-called/never-calling concepts (e.g. top-level `Struct`/`Enum` types, which never appear as `Calls`/`CalledBy` targets).
+
+Verified by dogfooding again after the symmetry/coverage/stats additions: on this repository's own 527-concept bundle, `okf-rs validate` still reports "no issues found" (the new symmetry check found no asymmetric `Calls`/`CalledBy` pairs, as expected on a purely `okf-rs generate`d bundle); `okf-rs coverage` reports 74% (356/477) of non-`Module`/`Package` concepts participate in the call graph; `okf-rs graph stats` reports 663 `Calls` edges, 663 `Called by` edges (symmetric, as expected), and 3 connected components — one large 352-concept cluster plus two small 2-concept ones, alongside 121 isolated concepts.
+
+`okf-generator` now deduplicates relationship targets by `(kind, target)` before rendering — both in the `relationships` frontmatter field and in the human-readable `# Calls`/`# Called by`/... body sections — via a shared `unique_by_kind_and_target` helper, so a concept calling the same target from multiple call sites in its body is listed once, not once per call site. This is the fix the redundant-link warning above pointed at, rather than a separate roadmap item: the validator's new check was correctly surfacing real duplication already present in generated bundles, and the actual bug was in the generator, not something for hand-edited bundles to work around.
 
 ## Phase 4 — Ecosystem
 
-- [ ] IDE plugins (VS Code, JetBrains) consuming the bundle and `okf-mcp`
-- [ ] Distributed knowledge server (`okf-server`): multi-repository, organization-wide serving
+Both items below build directly on Phase 3's stable `okf-graph`/`okf-query` library API rather than re-implementing graph access.
+
+- [ ] `okf-server`: REST + GraphQL API over the knowledge graph — multi-repository, organization-wide serving
+- [ ] `okf-rs` as an LSP server: hover, go-to-definition, and find-references backed by the OKF bundle, reachable from any LSP-capable editor through one server implementation rather than a bespoke plugin per IDE; dedicated VS Code/JetBrains extensions remain useful afterward as thin wrappers around it
 - [ ] Visualization: interactive graph explorer over `okf-server`
 - [ ] Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
 

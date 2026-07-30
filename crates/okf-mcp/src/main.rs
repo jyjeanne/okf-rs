@@ -180,11 +180,14 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"search"));
+        assert!(names.contains(&"coverage"));
         assert!(names.contains(&"graph_callers"));
         assert!(names.contains(&"graph_callees"));
         assert!(names.contains(&"graph_api"));
         assert!(names.contains(&"graph_cycles"));
         assert!(names.contains(&"graph_modules"));
+        assert!(names.contains(&"graph_isolated"));
+        assert!(names.contains(&"graph_stats"));
         assert!(names.contains(&"graph_path"));
     }
 

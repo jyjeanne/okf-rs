@@ -1,14 +1,20 @@
 name: Prepare Release
 
-# Manually triggered: bumps the workspace version, commits, and pushes a
-# `vX.Y.Z` tag. Pushing that tag then kicks off release.yml, which builds
-# and publishes the actual GitHub Release.
+# Automates the *start* of a release: bump the workspace version, commit,
+# and push a `vX.Y.Z` tag. release.yml already does the rest (build
+# cross-platform binaries and publish the GitHub Release) triggered by
+# that tag push -- this workflow exists only to close the remaining
+# manual gap, so cutting a release is "run this with a version number"
+# instead of hand-editing Cargo.toml and running git tag/push locally.
+#
+# Manually triggered (never automatic) so a maintainer decides exactly
+# when a release ships.
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release, without the leading 'v' (e.g. 0.2.0)"
+        description: "Version to release, e.g. 0.2.0 (no leading v)"
         required: true
 
 permissions:
@@ -24,17 +30,17 @@ jobs:
       VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Validate version
+      - name: Validate version format
         run: |
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::'$VERSION' is not a valid semver version (expected e.g. 1.2.3)"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be X.Y.Z (no leading v), got '$VERSION'"
             exit 1
           fi
-          # Check the remote directly rather than the local clone, which
-          # actions/checkout fetches without tags by default.
-          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
-            echo "::error::Tag v$VERSION already exists"
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag v$VERSION already exists"
             exit 1
           fi
 
@@ -45,13 +51,14 @@ jobs:
 
       - name: Bump workspace version
         run: |
-          sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\"/version = \"$VERSION\"/" Cargo.toml
-          if ! grep -qF "version = \"$VERSION\"" Cargo.toml; then
-            echo "::error::Failed to bump version in Cargo.toml (pattern did not match)"
-            exit 1
-          fi
+          # The only `version = "..."` line in the root manifest is
+          # `[workspace.package]`'s -- every crate inherits it via
+          # `version.workspace = true` -- so an unscoped substitution is
+          # safe here.
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          grep -q "version = \"$VERSION\"" Cargo.toml
 
-      - name: Update Cargo.lock
+      - name: Refresh Cargo.lock
         run: cargo check --workspace
 
       - name: Commit and tag
@@ -59,7 +66,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git commit -m "chore: release v$VERSION"
+          # Cargo.toml can already be at `version` -- e.g. the very first
+          # release, cut before anything ever bumped it off the crate
+          # template's default -- in which case there's nothing to commit.
+          # `git commit` would fail on that ("nothing to commit"), so only
+          # commit/push a branch update when the bump actually changed
+          # something; either way, still tag and push from current HEAD.
+          if git diff --cached --quiet; then
+            echo "Cargo.toml/Cargo.lock already at $VERSION -- nothing to bump, tagging current HEAD."
+          else
+            git commit -m "Release v$VERSION"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
           git tag "v$VERSION"
-          git push origin HEAD:${{ github.ref_name }}
           git push origin "v$VERSION"

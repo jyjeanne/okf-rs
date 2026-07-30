@@ -21,6 +21,16 @@ use std::path::Path;
 
 pub use agents::write_agent_entrypoints;
 
+/// The OKF spec version `okf-rs` targets (see spec §12), declared once in
+/// the bundle root's `index.md` frontmatter (the only place an `index.md`
+/// may carry one).
+const OKF_SPEC_VERSION: &str = "0.2";
+
+/// The actor identity `okf-rs` fills into every concept's `generated.by`
+/// (spec §7's `<producer>/<version>` convention), since the producer of a
+/// generated bundle is always `okf-rs` itself.
+const PRODUCER: &str = concat!("okf-rs/", env!("CARGO_PKG_VERSION"));
+
 #[derive(Serialize)]
 struct Frontmatter {
     #[serde(rename = "type")]
@@ -37,14 +47,23 @@ struct Frontmatter {
     /// base entry as something worth exposing.
     #[serde(skip_serializing_if = "Option::is_none")]
     visibility: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timestamp: Option<DateTime<Utc>>,
+    /// OKF v0.2 trust family (spec §5.2), superseding the v0.1 `timestamp`
+    /// field (§13.1). `by` is always populated with the [`PRODUCER`] actor,
+    /// since it's the only always-known half of the pair.
+    generated: GeneratedFrontmatter,
     /// Target concept ids grouped by relation kind, so a bundle on disk
     /// carries the full call/import graph without needing to re-analyze
     /// the project from source (see `okf_parser::read_bundle`, the
     /// reverse of this). Only emitted when non-empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     relationships: Option<RelationshipsFrontmatter>,
+}
+
+#[derive(Serialize)]
+struct GeneratedFrontmatter {
+    by: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, Default)]
@@ -69,12 +88,20 @@ struct RelationshipsFrontmatter {
 /// preserving each kind's original relative order. `None` when the
 /// concept has no relationships, so the frontmatter field is omitted
 /// entirely rather than emitted as an empty mapping.
+///
+/// A target appearing more than once under the same kind — e.g. a
+/// function calling the same callee from two different call sites in its
+/// body — is collapsed to its first occurrence: `relationships` records
+/// *which* concepts a relationship holds toward, not how many times or
+/// where, so a repeat carries no extra information and would otherwise
+/// double up as a redundant line in both this frontmatter list and the
+/// body section below (see `unique_by_kind_and_target`).
 fn relationships_frontmatter(concept: &Concept) -> Option<RelationshipsFrontmatter> {
     if concept.relationships.is_empty() {
         return None;
     }
     let mut grouped = RelationshipsFrontmatter::default();
-    for rel in &concept.relationships {
+    for rel in unique_by_kind_and_target(concept.relationships.iter()) {
         let bucket = match rel.kind {
             RelationKind::Imports => &mut grouped.imports,
             RelationKind::Calls => &mut grouped.calls,
@@ -87,6 +114,20 @@ fn relationships_frontmatter(concept: &Concept) -> Option<RelationshipsFrontmatt
         bucket.push(rel.target.clone());
     }
     Some(grouped)
+}
+
+/// Filters `rels` down to one entry per distinct `(kind, target)` pair,
+/// keeping the first occurrence and otherwise preserving relative order.
+/// Shared by `relationships_frontmatter` and `render_concept`'s body
+/// sections so the frontmatter's `relationships` field and the
+/// human-readable `# Calls`/... sections always agree on what's listed,
+/// rather than deduplicating each independently and risking drift.
+fn unique_by_kind_and_target<'a>(
+    rels: impl Iterator<Item = &'a okf_parser::Relationship>,
+) -> Vec<&'a okf_parser::Relationship> {
+    let mut seen: HashSet<(RelationKind, &str)> = HashSet::new();
+    rels.filter(|rel| seen.insert((rel.kind, rel.target.as_str())))
+        .collect()
 }
 
 /// Writes `concepts` to `output_dir` as an OKF bundle. Fails fast (before
@@ -150,7 +191,10 @@ fn render_concept(
         } else {
             Some("private")
         },
-        timestamp: concept.timestamp,
+        generated: GeneratedFrontmatter {
+            by: PRODUCER,
+            at: concept.generated_at,
+        },
         relationships: relationships_frontmatter(concept),
     };
     let yaml = serde_yaml::to_string(&frontmatter)?;
@@ -186,11 +230,8 @@ fn render_concept(
         (RelationKind::DependsOn, "# Depends on"),
         (RelationKind::MemberOf, "# Member of"),
     ] {
-        let rels: Vec<_> = concept
-            .relationships
-            .iter()
-            .filter(|r| r.kind == kind)
-            .collect();
+        let rels =
+            unique_by_kind_and_target(concept.relationships.iter().filter(|r| r.kind == kind));
         if rels.is_empty() {
             continue;
         }
@@ -229,7 +270,11 @@ fn write_dir_index(output_dir: &Path, dir: &str, entries: &[&Concept]) -> Result
 }
 
 fn write_root_index(output_dir: &Path, by_dir: &BTreeMap<&str, Vec<&Concept>>) -> Result<()> {
-    let mut content = String::from("# Knowledge Base\n\n");
+    // A bundle-root `index.md` is the one place OKF permits frontmatter on
+    // an index file (spec §8/§12), used here to declare the spec version
+    // the bundle targets.
+    let mut content =
+        format!("---\nokf_version: \"{OKF_SPEC_VERSION}\"\n---\n\n# Knowledge Base\n\n");
     for (dir, entries) in by_dir {
         content.push_str(&format!(
             "- [{}]({}/index.md) ({})\n",
@@ -263,7 +308,7 @@ mod tests {
             signature: Some(format!("fn {name}()")),
             tags: Vec::new(),
             is_public: true,
-            timestamp: None,
+            generated_at: None,
             relationships: Vec::new(),
         }
     }
@@ -382,6 +427,48 @@ mod tests {
         let content =
             fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
         assert!(content.contains("relationships:\n  calls:\n  - functions/auth/decode_jwt\n"));
+    }
+
+    #[test]
+    fn calling_the_same_target_twice_renders_only_one_line() {
+        // A function calling the same callee from two different call
+        // sites in its body produces two `Relationship` entries with the
+        // same target — both the frontmatter `relationships` list and
+        // the `# Calls` body section should collapse that to one entry
+        // rather than rendering it twice.
+        let dir = tempfile::tempdir().unwrap();
+        let mut caller = concept(
+            ConceptKind::Function,
+            "verify_token",
+            "auth.verify_token",
+            "src/auth.rs",
+        );
+        let callee = concept(
+            ConceptKind::Function,
+            "decode_jwt",
+            "auth.decode_jwt",
+            "src/auth.rs",
+        );
+        for _ in 0..2 {
+            caller.relationships.push(Relationship {
+                kind: RelationKind::Calls,
+                target: callee.id.clone(),
+                target_display: "decode_jwt".to_string(),
+            });
+        }
+
+        write_bundle(&[caller, callee], dir.path()).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
+        assert!(content.contains("relationships:\n  calls:\n  - functions/auth/decode_jwt\n"));
+        assert_eq!(
+            content
+                .matches("[decode_jwt](../../functions/auth/decode_jwt.md)")
+                .count(),
+            1,
+            "the `# Calls` section should list the repeated callee once: {content}"
+        );
     }
 
     #[test]

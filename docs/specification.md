@@ -19,19 +19,20 @@ The project follows four principles:
 
 ## About the Open Knowledge Format (OKF)
 
-The Open Knowledge Format is an open, vendor-neutral specification for representing metadata, context, and curated knowledge in a way that is equally readable by humans and parseable by AI agents. It formalizes the "knowledge as a living wiki" pattern: a shared library of files that both people and LLMs can read, cross-reference, and keep up to date over time.
+The Open Knowledge Format is an open, vendor-neutral specification for representing metadata, context, and curated knowledge in a way that is equally readable by humans and parseable by AI agents. It formalizes the "knowledge as a living wiki" pattern: a shared library of files that both people and LLMs can read, cross-reference, and keep up to date over time. "okf-rs" targets [OKF v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md), declared per bundle via `okf_version: "0.2"` in the bundle root's `index.md` frontmatter.
 
 Key characteristics of the OKF standard that "okf-rs" targets:
 
 - **Concepts as files** — Each unit of knowledge (a module, a class, a function, a metric, an API, …) is one markdown file with a YAML frontmatter header and a markdown body.
-- **One required field** — The frontmatter's only mandatory key is `type`. Everything else (`title`, `description`, `resource`, `tags`, `timestamp`, …) is optional, which keeps the format minimally opinionated about content models.
+- **One required field** — The frontmatter's only mandatory key is `type`. Everything else (`title`, `description`, `resource`, `tags`, …) is optional, which keeps the format minimally opinionated about content models.
 - **Bundle as a directory** — An OKF bundle is a directory of concept files, typically grouped by kind (`modules/`, `functions/`, `apis/`, …), with optional `index.md` files for progressive disclosure and optional `log.md` files for chronological change history.
 - **Graph via links** — Concepts reference each other through ordinary markdown links; the directory structure implies parent/child relationships while cross-links create a richer graph on top of the filesystem hierarchy.
 - **Just files, just markdown** — A bundle is readable in any editor, renders natively on GitHub, is indexable by any search tool, and ships as a plain tarball or git repository — no proprietary runtime, database, or SDK is required to read or write it.
 - **Producer/consumer independence** — The format is the contract, not the tooling. A human-authored bundle can be consumed by an AI agent, a metadata pipeline can feed a visualizer, and one LLM can synthesize knowledge that another LLM later queries — each side is free to swap implementations.
 - **Format, not platform** — OKF is not tied to any cloud provider, database, model vendor, or agent framework, which is what "okf-rs" means by "Open" in its own design principles.
+- **Trust, provenance, and lifecycle (v0.2)** — The optional `generated`, `verified`, `sources`, `status`, and `stale_after` frontmatter families make "who produced this," "who confirmed it," and "is it still current" answerable without leaving the frontmatter. `okf-rs` fills in `generated.by` (the `okf-rs/<version>` actor, per the spec's actor convention) on every concept it emits; the rest are optional and, per the spec's conformance rules, a concept missing any of them is still fully valid.
 
-"okf-rs" applies this specification to source code: instead of documenting datasets and tables, it extracts packages, modules, types, functions, and their relationships from a codebase and emits them as a conformant OKF bundle.
+"okf-rs" applies this specification to source code: instead of documenting datasets and tables, it extracts packages, modules, types, functions, and their relationships from a codebase and emits them as a conformant OKF bundle. The spec also defines an `Attested Computation` concept type for sanctioned, verifiably-executed computations (BigQuery/dbt/Python queries and the like) — outside what static code extraction produces, so `okf-rs` doesn't generate it, but `okf-rs validate` recognizes and checks one if a bundle is hand-edited to include it.
 
 ---
 
@@ -162,7 +163,7 @@ title: verify_token
 description: Validates a JWT and returns the decoded claims.
 resource: src/auth/token.rs#L42
 tags: [auth, security]
-timestamp: 2026-07-28T10:00:00Z
+generated: { by: okf-rs/0.1.0, at: 2026-07-28T10:00:00Z }
 ---
 
 # Signature
@@ -176,7 +177,7 @@ timestamp: 2026-07-28T10:00:00Z
 - [authenticate_request](../functions/authenticate_request.md)
 ```
 
-Only `type` is mandatory; `okf-rs` populates the remaining frontmatter fields (`title`, `description`, `resource`, `tags`, `timestamp`) and body sections (signature, relationships, documentation) from static analysis, and cross-links concepts using regular markdown links so the bundle forms a navigable graph.
+Only `type` is mandatory; `okf-rs` populates the remaining frontmatter fields (`title`, `description`, `resource`, `tags`, `generated.by`) and body sections (signature, relationships, documentation) from static analysis, and cross-links concepts using regular markdown links so the bundle forms a navigable graph. `generated.at` is populated when a deterministic source-control timestamp (e.g. the file's git commit date) is available; otherwise it's omitted, since `okf-rs` never stamps concepts with the wall-clock extraction time.
 
 ---
 
@@ -186,12 +187,18 @@ Validate that a generated (or hand-edited) bundle is a conformant OKF bundle bef
 
 `okf-rs validate` checks:
 
+- The bundle has a root `index.md`
 - Every concept file has a valid YAML frontmatter block with the mandatory `type` field
-- Frontmatter values match expected types (e.g. `tags` is a list, `timestamp` is RFC 3339)
-- Markdown links between concepts resolve to files that exist in the bundle (no dangling references)
-- Every concept is reachable from an `index.md` (no orphaned files)
+- Frontmatter values match expected types (e.g. `tags` is a list, `generated.at`/`verified[].at` are RFC 3339, `stale_after` is `YYYY-MM-DD`, `status` is `draft`/`stable`/`deprecated`)
+- The optional trust/provenance/lifecycle families (`generated`, `verified`, `sources`, `status`, `stale_after`), when present, match their v0.2 shape, and actor identities follow the `<producer>/<version>` / `human:<id>` / `process:<id>` convention (flagged as a warning, not an error, since it's producer guidance rather than a hard requirement)
+- A bundle-root `index.md`'s optional `okf_version` declaration is a well-formed `<major>.<minor>` string, and no other `index.md` carries frontmatter
 - No duplicate concept identity (same source symbol emitted twice)
-- Bundle structure matches the OKF schema version declared for the project
+- Frontmatter `relationships` targets (`calls`, `called_by`, `imports`, `member_of`, ...) resolve to concepts that exist in the bundle (external targets exempted)
+- `calls`/`called_by` are symmetric bundle-wide: a `Calls` edge with no matching reverse `CalledBy` (or vice versa) is flagged as a warning — the only relationship pair this applies to, since it's the only one ever emitted as two sides of the same edge
+- Markdown links between concepts resolve to files that exist in the bundle (no dangling references), and a file linking to the same target more than once is flagged as redundant
+- Every concept is reachable from an `index.md` (no orphaned files)
+
+`okf-rs graph isolated` complements this with a call-graph-level check: concepts with no `Calls`/`CalledBy` edge in either direction — a different notion of "orphan" than index-reachability, since it looks at whether a concept actually participates in the call graph rather than whether it's linked into the bundle's narrative. `okf-rs coverage` reports content-completeness metrics (description/tag coverage, call-graph participation), and `okf-rs graph stats` reports topology metrics (per-kind concept counts, relationship edge counts by kind, and connected components of the `Calls`/`CalledBy` graph) — both distinct from `validate`'s pass/fail checks.
 
 Validation is deterministic and fully offline, and is designed to run in CI (e.g. `okf-rs validate --ci`) to fail a pipeline on a broken or stale bundle.
 
@@ -234,6 +241,8 @@ Provide semantic search by:
 - Relationship
 - Tag
 
+Phase 1/2 search is exact/substring matching over these fields. Phase 3 adds a ranked, relevance-scored full-text index (via [Tantivy](https://github.com/quickwit-oss/tantivy), an embedded pure-Rust library — no new external runtime dependency) over concept names, signatures, descriptions, and body text, so a query can match on wording rather than only an exact identifier.
+
 ---
 
 ### MCP Server
@@ -261,6 +270,8 @@ Because an OKF bundle is just markdown with YAML frontmatter, it is readable out
 - **opencode** — As an open, model-agnostic agent, opencode consumes both MCP servers and plain-file context; "okf-rs" supports opencode the same way as Claude Code (MCP server) and can generate an `AGENTS.md` entry point, the emerging cross-tool convention opencode and other agents look for.
 - **Any other MCP-capable or file-reading agent** — Since OKF is a format, not a platform, no agent-specific code is required for baseline compatibility. Agents that support the Model Context Protocol get live, queryable access via `okf-mcp`; agents that only read files get a browsable, linkable bundle plus optional `CLAUDE.md` / `AGENTS.md` pointers generated by `okf-rs init`.
 
+`AGENTS.md` is the single source of truth for the generated section, and `CLAUDE.md` gets a one-line `@AGENTS.md` import rather than a duplicate copy. This matters beyond tidiness: opencode (and other AGENTS.md-first agents) use *only* `AGENTS.md` whenever both files are present in a directory, silently ignoring `CLAUDE.md` — so a duplicated `CLAUDE.md` would make any project-specific content a user later adds to it invisible to those agents the moment an `AGENTS.md` exists. Importing instead of duplicating also matches Claude Code's own documented guidance for repositories that support multiple agent tools.
+
 This mirrors OKF's producer/consumer independence principle: "okf-rs" is a single producer of knowledge, and any current or future agent is a free-to-swap consumer of the same bundle.
 
 ---
@@ -276,6 +287,8 @@ When enabled, an LLM may generate:
 - Glossary entries
 
 The generated OKF remains valid even without AI enrichment.
+
+The enrichment backend is pluggable via any OpenAI-compatible endpoint — a local runner ([Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), LocalAI), [Crustly](https://github.com/jyjeanne/crustly) (a terminal-based Rust coding assistant with the same local-LLM-first design), or a cloud provider — so enrichment never depends on one vendor, and offline/privacy-sensitive projects can enrich entirely locally. Matches the [Design Principles](#design-principles) this project already commits to: plugin-based and offline-first, with the deterministic core (Phases 1–2) completely unaffected either way — enrichment only ever adds an explicit, optional layer on top, never mixed into base extraction.
 
 ---
 
@@ -364,7 +377,7 @@ okf-rs/
 | `okf-validator` | Validates bundle conformance to the OKF schema (see [Validation](#validation)) |
 | `okf-search` | Indexes and queries the bundle by symbol, package, module, type, API, relationship, and tag |
 | `okf-mcp` | Model Context Protocol server exposing the bundle/graph to AI agents |
-| `okf-server` | HTTP server for browsing, visualization, and serving the bundle/search/MCP endpoints |
+| `okf-server` | REST + GraphQL API and HTTP server for browsing, visualization, and serving the bundle/search/MCP endpoints, built on `okf-graph`'s public library API |
 | `okf-watch` | Filesystem watcher for continuous re-indexing during local development |
 
 ---
@@ -410,22 +423,26 @@ Each phase builds strictly on the previous one's output; a feature is only liste
 - Basic documentation generation (Markdown, HTML) templated directly from the bundle — no LLM required
 - Continuous indexing in local development (`okf-watch`)
 
-### Phase 3 — Intelligence & Extended Output
+### Phase 3 — Search, Interop & Intelligence
 
-- Optional AI enrichment: function summaries, module descriptions, architecture explanations, usage examples, glossary entries
+Ordered deterministic/offline work first (no new runtime dependency, no external service, nothing optional), then interop, then the genuinely optional AI-dependent items last — each later item builds on a stable knowledge graph the earlier ones establish, and none of them are required for the ones before to be useful:
+
+- Full-text search engine: ranked, relevance-scored search (via [Tantivy](https://github.com/quickwit-oss/tantivy)) layered onto today's exact/substring `okf-search` — see [Search Engine](#search-engine)
+- Stable, versioned public library API: `okf-graph`/`okf-query` promoted from an internal implementation detail of `okf-cli`/`okf-mcp` to a documented, semver'd crate other Rust tools — including `okf-server` in Phase 4 — can embed directly, without shelling out to the CLI
+- DITA ⇄ OKF converter: export an OKF bundle to DITA (as before), plus *import* existing DITA XML as a source — so a technical-writing team with an existing DITA corpus can bring it into the same bundle/CLI/MCP/graph queries every other source already works with
+- Optional AI enrichment: function summaries, module descriptions, architecture explanations, usage examples, glossary entries — pluggable via any OpenAI-compatible endpoint, never a hard dependency on one vendor; see [Optional AI Enrichment](#optional-ai-enrichment)
 - Architecture extraction: architectural layers, domain boundaries, design patterns
 - REST endpoint, database model, and event-flow detection (feeds the architecture-dependent MCP queries noted in [MCP Server](#mcp-server))
-- DITA export
 - PDF export
 
 ### Phase 4 — Ecosystem
 
-- IDE plugins (VS Code, JetBrains) consuming the bundle and `okf-mcp`
-- Distributed knowledge server (`okf-server`): multi-repository, organization-wide serving
+Both items below build directly on Phase 3's stable `okf-graph`/`okf-query` library API rather than re-implementing graph access:
+
+- `okf-server`: REST + GraphQL API over the knowledge graph — multi-repository, organization-wide serving
+- `okf-rs` as an LSP server: hover, go-to-definition, and find-references backed by the OKF bundle, reachable from any LSP-capable editor (VS Code, JetBrains, Neovim, ...) through one server implementation rather than a bespoke plugin per IDE; dedicated VS Code/JetBrains extensions remain useful afterward as thin, editor-native wrappers around it
 - Visualization: interactive graph explorer over `okf-server`
 - Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
-
-Language ecosystems not yet scheduled in a phase (DITA XML as a *source* format, for example) remain future work and are tracked separately from the DITA *export* format above.
 
 ---
 
