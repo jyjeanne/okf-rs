@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 
 mod bundle;
@@ -326,5 +327,57 @@ impl Concept {
     pub fn make_id(kind: ConceptKind, qualified_name: &str) -> String {
         let slug = qualified_name.replace("::", "/").replace('.', "/");
         format!("{}/{}", kind.bundle_dir(), slug)
+    }
+
+    /// Assigns a unique id to every concept in `concepts` after the first
+    /// occurrence of a given id (compared case-insensitively, since ids
+    /// become file paths on filesystems that may not distinguish case),
+    /// by appending `-2`, `-3`, ... to each repeat, in place.
+    ///
+    /// Common for conditionally-compiled definitions that share one name
+    /// in one file but are never actually compiled together — e.g. Rust's
+    /// `#[cfg(feature = "x")]` / `#[cfg(not(feature = "x"))]` stub pair —
+    /// which Tree-sitter (unlike `rustc`) has no way to tell apart, since
+    /// it doesn't evaluate `cfg` attributes.
+    ///
+    /// Must run before anything indexes concepts by id — `okf-analyzer`
+    /// calls this right after collecting every file's concepts, before
+    /// building its id-to-index map for relationship resolution;
+    /// otherwise two same-id concepts stay indistinguishable there and a
+    /// resolved edge gets attributed to an arbitrary one of the pair
+    /// instead of the one whose body actually made the call.
+    /// `okf-generator::write_bundle` also calls this itself as a final
+    /// safety net, so nothing that reaches it can ever silently overwrite
+    /// another concept's file on disk.
+    ///
+    /// Ordered by location (`file`, then `start_line`) rather than
+    /// `concepts`' incoming order, so which occurrence is considered
+    /// "first" (and so keeps the unsuffixed id) is deterministic
+    /// regardless of extraction order.
+    pub fn disambiguate_ids(concepts: &mut [Concept]) {
+        let mut order: Vec<usize> = (0..concepts.len()).collect();
+        order.sort_by(|&a, &b| {
+            concepts[a]
+                .location
+                .file
+                .cmp(&concepts[b].location.file)
+                .then(
+                    concepts[a]
+                        .location
+                        .start_line
+                        .cmp(&concepts[b].location.start_line),
+                )
+        });
+
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for idx in order {
+            let count = seen
+                .entry(concepts[idx].id.to_ascii_lowercase())
+                .or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                concepts[idx].id = format!("{}-{}", concepts[idx].id, count);
+            }
+        }
     }
 }

@@ -137,6 +137,15 @@ pub fn analyze_with_cache_lsp(
     }
     *cache = fresh_cache;
 
+    // Must happen before anything below indexes concepts by id (the
+    // `index_of` map built after call resolution, in particular): two
+    // concepts sharing an id — e.g. a `#[cfg(feature = "x")]` /
+    // `#[cfg(not(feature = "x"))]` stub pair — would otherwise stay
+    // indistinguishable there, and a resolved Calls/CalledBy edge would
+    // get attributed to an arbitrary one of the pair instead of the one
+    // whose body actually made the call. See `Concept::disambiguate_ids`.
+    Concept::disambiguate_ids(&mut concepts);
+
     link_modules_to_packages(&mut concepts);
 
     let mut symbol_table: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -566,6 +575,70 @@ mod tests {
             .relationships
             .iter()
             .any(|r| r.kind == RelationKind::Calls));
+    }
+
+    #[test]
+    fn attributes_a_resolved_call_to_the_right_concept_when_two_share_one_id() {
+        // Mirrors a `#[cfg(feature = "x")]` / `#[cfg(not(feature = "x"))]`
+        // stub pair: two functions with the same name in the same file,
+        // only one of which actually calls anything. Before concepts are
+        // disambiguated up front, both shared the pre-disambiguation id
+        // `functions/src/a/run`, so the id-to-index map built for call
+        // resolution collapsed them to whichever was last in `concepts`
+        // — attributing the `Calls`/`CalledBy` edge to an arbitrary one
+        // of the pair instead of the one whose body made the call.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/a.rs"),
+            "pub fn helper() {}\n\npub fn run() { helper(); }\n\npub fn run() {}\n",
+        )
+        .unwrap();
+
+        let project = Project::load(dir.path()).unwrap();
+        let result = analyze(&project).unwrap();
+
+        let runs: Vec<_> = result.concepts.iter().filter(|c| c.name == "run").collect();
+        assert_eq!(runs.len(), 2, "both same-name concepts must survive");
+        assert_ne!(
+            runs[0].id, runs[1].id,
+            "same-file same-name concepts must get distinct ids"
+        );
+
+        let caller = runs
+            .iter()
+            .find(|c| c.location.start_line == 3)
+            .expect("the calling `run` is on line 3");
+        let stub = runs
+            .iter()
+            .find(|c| c.location.start_line == 5)
+            .expect("the empty `run` is on line 5");
+
+        assert!(
+            caller
+                .relationships
+                .iter()
+                .any(|r| r.kind == RelationKind::Calls && r.target_display == "helper"),
+            "the run that actually calls helper() must carry the Calls edge"
+        );
+        assert!(
+            !stub
+                .relationships
+                .iter()
+                .any(|r| r.kind == RelationKind::Calls),
+            "the empty run must not inherit the other run's Calls edge"
+        );
+
+        let helper = result.concepts.iter().find(|c| c.name == "helper").unwrap();
+        assert_eq!(
+            helper
+                .relationships
+                .iter()
+                .filter(|r| r.kind == RelationKind::CalledBy)
+                .count(),
+            1,
+            "helper must be called-by exactly the caller run, not both"
+        );
     }
 
     /// The same ambiguous-by-name shape as `does_not_resolve_ambiguous_call_names`

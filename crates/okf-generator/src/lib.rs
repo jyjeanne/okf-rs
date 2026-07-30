@@ -130,17 +130,28 @@ fn unique_by_kind_and_target<'a>(
         .collect()
 }
 
-/// Writes `concepts` to `output_dir` as an OKF bundle. Fails fast (before
-/// writing anything) if two concepts would collide on the same id, since
-/// that would otherwise silently overwrite one file with another.
+/// Writes `concepts` to `output_dir` as an OKF bundle. Duplicate-id
+/// concepts (see [`Concept::disambiguate_ids`]) are renamed rather than
+/// silently overwriting one another; if a rename still can't produce a
+/// fully unique set (in practice, only if a generated `-N` suffix itself
+/// happens to already be a distinct concept's id), this fails fast before
+/// writing anything rather than overwrite a file. Callers that already go
+/// through `okf-analyzer` (which disambiguates earlier, before resolving
+/// call relationships — see there for why that ordering matters) will
+/// never hit this path; it's a safety net for any other caller that
+/// assembles a concept list some other way.
 ///
 /// The collision check is case-insensitive, even though ids are compared
 /// exactly everywhere else: ids become file paths, and the most common
 /// target filesystems (default macOS APFS, Windows NTFS) are
 /// case-insensitive, so two ids differing only by case (e.g. `Run` vs.
-/// `run`) would still collide on disk even though this checker's own
-/// case-sensitive `HashSet` wouldn't catch it.
+/// `run`) would still collide on disk even though a case-sensitive check
+/// wouldn't catch it.
 pub fn write_bundle(concepts: &[Concept], output_dir: &Path) -> Result<()> {
+    let mut concepts = concepts.to_vec();
+    Concept::disambiguate_ids(&mut concepts);
+    let concepts = concepts.as_slice();
+
     let mut seen = HashSet::new();
     for concept in concepts {
         if !seen.insert(concept.id.to_ascii_lowercase()) {
@@ -365,24 +376,51 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_ids() {
+    fn disambiguates_duplicate_ids_instead_of_overwriting() {
+        // Two same-named, same-file concepts — e.g. Rust's
+        // `#[cfg(feature = "x")]` / `#[cfg(not(feature = "x"))]` stub
+        // pair — must both survive as distinct files rather than one
+        // silently overwriting the other.
         let dir = tempfile::tempdir().unwrap();
         let a = concept(ConceptKind::Function, "run", "run", "src/a.rs");
-        let b = concept(ConceptKind::Function, "run", "run", "src/b.rs");
-        let err = write_bundle(&[a, b], dir.path()).unwrap_err();
-        assert!(err.to_string().contains("duplicate concept id"));
+        let b = concept(ConceptKind::Function, "run", "run", "src/a.rs");
+        write_bundle(&[a, b], dir.path()).unwrap();
+
+        assert!(dir.path().join("functions/run.md").exists());
+        assert!(dir.path().join("functions/run-2.md").exists());
     }
 
     #[test]
-    fn rejects_ids_differing_only_by_case() {
+    fn disambiguates_ids_differing_only_by_case() {
         // On case-insensitive filesystems (default macOS, Windows), `Run`
-        // and `run` are the same path, so this must be caught even though
-        // the ids aren't byte-for-byte equal.
+        // and `run` are the same path, so this must be disambiguated even
+        // though the ids aren't byte-for-byte equal.
         let dir = tempfile::tempdir().unwrap();
         let a = concept(ConceptKind::Function, "Run", "Run", "src/a.rs");
         let b = concept(ConceptKind::Function, "run", "run", "src/b.rs");
-        let err = write_bundle(&[a, b], dir.path()).unwrap_err();
-        assert!(err.to_string().contains("duplicate concept id"));
+        write_bundle(&[a, b], dir.path()).unwrap();
+
+        assert!(dir.path().join("functions/Run.md").exists());
+        assert!(dir.path().join("functions/run-2.md").exists());
+    }
+
+    #[test]
+    fn disambiguation_order_is_deterministic_by_location_not_input_order() {
+        // The concept at the earlier source location keeps the unsuffixed
+        // id regardless of which order they're passed in.
+        let dir = tempfile::tempdir().unwrap();
+        let mut later = concept(ConceptKind::Function, "run", "run", "src/a.rs");
+        later.location.start_line = 20;
+        let mut earlier = concept(ConceptKind::Function, "run", "run", "src/a.rs");
+        earlier.location.start_line = 10;
+
+        // Passed in reverse of source order.
+        write_bundle(&[later, earlier], dir.path()).unwrap();
+
+        let first_content = fs::read_to_string(dir.path().join("functions/run.md")).unwrap();
+        assert!(first_content.contains("#L10"));
+        let second_content = fs::read_to_string(dir.path().join("functions/run-2.md")).unwrap();
+        assert!(second_content.contains("#L20"));
     }
 
     #[test]
