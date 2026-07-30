@@ -192,9 +192,16 @@ impl<'a> Graph<'a> {
     /// A concept with no `Calls`/`CalledBy` edge at all forms its own
     /// trivial single-concept component; those are omitted here since
     /// they're already reported, with more context, by
-    /// `isolated_concepts()` — this only returns components of two or
-    /// more concepts. Each component's ids are sorted; components
-    /// themselves are sorted by their first id, for deterministic output.
+    /// `isolated_concepts()`. A self-recursive concept (`Calls`/
+    /// `CalledBy` pointing at itself — the same shape `cycles()` treats
+    /// as "direct self-recursion") is *not* omitted even though it's
+    /// also a single-concept component: it has a real edge and
+    /// `isolated_concepts()` correctly doesn't report it either (it does
+    /// have a `Calls`/`CalledBy` relationship), so dropping it here too
+    /// would make it invisible to both. Every other single-concept
+    /// component (no self-loop) is dropped. Each component's ids are
+    /// sorted; components themselves are sorted by their first id, for
+    /// deterministic output.
     pub fn connected_components(&self) -> Vec<Vec<&'a str>> {
         let mut adjacency: HashMap<&str, HashSet<&str>> = HashMap::new();
         for concept in self.concepts {
@@ -235,7 +242,10 @@ impl<'a> Graph<'a> {
                     }
                 }
             }
-            if component.len() > 1 {
+            let has_self_loop = adjacency
+                .get(id)
+                .is_some_and(|neighbors| neighbors.contains(id));
+            if component.len() > 1 || has_self_loop {
                 component.sort();
                 components.push(component);
             }
@@ -536,6 +546,34 @@ mod tests {
                 .flatten()
                 .any(|&id| id == "functions/isolated"),
             "an isolated concept should not appear as its own component: {components:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_recursive_concept_is_its_own_component_not_dropped_as_a_singleton() {
+        // A concept whose only Calls/CalledBy edge points at itself has
+        // a real edge (isolated_concepts() correctly excludes it), so
+        // dropping it here too — as if it were an ordinary edgeless
+        // singleton — would make it invisible to both metrics.
+        let mut recursive = concept("functions/recursive", ConceptKind::Function, "x.rs", true);
+        add_edge(&mut recursive, RelationKind::Calls, "functions/recursive");
+        add_edge(
+            &mut recursive,
+            RelationKind::CalledBy,
+            "functions/recursive",
+        );
+
+        let concepts = vec![recursive];
+        let graph = Graph::build(&concepts);
+
+        assert!(
+            graph.isolated_concepts().is_empty(),
+            "a self-recursive concept has an edge, so it isn't isolated"
+        );
+        assert_eq!(
+            graph.connected_components(),
+            vec![vec!["functions/recursive"]],
+            "a self-recursive concept should form its own single-concept component"
         );
     }
 

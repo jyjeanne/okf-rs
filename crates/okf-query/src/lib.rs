@@ -178,11 +178,20 @@ pub fn coverage(bundle: &Path) -> Result<String> {
         .filter(|c| !isolated.contains(c.id.as_str()))
         .count();
 
+    let graph_line = if graph_eligible == 0 {
+        "  N/A (no non-Module/Package concepts to measure) participate in the call graph"
+            .to_string()
+    } else {
+        format!(
+            "  {}% ({graph_connected}/{graph_eligible}) participate in the call graph (excludes Module/Package; see `graph isolated` for the rest)",
+            percent(graph_connected, graph_eligible)
+        )
+    };
+
     Ok(format!(
-        "{total} concepts\n  {}% ({with_description}/{total}) have a description\n  {}% ({with_tags}/{total}) have at least one tag\n  {}% ({graph_connected}/{graph_eligible}) participate in the call graph (excludes Module/Package; see `graph isolated` for the rest)",
+        "{total} concepts\n  {}% ({with_description}/{total}) have a description\n  {}% ({with_tags}/{total}) have at least one tag\n{graph_line}",
         percent(with_description, total),
         percent(with_tags, total),
-        percent(graph_connected, graph_eligible),
     ))
 }
 
@@ -253,7 +262,7 @@ pub fn graph_stats(bundle: &Path) -> Result<String> {
     }
 
     out.push_str(&format!(
-        "\nCall graph: {} connected component(s) of 2+ concepts, {isolated_count} isolated concept(s) (see `graph isolated`)\n",
+        "\nCall graph: {} connected component(s) with at least one Calls/CalledBy edge (sizes shown below — a lone self-recursive concept forms its own size-1 component), {isolated_count} isolated concept(s) with no edge at all (see `graph isolated`)\n",
         components.len()
     ));
     for component in &components {
@@ -394,6 +403,29 @@ mod tests {
     }
 
     #[test]
+    fn coverage_reports_not_applicable_when_no_concept_is_call_graph_eligible() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "packages/demo.md",
+            "---\ntype: Rust Package\ntitle: demo\nresource: Cargo.toml\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "modules/lib.md",
+            "---\ntype: Rust Module\ntitle: lib\nresource: src/lib.rs#L1\n---\n\nbody\n",
+        );
+
+        let text = coverage(dir.path()).unwrap();
+        assert!(text.starts_with("2 concepts"));
+        assert!(
+            text.contains("N/A (no non-Module/Package concepts to measure) participate in the call graph"),
+            "a bundle with nothing but Module/Package concepts should report N/A, not a misleading 0%: {text}"
+        );
+        assert!(!text.contains("0% (0/0)"));
+    }
+
+    #[test]
     fn graph_stats_reports_kind_and_relation_counts_and_the_one_component() {
         let dir = sample_bundle();
         let text = graph_stats(dir.path()).unwrap();
@@ -401,7 +433,8 @@ mod tests {
         assert!(text.contains("Function     2"));
         assert!(text.contains("Calls        1"));
         assert!(text.contains("Called by    1"));
-        assert!(text.contains("1 connected component(s) of 2+ concepts, 0 isolated concept(s)"));
+        assert!(text.contains("1 connected component(s) with at least one Calls/CalledBy edge"));
+        assert!(text.contains("0 isolated concept(s) with no edge at all"));
         assert!(text.contains("functions/auth/decode_jwt, functions/auth/verify_token"));
     }
 
@@ -416,7 +449,28 @@ mod tests {
 
         let text = graph_stats(dir.path()).unwrap();
         assert!(text.starts_with("3 concepts"));
-        assert!(text.contains("1 connected component(s) of 2+ concepts, 1 isolated concept(s)"));
+        assert!(text.contains("1 connected component(s) with at least one Calls/CalledBy edge"));
+        assert!(text.contains("1 isolated concept(s) with no edge at all"));
+    }
+
+    #[test]
+    fn graph_stats_counts_a_self_recursive_concept_as_its_own_component_not_isolated() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/recursive.md",
+            "---\ntype: Rust Function\ntitle: recursive\nresource: src/auth.rs#L30\nrelationships:\n  calls:\n    - functions/auth/recursive\n  called_by:\n    - functions/auth/recursive\n---\n\nbody\n",
+        );
+
+        let text = graph_stats(dir.path()).unwrap();
+        assert!(text.starts_with("3 concepts"));
+        // The self-recursive concept and the original a<->b pair are two
+        // separate components — the self-loop must not be dropped as a
+        // singleton, nor merged into the unrelated pair, nor counted as
+        // isolated (it has a real Calls/CalledBy edge).
+        assert!(text.contains("2 connected component(s) with at least one Calls/CalledBy edge"));
+        assert!(text.contains("0 isolated concept(s) with no edge at all"));
+        assert!(text.contains("[1] functions/auth/recursive"));
     }
 
     #[test]
