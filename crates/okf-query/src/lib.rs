@@ -196,11 +196,7 @@ pub fn coverage(bundle: &Path) -> Result<String> {
 }
 
 fn percent(part: usize, total: usize) -> usize {
-    if total == 0 {
-        0
-    } else {
-        part * 100 / total
-    }
+    (part * 100).checked_div(total).unwrap_or(0)
 }
 
 /// Cross-module call dependency edges: which modules call into which.
