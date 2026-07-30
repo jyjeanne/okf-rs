@@ -8,7 +8,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 |---|---|
 | Phase 1 — Foundations | ✅ Complete |
 | Phase 2 — Depth & Integration | ✅ Complete (11/11) |
-| Phase 3 — Search, Interop & Intelligence | ⬜ Not started |
+| Phase 3 — Search, Interop & Intelligence | 🔶 In progress (7/15) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
