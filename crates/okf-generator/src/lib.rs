@@ -88,12 +88,20 @@ struct RelationshipsFrontmatter {
 /// preserving each kind's original relative order. `None` when the
 /// concept has no relationships, so the frontmatter field is omitted
 /// entirely rather than emitted as an empty mapping.
+///
+/// A target appearing more than once under the same kind — e.g. a
+/// function calling the same callee from two different call sites in its
+/// body — is collapsed to its first occurrence: `relationships` records
+/// *which* concepts a relationship holds toward, not how many times or
+/// where, so a repeat carries no extra information and would otherwise
+/// double up as a redundant line in both this frontmatter list and the
+/// body section below (see `unique_by_kind_and_target`).
 fn relationships_frontmatter(concept: &Concept) -> Option<RelationshipsFrontmatter> {
     if concept.relationships.is_empty() {
         return None;
     }
     let mut grouped = RelationshipsFrontmatter::default();
-    for rel in &concept.relationships {
+    for rel in unique_by_kind_and_target(concept.relationships.iter()) {
         let bucket = match rel.kind {
             RelationKind::Imports => &mut grouped.imports,
             RelationKind::Calls => &mut grouped.calls,
@@ -106,6 +114,20 @@ fn relationships_frontmatter(concept: &Concept) -> Option<RelationshipsFrontmatt
         bucket.push(rel.target.clone());
     }
     Some(grouped)
+}
+
+/// Filters `rels` down to one entry per distinct `(kind, target)` pair,
+/// keeping the first occurrence and otherwise preserving relative order.
+/// Shared by `relationships_frontmatter` and `render_concept`'s body
+/// sections so the frontmatter's `relationships` field and the
+/// human-readable `# Calls`/... sections always agree on what's listed,
+/// rather than deduplicating each independently and risking drift.
+fn unique_by_kind_and_target<'a>(
+    rels: impl Iterator<Item = &'a okf_parser::Relationship>,
+) -> Vec<&'a okf_parser::Relationship> {
+    let mut seen: HashSet<(RelationKind, &str)> = HashSet::new();
+    rels.filter(|rel| seen.insert((rel.kind, rel.target.as_str())))
+        .collect()
 }
 
 /// Writes `concepts` to `output_dir` as an OKF bundle. Fails fast (before
@@ -208,11 +230,8 @@ fn render_concept(
         (RelationKind::DependsOn, "# Depends on"),
         (RelationKind::MemberOf, "# Member of"),
     ] {
-        let rels: Vec<_> = concept
-            .relationships
-            .iter()
-            .filter(|r| r.kind == kind)
-            .collect();
+        let rels =
+            unique_by_kind_and_target(concept.relationships.iter().filter(|r| r.kind == kind));
         if rels.is_empty() {
             continue;
         }
@@ -408,6 +427,48 @@ mod tests {
         let content =
             fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
         assert!(content.contains("relationships:\n  calls:\n  - functions/auth/decode_jwt\n"));
+    }
+
+    #[test]
+    fn calling_the_same_target_twice_renders_only_one_line() {
+        // A function calling the same callee from two different call
+        // sites in its body produces two `Relationship` entries with the
+        // same target — both the frontmatter `relationships` list and
+        // the `# Calls` body section should collapse that to one entry
+        // rather than rendering it twice.
+        let dir = tempfile::tempdir().unwrap();
+        let mut caller = concept(
+            ConceptKind::Function,
+            "verify_token",
+            "auth.verify_token",
+            "src/auth.rs",
+        );
+        let callee = concept(
+            ConceptKind::Function,
+            "decode_jwt",
+            "auth.decode_jwt",
+            "src/auth.rs",
+        );
+        for _ in 0..2 {
+            caller.relationships.push(Relationship {
+                kind: RelationKind::Calls,
+                target: callee.id.clone(),
+                target_display: "decode_jwt".to_string(),
+            });
+        }
+
+        write_bundle(&[caller, callee], dir.path()).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
+        assert!(content.contains("relationships:\n  calls:\n  - functions/auth/decode_jwt\n"));
+        assert_eq!(
+            content
+                .matches("[decode_jwt](../../functions/auth/decode_jwt.md)")
+                .count(),
+            1,
+            "the `# Calls` section should list the repeated callee once: {content}"
+        );
     }
 
     #[test]

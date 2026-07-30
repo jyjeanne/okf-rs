@@ -2,6 +2,8 @@
 //! `okf-generator` or hand-edited — per the checks described in the
 //! project specification's Validation section:
 //!
+//! - the bundle has a root `index.md` (every other check below assumes
+//!   one exists to anchor reachability against)
 //! - every concept file has a valid YAML frontmatter block with the
 //!   mandatory `type` field
 //! - frontmatter values match expected shapes (`tags` is a list,
@@ -17,13 +19,22 @@
 //! - a bundle-root `index.md`'s optional `okf_version` declaration is a
 //!   well-formed `<major>.<minor>` string, and no other `index.md` carries
 //!   frontmatter at all
-//! - markdown links between concepts resolve to files that exist in the
-//!   bundle (no dangling references)
-//! - every concept is reachable from an `index.md` (no orphaned files)
 //! - no duplicate concept identity: neither two files colliding on path
 //!   (case-insensitively, since paths become filesystem entries that may
 //!   not distinguish case) nor two files independently describing the
 //!   same source location (`resource`)
+//! - frontmatter `relationships` targets (`calls`/`called_by`/`imports`/
+//!   `member_of`/...) resolve to concepts that exist in the bundle, same
+//!   as markdown links (external targets, prefixed `external/`, are
+//!   exempt by convention — see `okf-generator`)
+//! - `calls`/`called_by` are symmetric bundle-wide: a `Calls` edge with no
+//!   matching reverse `CalledBy` (or vice versa) is flagged — the only
+//!   relationship pair this applies to, since it's the only one
+//!   `okf-analyzer` ever emits as two sides of the same edge
+//! - markdown links between concepts resolve to files that exist in the
+//!   bundle (no dangling references), and a file linking to the same
+//!   target more than once is flagged as redundant
+//! - every concept is reachable from `index.md` (no orphaned files)
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -92,10 +103,13 @@ pub fn validate_bundle(bundle_dir: &Path) -> Result<ValidationReport> {
     let mut report = ValidationReport::default();
     let known_paths: HashSet<&str> = files.iter().map(|f| f.relative.as_str()).collect();
 
+    check_required_index(&files, &mut report);
     check_frontmatter(&files, &mut report);
     check_index_frontmatter(&files, &mut report);
     check_duplicate_ids(&files, &mut report);
     check_duplicate_resources(&files, &mut report);
+    check_relationship_targets(&files, &known_paths, &mut report);
+    check_relationship_symmetry(&files, &known_paths, &mut report);
     let links = check_links_and_collect(&files, &known_paths, &mut report);
     check_reachability(&files, &links, &mut report);
 
@@ -104,6 +118,21 @@ pub fn validate_bundle(bundle_dir: &Path) -> Result<ValidationReport> {
 
 fn is_index(relative: &str) -> bool {
     relative == "index.md" || relative.ends_with("/index.md")
+}
+
+/// The bundle's root `index.md` is the anchor every other structural
+/// check (reachability, in particular) assumes exists. Without this
+/// check, a bundle missing it entirely degrades silently into every
+/// single concept being reported as "orphaned" one at a time, instead of
+/// one clear error naming the actual root cause.
+fn check_required_index(files: &[ScannedFile], report: &mut ValidationReport) {
+    if !files.iter().any(|f| f.relative == "index.md") {
+        report.issues.push(ValidationIssue {
+            severity: Severity::Error,
+            file: "index.md".to_string(),
+            message: "missing required root `index.md`".to_string(),
+        });
+    }
 }
 
 fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
@@ -624,6 +653,173 @@ fn check_duplicate_resources(files: &[ScannedFile], report: &mut ValidationRepor
     }
 }
 
+/// A `relationships` target under the `external/` prefix names something
+/// outside the bundle by convention (e.g. a third-party import — see
+/// `okf-generator`'s external-target handling) and is never expected to
+/// resolve to a concept file, so it's exempt from this check.
+fn is_external_target(target: &str) -> bool {
+    target.starts_with("external/")
+}
+
+/// Every `relationships` entry in a concept's frontmatter (`calls`,
+/// `called_by`, `imports`, `member_of`, ...) names another concept by id;
+/// this checks each one resolves to a real file in the bundle, the same
+/// way `check_links_and_collect` does for markdown body links. Without
+/// this, a stale or hand-edited relationship target silently vanishes in
+/// `okf-graph` (`Graph::get` returns `None` and it's filtered out of
+/// results) instead of being reported.
+fn check_relationship_targets(
+    files: &[ScannedFile],
+    known_paths: &HashSet<&str>,
+    report: &mut ValidationReport,
+) {
+    for file in files {
+        if is_index(&file.relative) {
+            continue;
+        }
+        let Some((yaml, _)) = split_frontmatter(&file.content) else {
+            continue;
+        };
+        let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+            continue;
+        };
+        let Some(mapping) = value.as_mapping() else {
+            continue;
+        };
+        let Some(relationships) = mapping.get("relationships").and_then(|v| v.as_mapping()) else {
+            continue;
+        };
+
+        for (kind, targets) in relationships {
+            let kind = kind.as_str().unwrap_or("relationships");
+            let Some(targets) = targets.as_sequence() else {
+                continue;
+            };
+            for target in targets {
+                let Some(target) = target.as_str() else {
+                    continue;
+                };
+                if is_external_target(target) {
+                    continue;
+                }
+                let target_path = format!("{target}.md");
+                if !known_paths.contains(target_path.as_str()) {
+                    report.issues.push(ValidationIssue {
+                        severity: Severity::Error,
+                        file: file.relative.clone(),
+                        message: format!(
+                            "`relationships.{kind}` references `{target}`, which doesn't exist in the bundle"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Bundle-wide `Calls`/`CalledBy` symmetry. `okf-analyzer` always pushes
+/// both sides of a resolved call edge together (a `Calls` relationship on
+/// the caller, a `CalledBy` relationship on the callee), so an asymmetric
+/// pair only arises in a hand-edited or drifted bundle — this is a safety
+/// net for that, not something a plain `okf-rs generate` output should
+/// ever trigger. No other relationship kind (`Imports`, `Implements`,
+/// `Inherits`, `DependsOn`, `MemberOf`) has a reverse kind in
+/// `RelationKind` at all, so this check only ever applies to this one
+/// pair — checking any other kind for "symmetry" would be meaningless.
+///
+/// A target that doesn't exist in the bundle at all is already reported
+/// by `check_relationship_targets`; re-flagging it here as "asymmetric"
+/// too would just be the same problem under a second, more confusing
+/// message, so this only considers targets known to exist.
+fn check_relationship_symmetry(
+    files: &[ScannedFile],
+    known_paths: &HashSet<&str>,
+    report: &mut ValidationReport,
+) {
+    let mut calls_of: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut called_by_of: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for file in files {
+        if is_index(&file.relative) {
+            continue;
+        }
+        let Some((yaml, _)) = split_frontmatter(&file.content) else {
+            continue;
+        };
+        let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+            continue;
+        };
+        let Some(mapping) = value.as_mapping() else {
+            continue;
+        };
+        let Some(relationships) = mapping.get("relationships").and_then(|v| v.as_mapping()) else {
+            continue;
+        };
+        let id = file.relative.strip_suffix(".md").unwrap_or(&file.relative);
+
+        for (bucket, key) in [(&mut calls_of, "calls"), (&mut called_by_of, "called_by")] {
+            if let Some(targets) = relationships.get(key).and_then(|v| v.as_sequence()) {
+                bucket
+                    .entry(id.to_string())
+                    .or_default()
+                    .extend(targets.iter().filter_map(|t| t.as_str()).map(String::from));
+            }
+        }
+    }
+
+    check_symmetry_direction(
+        &calls_of,
+        &called_by_of,
+        known_paths,
+        "calls",
+        "called_by",
+        report,
+    );
+    check_symmetry_direction(
+        &called_by_of,
+        &calls_of,
+        known_paths,
+        "called_by",
+        "calls",
+        report,
+    );
+}
+
+/// One direction of `check_relationship_symmetry`: for every `id -> target`
+/// edge in `forward`, requires `reverse` to carry the matching
+/// `target -> id` edge back. Called twice (`calls`/`called_by`, then
+/// swapped) to cover both directions without duplicating this loop.
+fn check_symmetry_direction(
+    forward: &HashMap<String, HashSet<String>>,
+    reverse: &HashMap<String, HashSet<String>>,
+    known_paths: &HashSet<&str>,
+    forward_key: &str,
+    reverse_key: &str,
+    report: &mut ValidationReport,
+) {
+    for (id, targets) in forward {
+        for target in targets {
+            if is_external_target(target) {
+                continue;
+            }
+            let target_path = format!("{target}.md");
+            if !known_paths.contains(target_path.as_str()) {
+                continue;
+            }
+            let has_reverse = reverse.get(target).is_some_and(|s| s.contains(id));
+            if !has_reverse {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Warning,
+                    file: target_path,
+                    message: format!(
+                        "`{id}` lists `relationships.{forward_key}: {target}`, but `{target}` doesn't list `relationships.{reverse_key}: {id}` back"
+                    ),
+                });
+            }
+        }
+    }
+}
+
 fn extract_local_links(content: &str) -> Vec<String> {
     // A minimal markdown-link scanner (avoids pulling in a regex/markdown
     // dependency for one pattern): finds `](...)` and keeps the ones that
@@ -671,9 +867,17 @@ fn check_links_and_collect(
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
     for file in files {
         let mut resolved_targets = Vec::new();
+        let mut seen_targets: HashSet<String> = HashSet::new();
         for link in extract_local_links(&file.content) {
             match resolve_link(&file.relative, &link) {
                 Some(target) if known_paths.contains(target.as_str()) => {
+                    if !seen_targets.insert(target.clone()) {
+                        report.issues.push(ValidationIssue {
+                            severity: Severity::Warning,
+                            file: file.relative.clone(),
+                            message: format!("redundant link to `{target}` (already linked earlier in this file)"),
+                        });
+                    }
                     resolved_targets.push(target);
                 }
                 Some(target) => {
@@ -917,6 +1121,173 @@ mod tests {
                 .count(),
             2,
             "two Module concepts sharing a resource should still be flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn flags_a_missing_root_index() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.has_errors());
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.message.contains("missing required root `index.md`")));
+    }
+
+    #[test]
+    fn flags_a_relationship_target_that_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L1\nrelationships:\n  calls:\n    - functions/missing\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.has_errors());
+        assert!(report.issues.iter().any(|i| {
+            i.message.contains("relationships.calls") && i.message.contains("functions/missing")
+        }));
+    }
+
+    #[test]
+    fn accepts_an_external_relationship_target() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Module\ntitle: run\nresource: src/main.rs#L1\nrelationships:\n  imports:\n    - external/std-collections-hashmap\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "an external:// relationship target should not be flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn flags_a_redundant_duplicate_link() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [run](functions/run.md)\n- [run again](functions/run.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "a redundant link is a warning, not an error: {:?}",
+            report.issues
+        );
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| { i.severity == Severity::Warning && i.message.contains("redundant link") }));
+    }
+
+    #[test]
+    fn accepts_symmetric_calls_and_called_by() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [a](functions/a.md)\n- [b](functions/b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - functions/b\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\nrelationships:\n  called_by:\n    - functions/a\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "unexpected errors: {:?}",
+            report.issues
+        );
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("doesn't list")),
+            "a symmetric Calls/CalledBy pair should not be flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn flags_a_calls_edge_with_no_reciprocal_called_by() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [a](functions/a.md)\n- [b](functions/b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - functions/b\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "asymmetry is a warning, not an error: {:?}",
+            report.issues
+        );
+        assert!(report.issues.iter().any(|i| {
+            i.severity == Severity::Warning
+                && i.file == "functions/b.md"
+                && i.message.contains("relationships.calls: functions/b")
+                && i.message.contains("relationships.called_by: functions/a")
+        }));
+    }
+
+    #[test]
+    fn asymmetric_external_call_is_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [a](functions/a.md)\n");
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - external/std-mem-swap\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("doesn't list")),
+            "an external call target has no reciprocal side to check: {:?}",
             report.issues
         );
     }

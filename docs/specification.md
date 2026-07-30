@@ -187,13 +187,18 @@ Validate that a generated (or hand-edited) bundle is a conformant OKF bundle bef
 
 `okf-rs validate` checks:
 
+- The bundle has a root `index.md`
 - Every concept file has a valid YAML frontmatter block with the mandatory `type` field
 - Frontmatter values match expected types (e.g. `tags` is a list, `generated.at`/`verified[].at` are RFC 3339, `stale_after` is `YYYY-MM-DD`, `status` is `draft`/`stable`/`deprecated`)
 - The optional trust/provenance/lifecycle families (`generated`, `verified`, `sources`, `status`, `stale_after`), when present, match their v0.2 shape, and actor identities follow the `<producer>/<version>` / `human:<id>` / `process:<id>` convention (flagged as a warning, not an error, since it's producer guidance rather than a hard requirement)
 - A bundle-root `index.md`'s optional `okf_version` declaration is a well-formed `<major>.<minor>` string, and no other `index.md` carries frontmatter
-- Markdown links between concepts resolve to files that exist in the bundle (no dangling references)
-- Every concept is reachable from an `index.md` (no orphaned files)
 - No duplicate concept identity (same source symbol emitted twice)
+- Frontmatter `relationships` targets (`calls`, `called_by`, `imports`, `member_of`, ...) resolve to concepts that exist in the bundle (external targets exempted)
+- `calls`/`called_by` are symmetric bundle-wide: a `Calls` edge with no matching reverse `CalledBy` (or vice versa) is flagged as a warning — the only relationship pair this applies to, since it's the only one ever emitted as two sides of the same edge
+- Markdown links between concepts resolve to files that exist in the bundle (no dangling references), and a file linking to the same target more than once is flagged as redundant
+- Every concept is reachable from an `index.md` (no orphaned files)
+
+`okf-rs graph isolated` complements this with a call-graph-level check: concepts with no `Calls`/`CalledBy` edge in either direction — a different notion of "orphan" than index-reachability, since it looks at whether a concept actually participates in the call graph rather than whether it's linked into the bundle's narrative. `okf-rs coverage` reports content-completeness metrics (description/tag coverage, call-graph participation), and `okf-rs graph stats` reports topology metrics (per-kind concept counts, relationship edge counts by kind, and connected components of the `Calls`/`CalledBy` graph) — both distinct from `validate`'s pass/fail checks.
 
 Validation is deterministic and fully offline, and is designed to run in CI (e.g. `okf-rs validate --ci`) to fail a pipeline on a broken or stale bundle.
 
