@@ -27,6 +27,10 @@
 //!   `member_of`/...) resolve to concepts that exist in the bundle, same
 //!   as markdown links (external targets, prefixed `external/`, are
 //!   exempt by convention — see `okf-generator`)
+//! - `calls`/`called_by` are symmetric bundle-wide: a `Calls` edge with no
+//!   matching reverse `CalledBy` (or vice versa) is flagged — the only
+//!   relationship pair this applies to, since it's the only one
+//!   `okf-analyzer` ever emits as two sides of the same edge
 //! - markdown links between concepts resolve to files that exist in the
 //!   bundle (no dangling references), and a file linking to the same
 //!   target more than once is flagged as redundant
@@ -105,6 +109,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> Result<ValidationReport> {
     check_duplicate_ids(&files, &mut report);
     check_duplicate_resources(&files, &mut report);
     check_relationship_targets(&files, &known_paths, &mut report);
+    check_relationship_symmetry(&files, &known_paths, &mut report);
     let links = check_links_and_collect(&files, &known_paths, &mut report);
     check_reachability(&files, &links, &mut report);
 
@@ -712,6 +717,109 @@ fn check_relationship_targets(
     }
 }
 
+/// Bundle-wide `Calls`/`CalledBy` symmetry. `okf-analyzer` always pushes
+/// both sides of a resolved call edge together (a `Calls` relationship on
+/// the caller, a `CalledBy` relationship on the callee), so an asymmetric
+/// pair only arises in a hand-edited or drifted bundle — this is a safety
+/// net for that, not something a plain `okf-rs generate` output should
+/// ever trigger. No other relationship kind (`Imports`, `Implements`,
+/// `Inherits`, `DependsOn`, `MemberOf`) has a reverse kind in
+/// `RelationKind` at all, so this check only ever applies to this one
+/// pair — checking any other kind for "symmetry" would be meaningless.
+///
+/// A target that doesn't exist in the bundle at all is already reported
+/// by `check_relationship_targets`; re-flagging it here as "asymmetric"
+/// too would just be the same problem under a second, more confusing
+/// message, so this only considers targets known to exist.
+fn check_relationship_symmetry(
+    files: &[ScannedFile],
+    known_paths: &HashSet<&str>,
+    report: &mut ValidationReport,
+) {
+    let mut calls_of: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut called_by_of: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for file in files {
+        if is_index(&file.relative) {
+            continue;
+        }
+        let Some((yaml, _)) = split_frontmatter(&file.content) else {
+            continue;
+        };
+        let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+            continue;
+        };
+        let Some(mapping) = value.as_mapping() else {
+            continue;
+        };
+        let Some(relationships) = mapping.get("relationships").and_then(|v| v.as_mapping()) else {
+            continue;
+        };
+        let id = file.relative.strip_suffix(".md").unwrap_or(&file.relative);
+
+        for (bucket, key) in [(&mut calls_of, "calls"), (&mut called_by_of, "called_by")] {
+            if let Some(targets) = relationships.get(key).and_then(|v| v.as_sequence()) {
+                bucket
+                    .entry(id.to_string())
+                    .or_default()
+                    .extend(targets.iter().filter_map(|t| t.as_str()).map(String::from));
+            }
+        }
+    }
+
+    check_symmetry_direction(
+        &calls_of,
+        &called_by_of,
+        known_paths,
+        "calls",
+        "called_by",
+        report,
+    );
+    check_symmetry_direction(
+        &called_by_of,
+        &calls_of,
+        known_paths,
+        "called_by",
+        "calls",
+        report,
+    );
+}
+
+/// One direction of `check_relationship_symmetry`: for every `id -> target`
+/// edge in `forward`, requires `reverse` to carry the matching
+/// `target -> id` edge back. Called twice (`calls`/`called_by`, then
+/// swapped) to cover both directions without duplicating this loop.
+fn check_symmetry_direction(
+    forward: &HashMap<String, HashSet<String>>,
+    reverse: &HashMap<String, HashSet<String>>,
+    known_paths: &HashSet<&str>,
+    forward_key: &str,
+    reverse_key: &str,
+    report: &mut ValidationReport,
+) {
+    for (id, targets) in forward {
+        for target in targets {
+            if is_external_target(target) {
+                continue;
+            }
+            let target_path = format!("{target}.md");
+            if !known_paths.contains(target_path.as_str()) {
+                continue;
+            }
+            let has_reverse = reverse.get(target).is_some_and(|s| s.contains(id));
+            if !has_reverse {
+                report.issues.push(ValidationIssue {
+                    severity: Severity::Warning,
+                    file: target_path,
+                    message: format!(
+                        "`{id}` lists `relationships.{forward_key}: {target}`, but `{target}` doesn't list `relationships.{reverse_key}: {id}` back"
+                    ),
+                });
+            }
+        }
+    }
+}
+
 fn extract_local_links(content: &str) -> Vec<String> {
     // A minimal markdown-link scanner (avoids pulling in a regex/markdown
     // dependency for one pattern): finds `](...)` and keeps the ones that
@@ -1093,6 +1201,95 @@ mod tests {
             .issues
             .iter()
             .any(|i| { i.severity == Severity::Warning && i.message.contains("redundant link") }));
+    }
+
+    #[test]
+    fn accepts_symmetric_calls_and_called_by() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [a](functions/a.md)\n- [b](functions/b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - functions/b\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\nrelationships:\n  called_by:\n    - functions/a\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "unexpected errors: {:?}",
+            report.issues
+        );
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("doesn't list")),
+            "a symmetric Calls/CalledBy pair should not be flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn flags_a_calls_edge_with_no_reciprocal_called_by() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [a](functions/a.md)\n- [b](functions/b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - functions/b\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "asymmetry is a warning, not an error: {:?}",
+            report.issues
+        );
+        assert!(report.issues.iter().any(|i| {
+            i.severity == Severity::Warning
+                && i.file == "functions/b.md"
+                && i.message.contains("relationships.calls: functions/b")
+                && i.message.contains("relationships.called_by: functions/a")
+        }));
+    }
+
+    #[test]
+    fn asymmetric_external_call_is_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [a](functions/a.md)\n");
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - external/std-mem-swap\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("doesn't list")),
+            "an external call target has no reciprocal side to check: {:?}",
+            report.issues
+        );
     }
 
     #[test]

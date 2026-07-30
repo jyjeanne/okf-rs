@@ -8,7 +8,7 @@
 //! `okf-mcp` wraps either into an MCP tool response.
 
 use anyhow::{anyhow, Result};
-use okf_parser::Concept;
+use okf_parser::{Concept, ConceptKind, RelationKind};
 use std::path::Path;
 
 /// Errors if `bundle` doesn't exist yet, with a pointer to `okf-rs
@@ -133,6 +133,67 @@ pub fn graph_isolated(bundle: &Path) -> Result<String> {
     Ok(concept_lines(&isolated))
 }
 
+/// Bundle-wide content-completeness metrics: how much of the knowledge
+/// base is actually filled in, as distinct from `okf-rs validate`'s
+/// pass/fail structural checks. Computed entirely from the bundle
+/// already on disk (via [`load_concepts`]/[`okf_graph::Graph`]) — no
+/// re-scan of the source project, so there's no second source of truth
+/// to keep in sync.
+///
+/// The call-graph-participation metric excludes `Module`/`Package`
+/// concepts from its denominator, matching `Graph::isolated_concepts`'s
+/// own exclusion: they're structural containers that are never expected
+/// to carry a `Calls`/`CalledBy` edge, so counting them would understate
+/// coverage for reasons that have nothing to do with documentation or
+/// analysis quality.
+pub fn coverage(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    if concepts.is_empty() {
+        return Ok("Bundle has no concepts".to_string());
+    }
+    let total = concepts.len();
+    let with_description = concepts
+        .iter()
+        .filter(|c| {
+            c.description
+                .as_deref()
+                .is_some_and(|d| !d.trim().is_empty())
+        })
+        .count();
+    let with_tags = concepts.iter().filter(|c| !c.tags.is_empty()).count();
+
+    let graph = okf_graph::Graph::build(&concepts);
+    let isolated: std::collections::HashSet<&str> = graph
+        .isolated_concepts()
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    let graph_eligible = concepts
+        .iter()
+        .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package))
+        .count();
+    let graph_connected = concepts
+        .iter()
+        .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package))
+        .filter(|c| !isolated.contains(c.id.as_str()))
+        .count();
+
+    Ok(format!(
+        "{total} concepts\n  {}% ({with_description}/{total}) have a description\n  {}% ({with_tags}/{total}) have at least one tag\n  {}% ({graph_connected}/{graph_eligible}) participate in the call graph (excludes Module/Package; see `graph isolated` for the rest)",
+        percent(with_description, total),
+        percent(with_tags, total),
+        percent(graph_connected, graph_eligible),
+    ))
+}
+
+fn percent(part: usize, total: usize) -> usize {
+    if total == 0 {
+        0
+    } else {
+        part * 100 / total
+    }
+}
+
 /// Cross-module call dependency edges: which modules call into which.
 pub fn graph_modules(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
@@ -146,6 +207,64 @@ pub fn graph_modules(bundle: &Path) -> Result<String> {
         .map(|(from, to)| format!("{from} -> {to}"))
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// Bundle-wide graph topology metrics: concept-kind breakdown, edge
+/// counts per relationship kind, and connected components of the
+/// `Calls`/`CalledBy` graph. Edges are counted per kind rather than as a
+/// single total, to sidestep the ambiguous question of whether a
+/// resolved `Calls`/`CalledBy` pair is one edge or two.
+///
+/// Deliberately doesn't report a "depth" metric: the call graph isn't
+/// guaranteed acyclic (see `graph_cycles`), so there's no single
+/// well-defined notion of depth to report without first committing to a
+/// much narrower definition than the word implies.
+pub fn graph_stats(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let graph = okf_graph::Graph::build(&concepts);
+
+    let mut by_kind: std::collections::BTreeMap<ConceptKind, usize> = Default::default();
+    for c in &concepts {
+        *by_kind.entry(c.kind).or_default() += 1;
+    }
+
+    let mut by_relation: std::collections::BTreeMap<RelationKind, usize> = Default::default();
+    for c in &concepts {
+        for rel in &c.relationships {
+            *by_relation.entry(rel.kind).or_default() += 1;
+        }
+    }
+
+    let components = graph.connected_components();
+    let isolated_count = graph.isolated_concepts().len();
+
+    let mut out = format!("{} concepts\n\nBy kind:\n", concepts.len());
+    for (kind, count) in &by_kind {
+        out.push_str(&format!("  {:<12} {count}\n", kind.as_str()));
+    }
+
+    out.push_str("\nRelationship edges by kind:\n");
+    if by_relation.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for (kind, count) in &by_relation {
+            out.push_str(&format!("  {:<12} {count}\n", kind.label()));
+        }
+    }
+
+    out.push_str(&format!(
+        "\nCall graph: {} connected component(s) of 2+ concepts, {isolated_count} isolated concept(s) (see `graph isolated`)\n",
+        components.len()
+    ));
+    for component in &components {
+        out.push_str(&format!(
+            "  [{}] {}\n",
+            component.len(),
+            component.join(", ")
+        ));
+    }
+
+    Ok(out.trim_end().to_string())
 }
 
 /// The shortest call path between two concept ids.
@@ -246,6 +365,58 @@ mod tests {
         let text = graph_api(dir.path()).unwrap();
         assert!(text.contains("2 public concepts:"));
         assert!(text.contains("functions/auth/verify_token"));
+    }
+
+    #[test]
+    fn coverage_reports_zero_description_and_tag_coverage_but_full_graph_participation() {
+        let dir = sample_bundle();
+        let text = coverage(dir.path()).unwrap();
+        assert!(text.starts_with("2 concepts"));
+        assert!(text.contains("0% (0/2) have a description"));
+        assert!(text.contains("0% (0/2) have at least one tag"));
+        assert!(text.contains("100% (2/2) participate in the call graph"));
+    }
+
+    #[test]
+    fn coverage_counts_descriptions_tags_and_isolated_concepts() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/unused.md",
+            "---\ntype: Rust Function\ntitle: unused\ndescription: Dead code, never called.\ntags: [dead-code]\nresource: src/auth.rs#L20\n---\n\nbody\n",
+        );
+
+        let text = coverage(dir.path()).unwrap();
+        assert!(text.starts_with("3 concepts"));
+        assert!(text.contains("33% (1/3) have a description"));
+        assert!(text.contains("33% (1/3) have at least one tag"));
+        assert!(text.contains("66% (2/3) participate in the call graph"));
+    }
+
+    #[test]
+    fn graph_stats_reports_kind_and_relation_counts_and_the_one_component() {
+        let dir = sample_bundle();
+        let text = graph_stats(dir.path()).unwrap();
+        assert!(text.starts_with("2 concepts"));
+        assert!(text.contains("Function     2"));
+        assert!(text.contains("Calls        1"));
+        assert!(text.contains("Called by    1"));
+        assert!(text.contains("1 connected component(s) of 2+ concepts, 0 isolated concept(s)"));
+        assert!(text.contains("functions/auth/decode_jwt, functions/auth/verify_token"));
+    }
+
+    #[test]
+    fn graph_stats_counts_an_isolated_concept_separately_from_components() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/unused.md",
+            "---\ntype: Rust Function\ntitle: unused\nresource: src/auth.rs#L20\n---\n\nbody\n",
+        );
+
+        let text = graph_stats(dir.path()).unwrap();
+        assert!(text.starts_with("3 concepts"));
+        assert!(text.contains("1 connected component(s) of 2+ concepts, 1 isolated concept(s)"));
     }
 
     #[test]
