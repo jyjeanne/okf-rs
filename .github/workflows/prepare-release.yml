@@ -14,21 +14,27 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: prepare-release
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Validate version
         run: |
-          version="${{ inputs.version }}"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::'$version' is not a valid semver version (expected e.g. 1.2.3)"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$VERSION' is not a valid semver version (expected e.g. 1.2.3)"
             exit 1
           fi
-          if git rev-parse "v$version" >/dev/null 2>&1; then
-            echo "::error::Tag v$version already exists"
+          # Check the remote directly rather than the local clone, which
+          # actions/checkout fetches without tags by default.
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag v$VERSION already exists"
             exit 1
           fi
 
@@ -39,7 +45,11 @@ jobs:
 
       - name: Bump workspace version
         run: |
-          sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\"/version = \"${{ inputs.version }}\"/" Cargo.toml
+          sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\"/version = \"$VERSION\"/" Cargo.toml
+          if ! grep -qF "version = \"$VERSION\"" Cargo.toml; then
+            echo "::error::Failed to bump version in Cargo.toml (pattern did not match)"
+            exit 1
+          fi
 
       - name: Update Cargo.lock
         run: cargo check --workspace
@@ -49,7 +59,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git commit -m "chore: release v${{ inputs.version }}"
-          git tag "v${{ inputs.version }}"
+          git commit -m "chore: release v$VERSION"
+          git tag "v$VERSION"
           git push origin HEAD:${{ github.ref_name }}
-          git push origin "v${{ inputs.version }}"
+          git push origin "v$VERSION"
