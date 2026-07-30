@@ -9,6 +9,15 @@
 //! non-destructive: the okf-rs section is delimited by marker comments,
 //! and only the content between those markers is ever touched. A file
 //! with no markers gets the section appended, not overwritten.
+//!
+//! `AGENTS.md` is the source of truth for the okf-rs section; `CLAUDE.md`
+//! gets a one-line `@AGENTS.md` import instead of a duplicate copy. This
+//! matches Claude Code's own documented multi-tool convention, and avoids
+//! a real compatibility trap: OpenCode (and other AGENTS.md-first agents)
+//! use *only* AGENTS.md when both files are present, so a duplicated
+//! CLAUDE.md would silently go unread by them the moment an AGENTS.md
+//! exists — including any project-specific content a user wrote into
+//! CLAUDE.md outside the okf-rs markers.
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -36,6 +45,13 @@ Regenerate the bundle after code changes with `okf-rs generate`.
     )
 }
 
+/// The section written to `CLAUDE.md`: an `@AGENTS.md` import rather than
+/// a duplicate of `render_section`'s content, so `AGENTS.md` stays the
+/// single source of truth.
+fn render_import_section() -> String {
+    format!("{BEGIN_MARKER}\n@AGENTS.md\n{END_MARKER}\n")
+}
+
 /// Replaces the marked section in `existing` with `section`, or appends
 /// `section` if no markers are present, or returns `section` as-is if
 /// there's no existing content.
@@ -46,7 +62,11 @@ fn merge(existing: Option<String>, section: &str) -> String {
     match (content.find(BEGIN_MARKER), content.find(END_MARKER)) {
         (Some(start), Some(end)) if end > start => {
             let end = end + END_MARKER.len();
-            format!("{}{}{}", &content[..start], section, &content[end..])
+            // `section` already supplies its own trailing newline, so
+            // drop the one immediately following the old end marker to
+            // avoid growing a blank line on every re-run.
+            let remainder = content[end..].strip_prefix('\n').unwrap_or(&content[end..]);
+            format!("{}{}{}", &content[..start], section, remainder)
         }
         _ => {
             let mut merged = content;
@@ -68,15 +88,21 @@ fn merge(existing: Option<String>, section: &str) -> String {
 /// `okf.toml`, e.g. `knowledge`). Returns the paths written.
 pub fn write_agent_entrypoints(project_root: &Path, bundle_output: &str) -> Result<Vec<PathBuf>> {
     let section = render_section(bundle_output);
+    let import_section = render_import_section();
     let mut written = Vec::new();
     for relative in TARGETS {
+        let section = if relative == "CLAUDE.md" {
+            &import_section
+        } else {
+            &section
+        };
         let target = project_root.join(relative);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let existing = fs::read_to_string(&target).ok();
-        let merged = merge(existing, &section);
+        let merged = merge(existing, section);
         fs::write(&target, merged)
             .with_context(|| format!("failed to write {}", target.display()))?;
         written.push(target);
@@ -94,11 +120,21 @@ mod tests {
         let written = write_agent_entrypoints(dir.path(), "knowledge").unwrap();
         assert_eq!(written.len(), 3);
 
+        // CLAUDE.md imports AGENTS.md rather than duplicating its
+        // content, so it stays readable by tools (e.g. OpenCode) that
+        // ignore CLAUDE.md outright whenever an AGENTS.md is present.
         let claude = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
         assert!(claude.contains(BEGIN_MARKER));
-        assert!(claude.contains("knowledge/index.md"));
+        assert!(claude.contains("@AGENTS.md"));
+        assert!(!claude.contains("knowledge/index.md"));
 
-        assert!(dir.path().join(".github/copilot-instructions.md").exists());
+        let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(agents.contains(BEGIN_MARKER));
+        assert!(agents.contains("knowledge/index.md"));
+
+        let copilot =
+            fs::read_to_string(dir.path().join(".github/copilot-instructions.md")).unwrap();
+        assert!(copilot.contains("knowledge/index.md"));
     }
 
     #[test]
@@ -114,15 +150,43 @@ mod tests {
         let first = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
         assert!(first.contains("Some existing instructions the user wrote."));
         assert!(first.contains(BEGIN_MARKER));
+        assert!(first.contains("@AGENTS.md"));
 
-        // Running it again with a different bundle path updates only the
-        // marked section, not the user's own content, and doesn't
+        // Running it again with a different bundle path updates AGENTS.md's
+        // marked section (CLAUDE.md's import line is stable either way),
+        // preserves the user's own CLAUDE.md content, and doesn't
         // duplicate the section.
         write_agent_entrypoints(dir.path(), "docs/kb").unwrap();
         let second = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
         assert!(second.contains("Some existing instructions the user wrote."));
-        assert!(second.contains("docs/kb/index.md"));
-        assert!(!second.contains("knowledge/index.md"));
         assert_eq!(second.matches(BEGIN_MARKER).count(), 1);
+
+        let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(agents.contains("docs/kb/index.md"));
+        assert!(!agents.contains("knowledge/index.md"));
+    }
+
+    #[test]
+    fn repeat_runs_do_not_grow_a_trailing_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent_entrypoints(dir.path(), "knowledge").unwrap();
+        let once = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+
+        for _ in 0..3 {
+            write_agent_entrypoints(dir.path(), "knowledge").unwrap();
+        }
+        let repeated = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert_eq!(once, repeated);
+    }
+
+    #[test]
+    fn claude_md_import_does_not_duplicate_on_repeat_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent_entrypoints(dir.path(), "knowledge").unwrap();
+        write_agent_entrypoints(dir.path(), "knowledge").unwrap();
+
+        let claude = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(claude.matches("@AGENTS.md").count(), 1);
+        assert_eq!(claude.matches(BEGIN_MARKER).count(), 1);
     }
 }

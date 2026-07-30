@@ -44,7 +44,7 @@ See [`docs/specification.md`](docs/specification.md) for the full project specif
 - **Graph queries** — callers/callees, call-graph cycle detection, cross-module dependencies, and shortest call path
 - **Bundle diffing** — compare a project's concepts between two git refs without touching your working tree
 - **Documentation generation** — `okf-rs docs` renders a bundle into a browsable static HTML site or a single consolidated Markdown document, templated directly from the concept data — no LLM required
-- **AI agent integration** — `okf-rs init` writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md`, idempotently; `okf-mcp` exposes search and graph queries as an MCP server for tools like Claude Code
+- **AI agent integration** — `okf-rs init` writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md`, idempotently; `AGENTS.md` holds the generated content and `CLAUDE.md` just imports it (`@AGENTS.md`), so tools that prefer `AGENTS.md` over `CLAUDE.md` (e.g. opencode) never end up reading stale or missing content; `okf-mcp` exposes search and graph queries as an MCP server for tools like Claude Code and opencode
 - **Standalone binary** — no runtime dependency beyond the OS's standard C library; see [Packaging & Distribution](docs/specification.md#packaging--distribution)
 
 See [`ROADMAP.md`](ROADMAP.md) for what's shipped (Phase 1 complete, Phase 2 in progress) and what's next.
@@ -219,7 +219,22 @@ Run `okf-rs <command> --help` for each command's options. `okf-rs generate` pers
 Register it with Claude Code:
 
 ```sh
-claude mcp add okf-rs -- /path/to/okf-mcp /path/to/project
+claude mcp add okf-rs -s project -- /path/to/okf-mcp /path/to/project
+```
+
+`-s project` writes the registration to `.mcp.json` at the repo root so it's shared via git with every contributor's Claude Code instance, instead of only the local user's.
+
+Register it with opencode by adding it to `opencode.json`:
+
+```json
+{
+  "mcp": {
+    "okf-rs": {
+      "type": "local",
+      "command": ["/path/to/okf-mcp", "/path/to/project"]
+    }
+  }
+}
 ```
 
 or point any other MCP client's stdio transport at the same binary and argument.
