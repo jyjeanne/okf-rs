@@ -36,10 +36,10 @@ See [`docs/specification.md`](docs/specification.md) for the full project specif
 - **Semantic extraction** for **Rust, Python, TypeScript, JavaScript, Go, Java, C#, PHP, Kotlin, C/C++, and Swift** — packages, modules, types (structs/classes/enums/interfaces/traits), functions, and methods, including public/private API-surface detection tailored to each language's actual visibility rules (explicit-opt-in for Rust/Java/C#/Swift, opt-out-by-default for PHP/Kotlin, section-based for C++, capitalization for Go)
 - **Relationship extraction** — imports, and a resolved call graph covering bare calls, member/`self`/`this` calls, static/scoped calls, and qualified module calls across all eleven languages
 - **LSP-backed disambiguation** (optional) — `okf-rs generate --lsp` resolves calls whose name is ambiguous project-wide by asking the project's real language server (`textDocument/definition`), on top of Tree-sitter's own unambiguous-name-only resolution; verified end to end against real `rust-analyzer`/`pyright` servers, with a timeout on unresponsive servers, Windows-aware executable lookup, and percent-encoded `file://` URIs so paths with spaces or non-ASCII characters resolve correctly
-- **OKF bundle generation** — markdown + YAML frontmatter, cross-linked, with `index.md` navigation at every level
+- **OKF bundle generation** — markdown + YAML frontmatter, cross-linked, with `index.md` navigation at every level; targets [OKF v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md), declaring `okf_version: "0.2"` in the bundle root and filling in each concept's `generated.by` trust field
 - **Incremental indexing** — `okf-rs generate` caches each file's extraction by content hash, so a re-run only re-parses what actually changed
 - **Watch mode** — `okf-rs watch` keeps a project's bundle up to date as files change, reusing the same incremental cache
-- **Validation** — frontmatter/schema checks, dangling-link detection, orphan detection, and duplicate-identity checks (both path collisions and same-symbol-different-file)
+- **Validation** — frontmatter/schema checks (including the v0.2 `generated`/`verified`/`sources`/`status`/`stale_after` trust families and the root `okf_version` declaration), dangling-link detection, orphan detection, and duplicate-identity checks (both path collisions and same-symbol-different-file)
 - **Search** — ranked free-text search by symbol, package, module, type, and tag
 - **Graph queries** — callers/callees, call-graph cycle detection, cross-module dependencies, and shortest call path
 - **Bundle diffing** — compare a project's concepts between two git refs without touching your working tree
@@ -105,6 +105,8 @@ A generated concept file — `knowledge/functions/src/Auth/verify_token.md` from
 type: Rust Method
 title: verify_token
 resource: src/main.rs#L4-L6
+generated:
+  by: okf-rs/0.1.0
 ---
 
 # Signature
