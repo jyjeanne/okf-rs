@@ -55,7 +55,13 @@ jobs:
         env:
           FAIL_ON_RISK: ${{ vars.OKF_FAIL_ON_RISK }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.sha }}
+          # Not `github.sha`: for `pull_request` events that resolves to
+          # GitHub's ephemeral test-merge commit (`refs/pull/<n>/merge`,
+          # the PR branch merged onto whatever the base tip is *at
+          # workflow-run time*), not the PR's actual last commit -- using
+          # it here would review a moving target instead of what the PR
+          # author actually pushed.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if [ -n "$FAIL_ON_RISK" ]; then
             ./target/release/okf-rs review "$BASE_SHA" "$HEAD_SHA" . --fail-on-risk "$FAIL_ON_RISK" > review.md
