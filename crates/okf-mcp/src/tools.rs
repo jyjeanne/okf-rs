@@ -194,7 +194,12 @@ mod tests {
     #[test]
     fn search_ranked_finds_a_concept_by_title() {
         let dir = sample_bundle();
-        let text = call("search_ranked", &json!({ "query": "decode_jwt" }), dir.path()).unwrap();
+        let text = call(
+            "search_ranked",
+            &json!({ "query": "decode_jwt" }),
+            dir.path(),
+        )
+        .unwrap();
         assert!(text.contains("functions/auth/decode_jwt"));
     }
 

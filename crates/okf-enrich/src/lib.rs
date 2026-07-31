@@ -333,7 +333,8 @@ pub fn enrich_missing_descriptions(
                 stats.generated += 1;
             }
             Err(e) if first_error.is_none() => {
-                first_error = Some(e.context(format!("failed to enrich `{}`", concepts[*index].id)));
+                first_error =
+                    Some(e.context(format!("failed to enrich `{}`", concepts[*index].id)));
             }
             Err(_) => {}
         }
@@ -398,9 +399,8 @@ pub mod test_support {
                 let mut body = vec![0u8; content_length];
                 std::io::Read::read_exact(&mut reader, &mut body).unwrap();
 
-                let payload = format!(
-                    r#"{{"choices":[{{"message":{{"content":"{reply_content}"}}}}]}}"#
-                );
+                let payload =
+                    format!(r#"{{"choices":[{{"message":{{"content":"{reply_content}"}}}}]}}"#);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     payload.len(),
@@ -480,7 +480,13 @@ mod tests {
         let mut concepts = vec![function_concept("functions/f")];
 
         let stats = enrich_missing_descriptions(&client, &mut concepts, &[]).unwrap();
-        assert_eq!(stats, EnrichStats { generated: 1, reused: 0 });
+        assert_eq!(
+            stats,
+            EnrichStats {
+                generated: 1,
+                reused: 0
+            }
+        );
         assert_eq!(concepts[0].description.as_deref(), Some("verifies a token"));
     }
 
@@ -493,7 +499,13 @@ mod tests {
         let mut concepts = vec![concept];
 
         let stats = enrich_missing_descriptions(&client, &mut concepts, &[]).unwrap();
-        assert_eq!(stats, EnrichStats { generated: 0, reused: 0 });
+        assert_eq!(
+            stats,
+            EnrichStats {
+                generated: 0,
+                reused: 0
+            }
+        );
         assert_eq!(
             concepts[0].description.as_deref(),
             Some("hand-written description")
@@ -509,9 +521,14 @@ mod tests {
         let mut previous = function_concept("functions/f");
         previous.description = Some("from a prior --enrich run".to_string());
 
-        let stats =
-            enrich_missing_descriptions(&client, &mut concepts, &[previous]).unwrap();
-        assert_eq!(stats, EnrichStats { generated: 0, reused: 1 });
+        let stats = enrich_missing_descriptions(&client, &mut concepts, &[previous]).unwrap();
+        assert_eq!(
+            stats,
+            EnrichStats {
+                generated: 0,
+                reused: 1
+            }
+        );
         assert_eq!(
             concepts[0].description.as_deref(),
             Some("from a prior --enrich run")
@@ -528,7 +545,13 @@ mod tests {
         let mut concepts = vec![concept];
 
         let stats = enrich_missing_descriptions(&client, &mut concepts, &[]).unwrap();
-        assert_eq!(stats, EnrichStats { generated: 0, reused: 0 });
+        assert_eq!(
+            stats,
+            EnrichStats {
+                generated: 0,
+                reused: 0
+            }
+        );
         assert_eq!(concepts[0].description, None);
         assert_eq!(server.request_count.load(Ordering::SeqCst), 0);
     }
@@ -544,13 +567,15 @@ mod tests {
             function_concept("functions/new"),
         ];
 
-        let stats =
-            enrich_missing_descriptions(&client, &mut concepts, &[previous]).unwrap();
-        assert_eq!(stats, EnrichStats { generated: 1, reused: 1 });
+        let stats = enrich_missing_descriptions(&client, &mut concepts, &[previous]).unwrap();
         assert_eq!(
-            concepts[0].description.as_deref(),
-            Some("carried forward")
+            stats,
+            EnrichStats {
+                generated: 1,
+                reused: 1
+            }
         );
+        assert_eq!(concepts[0].description.as_deref(), Some("carried forward"));
         assert_eq!(
             concepts[1].description.as_deref(),
             Some("freshly generated")

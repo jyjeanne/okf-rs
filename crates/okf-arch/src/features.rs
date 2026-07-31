@@ -177,7 +177,11 @@ mod tests {
     fn method(owner_path: &str, name: &str, is_public: bool) -> Concept {
         Concept {
             name: name.to_string(),
-            ..type_concept(&format!("{owner_path}/{name}"), ConceptKind::Method, is_public)
+            ..type_concept(
+                &format!("{owner_path}/{name}"),
+                ConceptKind::Method,
+                is_public,
+            )
         }
     }
 

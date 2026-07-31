@@ -312,7 +312,10 @@ pub fn coverage_report(bundle: &Path) -> Result<CoverageReport> {
     let graph_participation = if eligible == 0 {
         None
     } else {
-        Some(GraphParticipation { connected, eligible })
+        Some(GraphParticipation {
+            connected,
+            eligible,
+        })
     };
 
     Ok(CoverageReport {
@@ -517,8 +520,9 @@ pub fn graph_features(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
     let found = okf_arch::detect_features(&concepts);
     if found.is_empty() {
-        return Ok("No REST endpoints, database models, or event-flow participants detected"
-            .to_string());
+        return Ok(
+            "No REST endpoints, database models, or event-flow participants detected".to_string(),
+        );
     }
     Ok(found
         .iter()

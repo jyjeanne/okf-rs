@@ -183,8 +183,14 @@ pub fn domains(graph: &Graph<'_>) -> Vec<Domain> {
         adjacency.entry(pkg).or_default();
     }
     for (from, to) in &edges {
-        adjacency.entry(from.as_str()).or_default().insert(to.as_str());
-        adjacency.entry(to.as_str()).or_default().insert(from.as_str());
+        adjacency
+            .entry(from.as_str())
+            .or_default()
+            .insert(to.as_str());
+        adjacency
+            .entry(to.as_str())
+            .or_default()
+            .insert(from.as_str());
     }
 
     let mut visited: HashSet<&str> = HashSet::new();
@@ -273,7 +279,11 @@ mod tests {
 
         let mut caller = concept("functions/app_fn", ConceptKind::Function, "app/src/lib.rs");
         calls(&mut caller, "functions/core_fn");
-        let callee = concept("functions/core_fn", ConceptKind::Function, "core/src/lib.rs");
+        let callee = concept(
+            "functions/core_fn",
+            ConceptKind::Function,
+            "core/src/lib.rs",
+        );
 
         vec![core_pkg, app_pkg, core_mod, app_mod, caller, callee]
     }

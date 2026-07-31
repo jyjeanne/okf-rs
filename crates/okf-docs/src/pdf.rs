@@ -285,7 +285,10 @@ mod tests {
         for line in &lines {
             assert!(line.chars().count() <= 12, "line too long: {line:?}");
         }
-        assert_eq!(lines.join(" "), "the quick brown fox jumps over the lazy dog");
+        assert_eq!(
+            lines.join(" "),
+            "the quick brown fox jumps over the lazy dog"
+        );
     }
 
     #[test]

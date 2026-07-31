@@ -602,7 +602,12 @@ mod tests {
         // A Document (e.g. an okf-dita-imported DITA topic) is
         // structural the same way Module/Package are: never expected to
         // carry a Calls/CalledBy edge, and not API surface.
-        let doc = concept("documents/readme", ConceptKind::Document, "readme.dita", true);
+        let doc = concept(
+            "documents/readme",
+            ConceptKind::Document,
+            "readme.dita",
+            true,
+        );
         let concepts = vec![doc];
         let graph = Graph::build(&concepts);
 

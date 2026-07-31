@@ -610,7 +610,8 @@ fn start_mock_enrich_server(reply_content: &'static str) -> (String, Arc<AtomicU
             let mut body = vec![0u8; content_length];
             let _ = reader.read_exact(&mut body);
 
-            let payload = format!(r#"{{"choices":[{{"message":{{"content":"{reply_content}"}}}}]}}"#);
+            let payload =
+                format!(r#"{{"choices":[{{"message":{{"content":"{reply_content}"}}}}]}}"#);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 payload.len(),

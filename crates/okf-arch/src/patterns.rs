@@ -107,8 +107,13 @@ fn builder_for(c: &Concept, methods: Option<&Vec<&Concept>>) -> Option<DetectedP
     })
 }
 
-const SINGLETON_METHOD_NAMES: &[&str] =
-    &["instance", "get_instance", "getinstance", "shared", "singleton"];
+const SINGLETON_METHOD_NAMES: &[&str] = &[
+    "instance",
+    "get_instance",
+    "getinstance",
+    "shared",
+    "singleton",
+];
 
 /// Whether `c` is a type with an `instance`/`get_instance`/`shared`/
 /// `singleton`-named method on it, e.g. `Logger::get_instance`. Assumes

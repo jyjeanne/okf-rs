@@ -6,4 +6,20 @@
 # here (with a comment linking to the tracking issue or upstream fix) when a
 # vulnerable dependency can't be upgraded away from immediately, so CI on
 # unrelated PRs isn't blocked while a fix is worked out.
-ignore = []
+ignore = [
+    # lopdf 0.31 (pulled in transitively by printpdf 0.7, used for
+    # okf-docs's PDF export): stack overflow in lopdf's *parser* when
+    # reading deeply nested PDF objects. https://rustsec.org/advisories/RUSTSEC-2026-0187
+    #
+    # Not exploitable via okf-rs's actual usage: this codebase only ever
+    # calls printpdf's write path (building a PDF from scratch out of its
+    # own in-memory model) to export a bundle -- it never parses an
+    # existing/untrusted PDF with lopdf or printpdf. The fix (lopdf
+    # >=0.42) requires printpdf >=0.11, whose default features pull in
+    # azul-layout's CSS layout engine (the exact dependency-bloat printpdf
+    # was deliberately pinned to 0.7 to avoid -- see okf-docs/Cargo.toml);
+    # upgrading needs feature-flag surgery plus an API migration (printpdf
+    # 0.8+ reshaped the writer API), tracked as follow-up work rather than
+    # done here.
+    "RUSTSEC-2026-0187",
+]

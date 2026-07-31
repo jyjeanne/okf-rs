@@ -180,10 +180,7 @@ mod tests {
         export_dita(&concepts, dir.path()).unwrap();
 
         assert!(dir.path().join("root.ditamap").exists());
-        assert!(dir
-            .path()
-            .join("functions/auth/verify_token.dita")
-            .exists());
+        assert!(dir.path().join("functions/auth/verify_token.dita").exists());
 
         let content =
             fs::read_to_string(dir.path().join("functions/auth/verify_token.dita")).unwrap();

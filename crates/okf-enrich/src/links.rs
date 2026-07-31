@@ -146,19 +146,21 @@ pub fn suggest_missing_links(
                 continue;
             }
 
-            jobs.push((concept, candidate, prompt_for(concept, description, candidate)));
+            jobs.push((
+                concept,
+                candidate,
+                prompt_for(concept, description, candidate),
+            ));
         }
     }
 
     let outcomes = crate::run_bounded(&jobs, |(concept, candidate, prompt)| {
-        client
-            .complete(SYSTEM_PROMPT, prompt)
-            .with_context(|| {
-                format!(
-                    "failed to judge a candidate link between `{}` and `{}`",
-                    concept.id, candidate.id
-                )
-            })
+        client.complete(SYSTEM_PROMPT, prompt).with_context(|| {
+            format!(
+                "failed to judge a candidate link between `{}` and `{}`",
+                concept.id, candidate.id
+            )
+        })
     });
 
     let mut suggestions = Vec::new();

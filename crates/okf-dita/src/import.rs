@@ -95,8 +95,8 @@ pub fn import_dita(input_path: &Path) -> Result<(Vec<Concept>, Vec<String>)> {
 fn import_file(path: &Path, relative: &str) -> Result<Concept> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let doc = Document::parse_with_options(&content, parsing_options())
-        .context("not well-formed XML")?;
+    let doc =
+        Document::parse_with_options(&content, parsing_options()).context("not well-formed XML")?;
     let root = doc.root_element();
 
     let title = find_child_text(root, "title")
