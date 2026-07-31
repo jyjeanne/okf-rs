@@ -28,7 +28,7 @@ Most codebase-analysis tools produce a proprietary graph database, an AI-specifi
 - **Deterministic** — identical source always produces byte-identical output; no wall-clock timestamps, no unordered maps leaking into results.
 - **AI-ready** — structured knowledge that doesn't require an LLM to produce, though one can optionally enrich it later.
 
-See [`docs/specification.md`](docs/specification.md) for the full project specification, including how `okf-rs` compares to other tools in this space, and [`ROADMAP.md`](ROADMAP.md) for what's shipped and what's next.
+See [`docs/specification.md`](docs/specification.md) for the full project specification, including how `okf-rs` compares to other tools in this space, [`docs/improvement-plan.md`](docs/improvement-plan.md) for a gap analysis against CodeGraph and code-review-graph plus a prioritized improvement plan, and [`ROADMAP.md`](ROADMAP.md) for what's shipped and what's next.
 
 ## Features
 

@@ -176,6 +176,8 @@ Both items below build directly on Phase 3's stable `okf-graph`/`okf-query` libr
 - [ ] Visualization: interactive graph explorer over `okf-server`
 - [ ] Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
 
+See [`docs/improvement-plan.md`](docs/improvement-plan.md) for a gap analysis against two other codebase-knowledge-graph tools (CodeGraph, code-review-graph) and a reprioritization of several Phase 4 items — change-impact analysis, a composite MCP tool, parallel extraction, and real community detection — in light of what they've already shipped.
+
 ---
 
 See [`docs/specification.md`](docs/specification.md) for the full project specification, including the OKF bundle format, architecture, and design principles this roadmap implements against.
