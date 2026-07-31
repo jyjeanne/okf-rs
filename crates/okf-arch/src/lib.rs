@@ -1,9 +1,9 @@
-//! Architecture extraction: architectural layers, domain boundaries, and
-//! design-pattern detection, derived entirely from the package
-//! dependency graph (`okf-graph`) and each concept's own id/kind —
-//! deterministic and offline, no AI dependency (see `okf-enrich` for the
-//! separate, optional AI-enrichment pass this deliberately doesn't
-//! need).
+//! Architecture extraction: architectural layers, domain boundaries,
+//! design-pattern detection, and REST-endpoint/database-model/event-flow
+//! detection — derived entirely from the package dependency graph
+//! (`okf-graph`) and each concept's own id/kind/name, deterministic and
+//! offline, no AI dependency (see `okf-enrich` for the separate,
+//! optional AI-enrichment pass this deliberately doesn't need).
 //!
 //! Every analysis here is a structural or naming heuristic over data
 //! `okf-analyzer`/`okf-graph` already produce, not a semantic
@@ -15,8 +15,11 @@
 
 #![deny(missing_docs)]
 
+mod features;
+mod ownership;
 mod patterns;
 
+pub use features::{detect_features, DetectedFeature, FeatureKind};
 pub use patterns::{detect_patterns, DetectedPattern, PatternKind};
 
 use okf_graph::Graph;

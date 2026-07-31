@@ -111,6 +111,11 @@ pub fn list() -> Vec<Value> {
             "description": "List design patterns (Builder, Singleton, Factory, Visitor) detected via structural/naming heuristics — a structural signal to review, not a semantic guarantee the pattern is really implemented as intended.",
             "inputSchema": { "type": "object", "properties": {} },
         }),
+        json!({
+            "name": "graph_features",
+            "description": "List REST endpoints, database models, and event-flow participants detected via structural/naming heuristics (e.g. a public method on a *Controller-named type, a *Model/*Entity-named type, an emit_*/on_*-named function) — a naming-convention signal, not decorator/annotation-aware detection.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
     ]
 }
 
@@ -139,6 +144,7 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
         "graph_layers" => okf_query::graph_layers(bundle),
         "graph_domains" => okf_query::graph_domains(bundle),
         "graph_patterns" => okf_query::graph_patterns(bundle),
+        "graph_features" => okf_query::graph_features(bundle),
         other => Err(anyhow!("unknown tool `{other}`")),
     }
 }
@@ -193,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_layers_domains_and_patterns_run_without_error() {
+    fn graph_layers_domains_patterns_and_features_run_without_error() {
         let dir = sample_bundle();
         // No Package concepts in this fixture -- both should report the
         // clear "none found" text, not error.
@@ -203,6 +209,11 @@ mod tests {
         assert!(domains.contains("No packages found"));
         let patterns = call("graph_patterns", &json!({}), dir.path()).unwrap();
         assert_eq!(patterns, "No design patterns detected");
+        let features = call("graph_features", &json!({}), dir.path()).unwrap();
+        assert_eq!(
+            features,
+            "No REST endpoints, database models, or event-flow participants detected"
+        );
     }
 
     #[test]

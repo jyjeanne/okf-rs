@@ -6,14 +6,10 @@
 //! exactly what it checks.
 //!
 //! Every detector here correlates a method to its owning type via
-//! [`owner_path`] rather than [`Concept::qualified_name`], since that
-//! field's separator isn't stable across a fresh analysis (`.`, what
-//! every language extractor emits) and a bundle read back off disk
-//! (`::`, `okf_parser::read_bundle`'s best-effort reconstruction, since
-//! frontmatter doesn't store `qualified_name` itself) — [`Concept::id`],
-//! built once by [`Concept::make_id`], always uses `/` regardless of
-//! which path a caller's concepts came from.
+//! [`crate::ownership::owner_path`] rather than
+//! [`Concept::qualified_name`] — see that module's own docs for why.
 
+use crate::ownership::{group_methods_by_owner, is_type_kind, owner_path, path_after_kind_dir};
 use okf_parser::{Concept, ConceptKind};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -56,46 +52,6 @@ pub struct DetectedPattern {
     pub concept_id: String,
     /// A one-line, human-readable justification for the match.
     pub evidence: String,
-}
-
-/// The id path after its kind-directory prefix (e.g. `structs/`,
-/// `functions/`) — the qualified path [`Concept::make_id`] encodes,
-/// stripped of the kind-specific directory so a type and its own methods
-/// (which live under a *different* kind directory: `structs/` vs
-/// `functions/`) can be correlated by comparing this instead of the full
-/// id.
-fn path_after_kind_dir(id: &str) -> &str {
-    id.split_once('/').map(|(_, rest)| rest).unwrap_or(id)
-}
-
-/// A method's owning type/module path, derived from its own id — the
-/// counterpart of a type concept's own [`path_after_kind_dir`], so the
-/// two can be compared directly to correlate a method to its declaring
-/// type.
-fn owner_path(method_id: &str) -> Option<&str> {
-    path_after_kind_dir(method_id)
-        .rsplit_once('/')
-        .map(|(owner, _)| owner)
-}
-
-fn is_type_kind(kind: ConceptKind) -> bool {
-    matches!(
-        kind,
-        ConceptKind::Struct | ConceptKind::Class | ConceptKind::Interface | ConceptKind::Trait
-    )
-}
-
-fn group_methods_by_owner(concepts: &[Concept]) -> HashMap<&str, Vec<&Concept>> {
-    let mut map: HashMap<&str, Vec<&Concept>> = HashMap::new();
-    for c in concepts {
-        if c.kind != ConceptKind::Method {
-            continue;
-        }
-        if let Some(owner) = owner_path(&c.id) {
-            map.entry(owner).or_default().push(c);
-        }
-    }
-    map
 }
 
 /// Runs every detector below over `concepts` and returns every match,

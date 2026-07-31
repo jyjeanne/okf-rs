@@ -174,6 +174,7 @@ okf-rs graph api                                         # the whole public API 
 okf-rs graph layers                                      # each package's layer in the dependency graph (0 = foundational)
 okf-rs graph domains                                     # clusters of packages that depend on each other
 okf-rs graph patterns                                    # Builder/Singleton/Factory/Visitor matches, by structural heuristic
+okf-rs graph features                                    # REST endpoints, database models, event-flow participants, by naming heuristic
 okf-rs docs --format html                                # a browsable static site, into docs/
 ```
 

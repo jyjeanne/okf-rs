@@ -277,6 +277,17 @@ enum GraphQuery {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+    /// List REST endpoints, database models, and event-flow participants
+    /// detected via structural/naming heuristics (e.g. a public method on
+    /// a `*Controller`-named type, a `*Model`/`*Entity`-named type, an
+    /// `emit_*`/`on_*`-named function).
+    Features {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -716,6 +727,10 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
         GraphQuery::Patterns { bundle, project } => {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::graph_patterns(&bundle))
+        }
+        GraphQuery::Features { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_features(&bundle))
         }
     }
 }

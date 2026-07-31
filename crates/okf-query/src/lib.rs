@@ -506,6 +506,24 @@ pub fn graph_patterns(bundle: &Path) -> Result<String> {
         .join("\n"))
 }
 
+/// REST endpoints, database models, and event-flow participants detected
+/// via structural/naming heuristics (`okf_arch::detect_features`) — see
+/// that function's own docs for what this does and doesn't claim to
+/// detect.
+pub fn graph_features(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let found = okf_arch::detect_features(&concepts);
+    if found.is_empty() {
+        return Ok("No REST endpoints, database models, or event-flow participants detected"
+            .to_string());
+    }
+    Ok(found
+        .iter()
+        .map(|f| format!("{:<13} {} — {}", f.kind.as_str(), f.concept_id, f.evidence))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 fn concept_lines(concepts: &[&Concept]) -> String {
     concepts
         .iter()
@@ -876,6 +894,29 @@ mod tests {
         assert_eq!(
             graph_patterns(dir.path()).unwrap(),
             "No design patterns detected"
+        );
+    }
+
+    #[test]
+    fn graph_features_finds_a_database_model() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "classes/UserModel.md",
+            "---\ntype: Rust Class\ntitle: UserModel\nresource: src/models.rs#L1\n---\n\nbody\n",
+        );
+
+        let text = graph_features(dir.path()).unwrap();
+        assert!(text.contains("DatabaseModel"));
+        assert!(text.contains("classes/UserModel"));
+    }
+
+    #[test]
+    fn graph_features_reports_none_found_when_there_are_no_matches() {
+        let dir = sample_bundle();
+        assert_eq!(
+            graph_features(dir.path()).unwrap(),
+            "No REST endpoints, database models, or event-flow participants detected"
         );
     }
 }
