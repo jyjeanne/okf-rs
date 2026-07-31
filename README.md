@@ -24,7 +24,7 @@ knowledge — no issues found
 Most codebase-analysis tools produce a proprietary graph database, an AI-specific context blob, or a pile of Markdown summaries you can't query or diff. `okf-rs` instead emits a **conformant OKF bundle**: ordinary `.md` files with YAML frontmatter, cross-linked by ordinary markdown links, that live in your repo like any other file — git-diffable, greppable, renderable on GitHub, and readable by any tool without going through `okf-rs` itself.
 
 - **Open** — the output is the artifact; no proprietary runtime, database, or SDK required to read or write it.
-- **Fast** — a native Rust core using [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for parsing.
+- **Fast** — a native Rust core using [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for parsing, with per-file extraction parallelized across a `rayon` thread pool.
 - **Deterministic** — identical source always produces byte-identical output; no wall-clock timestamps, no unordered maps leaking into results.
 - **AI-ready** — structured knowledge that doesn't require an LLM to produce, though one can optionally enrich it later.
 
