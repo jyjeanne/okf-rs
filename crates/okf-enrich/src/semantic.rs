@@ -37,17 +37,30 @@ fn embeddable_text(concept: &Concept, description: &str) -> String {
     )
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+fn vector_norm(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// Cosine similarity between `a` and `b`, given `a`'s already-computed
+/// norm — lets a caller comparing one fixed vector (the query embedding)
+/// against many candidates compute that norm once, rather than
+/// recomputing the same value on every comparison (see
+/// [`semantic_search`], which does exactly that).
+fn cosine_similarity_with_norm(a: &[f32], norm_a: f32, b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b = vector_norm(b);
     if norm_a == 0.0 || norm_b == 0.0 {
         return 0.0;
     }
     dot / (norm_a * norm_b)
+}
+
+#[cfg(test)]
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    cosine_similarity_with_norm(a, vector_norm(a), b)
 }
 
 /// Ranks every described concept in `concepts` by embedding-cosine
@@ -82,6 +95,7 @@ pub fn semantic_search(
     }
 
     let query_embedding = client.embed(query)?;
+    let query_norm = vector_norm(&query_embedding);
     let embeddings = crate::run_bounded(&candidates, |(_, text)| client.embed(text));
 
     let mut hits = Vec::with_capacity(candidates.len());
@@ -91,7 +105,7 @@ pub fn semantic_search(
             id: concept.id.clone(),
             title: concept.name.clone(),
             concept_type: concept.frontmatter_type(),
-            score: cosine_similarity(&query_embedding, &embedding),
+            score: cosine_similarity_with_norm(&query_embedding, query_norm, &embedding),
         });
     }
 

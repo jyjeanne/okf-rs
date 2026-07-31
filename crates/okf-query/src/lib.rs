@@ -128,17 +128,17 @@ pub fn search_ranked(bundle: &Path, query: &str) -> Result<String> {
         .join("\n"))
 }
 
-/// Resolves `query` to a concept in `graph`: an exact id match wins;
-/// otherwise the top hit of a ranked full-text search (the same index
-/// [`search_ranked`] uses) against `index`.
-fn resolve_explore_target<'a>(
+/// Resolves `query` to a concept via a ranked full-text search fallback
+/// (the same index [`search_ranked`] uses), for when it isn't an exact
+/// concept id — see [`explore`], which checks that cheap exact-id path
+/// first and only builds the index this needs when it's actually
+/// required, rather than paying for it on every call regardless.
+fn resolve_explore_target_by_search<'a>(
     graph: &okf_graph::Graph<'a>,
-    index: &okf_search::FullTextIndex,
+    concepts: &[Concept],
     query: &str,
 ) -> Result<&'a Concept> {
-    if let Some(concept) = graph.get(query) {
-        return Ok(concept);
-    }
+    let index = okf_search::FullTextIndex::build_from_concepts(concepts)?;
     let hit = index
         .search(query, 1)?
         .into_iter()
@@ -175,10 +175,16 @@ fn id_list(ids: &[&Concept]) -> String {
 pub fn explore(bundle: &Path, query: &str) -> Result<String> {
     let concepts = load_concepts(bundle)?;
     let graph = okf_graph::Graph::build(&concepts);
-    let index = okf_search::FullTextIndex::build_from_concepts(&concepts)?;
-    let concept = resolve_explore_target(&graph, &index, query)?;
+    // The common case -- an agent chaining `search`/a previous `explore`
+    // call, which already has a concept id in hand -- never needs the
+    // full-text index at all, so it's only built on the free-text
+    // fallback path below, not unconditionally on every call.
+    let concept = match graph.get(query) {
+        Some(concept) => concept,
+        None => resolve_explore_target_by_search(&graph, &concepts, query)?,
+    };
 
-    let is_public_api = concept.is_public && !okf_graph::is_structural(concept.kind);
+    let is_public_api = okf_graph::is_public_api(concept);
     let in_cycle = graph
         .cycles()
         .into_iter()

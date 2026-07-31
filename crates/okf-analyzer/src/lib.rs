@@ -120,7 +120,17 @@ pub fn analyze_with_cache_lsp(
     // order) happens in the merge loop below, over `.collect()`'s
     // input-order-preserving `Vec`, so output is byte-identical to the
     // sequential version regardless of which thread finished first.
-    let file_results: Vec<Result<FileParseResult>> = project
+    //
+    // Collecting into `Result<Vec<_>, _>` (rather than `Vec<Result<_>>`
+    // plus a manual first-error scan) uses rayon's own short-circuiting
+    // `FromParallelIterator` impl for `Result`: once any item produces an
+    // `Err`, rayon stops handing out further work to idle threads, so a
+    // file that fails early (a permission error, a deleted file) no
+    // longer guarantees every other file in the project gets read and
+    // parsed first — closer to the old sequential loop's fail-fast
+    // behavior than an unconditional "process everything, then report
+    // the first error" would be.
+    let file_results: Vec<FileParseResult> = project
         .files
         .par_iter()
         .map(|file| -> Result<FileParseResult> {
@@ -145,10 +155,9 @@ pub fn analyze_with_cache_lsp(
                 source: if use_lsp { Some(source) } else { None },
             })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     for result in file_results {
-        let result = result?;
         if result.reused {
             stats.reused += 1;
         } else {
@@ -412,6 +421,17 @@ pub struct ImpactReport {
 /// `before` — the only snapshot that still has it, and the graph its
 /// former callers actually lived in; an added or changed concept's is
 /// computed against `after`, the snapshot it currently exists in.
+/// One of [`impact`]'s three scoring groups (added/removed/changed): the
+/// ids to score, tagged with the [`ChangeKind`] and the graph/public-API/
+/// cycle-membership triple to score them against.
+struct ImpactGroup<'a> {
+    ids: Vec<&'a str>,
+    change: ChangeKind,
+    graph: &'a okf_graph::Graph<'a>,
+    public: &'a HashSet<&'a str>,
+    cyclic: &'a HashSet<&'a str>,
+}
+
 pub fn impact(before: &[Concept], after: &[Concept]) -> ImpactReport {
     let diff_report = diff(before, after);
     let before_graph = okf_graph::Graph::build(before);
@@ -430,36 +450,49 @@ pub fn impact(before: &[Concept], after: &[Concept]) -> ImpactReport {
     let before_cyclic: HashSet<&str> = before_graph.cycles().into_iter().flatten().collect();
     let after_cyclic: HashSet<&str> = after_graph.cycles().into_iter().flatten().collect();
 
-    let mut impacted = Vec::new();
-    for concept in &diff_report.added {
-        impacted.push(score_impact(
-            &concept.id,
-            concept.kind,
-            ChangeKind::Added,
-            &after_graph,
-            &after_public,
-            &after_cyclic,
-        ));
-    }
-    for concept in &diff_report.removed {
-        impacted.push(score_impact(
-            &concept.id,
-            concept.kind,
-            ChangeKind::Removed,
-            &before_graph,
-            &before_public,
-            &before_cyclic,
-        ));
-    }
-    for changed in &diff_report.changed {
-        impacted.push(score_impact(
-            &changed.id,
-            changed.kind,
-            ChangeKind::Changed,
-            &after_graph,
-            &after_public,
-            &after_cyclic,
-        ));
+    // Each group scores its ids against the graph/public-API/cycle triple
+    // those ids actually belong to: a removed concept only still exists
+    // in `before` (and its former callers only live in that graph too);
+    // an added or changed concept exists in `after`. One loop over these
+    // three groups replaces what used to be three near-identical copies
+    // of the same scoring loop.
+    let groups = [
+        ImpactGroup {
+            ids: diff_report.added.iter().map(|c| c.id.as_str()).collect(),
+            change: ChangeKind::Added,
+            graph: &after_graph,
+            public: &after_public,
+            cyclic: &after_cyclic,
+        },
+        ImpactGroup {
+            ids: diff_report.removed.iter().map(|c| c.id.as_str()).collect(),
+            change: ChangeKind::Removed,
+            graph: &before_graph,
+            public: &before_public,
+            cyclic: &before_cyclic,
+        },
+        ImpactGroup {
+            ids: diff_report.changed.iter().map(|c| c.id.as_str()).collect(),
+            change: ChangeKind::Changed,
+            graph: &after_graph,
+            public: &after_public,
+            cyclic: &after_cyclic,
+        },
+    ];
+
+    let mut impacted: Vec<ImpactedConcept> = Vec::new();
+    for group in &groups {
+        // Each id's blast radius is an independent graph traversal (no
+        // shared mutable state), so scoring runs across a rayon thread
+        // pool the same way per-file extraction does above -- a pure
+        // wall-clock win on a diff that touches many concepts, not a
+        // change in what's computed.
+        impacted.par_extend(
+            group
+                .ids
+                .par_iter()
+                .map(|&id| score_impact(id, group.change, group.graph, group.public, group.cyclic)),
+        );
     }
 
     impacted.sort_by(|a, b| {
@@ -477,12 +510,20 @@ pub fn impact(before: &[Concept], after: &[Concept]) -> ImpactReport {
 
 fn score_impact(
     id: &str,
-    kind: ConceptKind,
     change: ChangeKind,
     graph: &okf_graph::Graph<'_>,
     public: &HashSet<&str>,
     cyclic: &HashSet<&str>,
 ) -> ImpactedConcept {
+    // `id` always comes from a group scored against the graph that
+    // concept actually belongs to (see `impact`), so this always finds
+    // it -- deriving `kind` here instead of taking it as a separate
+    // parameter means there's only ever one place a concept's kind comes
+    // from, not two that could drift out of sync.
+    let kind = graph
+        .get(id)
+        .expect("id passed to score_impact must belong to the graph it's scored against")
+        .kind;
     let blast_radius: Vec<String> = graph
         .transitive_callers(id, None)
         .iter()

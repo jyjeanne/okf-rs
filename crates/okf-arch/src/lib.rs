@@ -69,21 +69,37 @@ pub struct Domain {
 /// concept covers it — the whole bundle, if `okf-analyzer` found no
 /// manifest at all) contributes no edge.
 pub fn package_dependencies(graph: &Graph<'_>) -> Vec<(String, String)> {
-    let mut edges: HashSet<(String, String)> = HashSet::new();
-    for (from_module, to_module) in graph.module_dependencies() {
-        let (Some(from_pkg), Some(to_pkg)) = (
-            graph.owning_package(from_module),
-            graph.owning_package(to_module),
-        ) else {
-            continue;
-        };
-        if from_pkg.id != to_pkg.id {
-            edges.insert((from_pkg.id.clone(), to_pkg.id.clone()));
-        }
-    }
+    let edges: HashSet<(String, String)> = resolved_package_edges(graph).collect();
     let mut edges: Vec<_> = edges.into_iter().collect();
     edges.sort();
     edges
+}
+
+/// For every cross-module dependency edge (`graph.module_dependencies()`),
+/// the pair of owning package ids on each side — shared by
+/// [`package_dependencies`] (deduplicated, unweighted, directed) and
+/// [`weighted_package_edges`] (counted, undirected, for modularity-based
+/// community detection) so both derive their edges from exactly one
+/// resolution step, instead of two independently maintained copies of
+/// the same `owning_package` lookup and same-package skip. A module
+/// dependency whose owning package can't be resolved on either side, or
+/// that resolves to the same package on both sides, yields nothing.
+fn resolved_package_edges<'g>(graph: &'g Graph<'_>) -> impl Iterator<Item = (String, String)> + 'g {
+    graph
+        .module_dependencies()
+        .into_iter()
+        .filter_map(|(from_module, to_module)| {
+            let (Some(from_pkg), Some(to_pkg)) = (
+                graph.owning_package(from_module),
+                graph.owning_package(to_module),
+            ) else {
+                return None;
+            };
+            if from_pkg.id == to_pkg.id {
+                return None;
+            }
+            Some((from_pkg.id.clone(), to_pkg.id.clone()))
+        })
 }
 
 /// See [`PackageLayer`]. Sorted by `(layer, package_id)` for
@@ -251,21 +267,8 @@ pub struct Community {
 /// direction was observed.
 fn weighted_package_edges(graph: &Graph<'_>) -> HashMap<(String, String), usize> {
     let mut weights: HashMap<(String, String), usize> = HashMap::new();
-    for (from_module, to_module) in graph.module_dependencies() {
-        let (Some(from_pkg), Some(to_pkg)) = (
-            graph.owning_package(from_module),
-            graph.owning_package(to_module),
-        ) else {
-            continue;
-        };
-        if from_pkg.id == to_pkg.id {
-            continue;
-        }
-        let key = if from_pkg.id <= to_pkg.id {
-            (from_pkg.id.clone(), to_pkg.id.clone())
-        } else {
-            (to_pkg.id.clone(), from_pkg.id.clone())
-        };
+    for (from, to) in resolved_package_edges(graph) {
+        let key = if from <= to { (from, to) } else { (to, from) };
         *weights.entry(key).or_default() += 1;
     }
     weights
@@ -362,24 +365,22 @@ fn greedy_modularity_communities(
 
     loop {
         // Modularity gain from merging communities a and b:
-        // ΔQ = 2 * (w_ab/m - deg(a)*deg(b) / (2*m^2)).
-        let mut best: Option<((String, String), f64)> = None;
-        for ((a, b), &w) in &comm_edges {
-            let delta = 2.0
-                * (w / total_weight
-                    - (degree[a] * degree[b]) / (2.0 * total_weight * total_weight));
-            let candidate = ((a.clone(), b.clone()), delta);
-            best = Some(match best {
-                None => candidate,
-                Some((best_pair, best_delta)) => {
-                    if delta > best_delta || (delta == best_delta && candidate.0 < best_pair) {
-                        candidate
-                    } else {
-                        (best_pair, best_delta)
-                    }
-                }
-            });
-        }
+        // ΔQ = 2 * (w_ab/m - deg(a)*deg(b) / (2*m^2)). `comm_edges`
+        // (a `BTreeMap`) iterates in ascending key order; reversing that
+        // to descending means `max_by`'s documented "last element wins a
+        // tie" rule picks the lexicographically *smallest* pair on an
+        // exact delta tie, matching the deterministic tie-break this
+        // algorithm requires.
+        let best = comm_edges
+            .iter()
+            .rev()
+            .map(|((a, b), &w)| {
+                let delta = 2.0
+                    * (w / total_weight
+                        - (degree[a] * degree[b]) / (2.0 * total_weight * total_weight));
+                ((a.clone(), b.clone()), delta)
+            })
+            .max_by(|x, y| x.1.total_cmp(&y.1));
 
         let Some(((a, b), delta)) = best else {
             break;

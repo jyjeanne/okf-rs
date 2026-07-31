@@ -23,15 +23,10 @@ use std::path::Path;
 /// `output_dir` — open `output_dir` directly as an Obsidian vault.
 pub fn generate_obsidian(concepts: &[Concept], output_dir: &Path) -> Result<()> {
     let bundle_ids: HashSet<&str> = concepts.iter().map(|c| c.id.as_str()).collect();
-    fs::create_dir_all(output_dir)?;
 
-    for concept in concepts {
-        let file_path = output_dir.join(format!("{}.md", concept.id));
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(file_path, render_note(concept, concepts, &bundle_ids))?;
-    }
+    crate::write_one_file_per_concept(concepts, output_dir, "md", |concept| {
+        render_note(concept, concepts, &bundle_ids)
+    })?;
 
     write_root_index(concepts, output_dir)?;
     Ok(())

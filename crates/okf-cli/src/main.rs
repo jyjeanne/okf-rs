@@ -489,10 +489,12 @@ fn run(command: Command) -> Result<ExitCode> {
             bundle,
             &project,
             ranked,
-            semantic,
-            enrich_base_url,
-            enrich_model,
-            enrich_api_key,
+            SemanticSearchArgs {
+                enabled: semantic,
+                base_url: enrich_base_url,
+                model: enrich_model,
+                api_key: enrich_api_key,
+            },
         ),
         Command::Explore {
             query,
@@ -893,20 +895,28 @@ fn print_query_result(result: Result<String>) -> Result<ExitCode> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The `--semantic`/`--enrich-*` flags bundled together, the same way
+/// [`EnrichArgs`] bundles `generate --enrich`'s equivalents — these four
+/// are only ever used together (all four or none), so they travel as one
+/// parameter instead of growing `cmd_search`'s own parameter list every
+/// time a new semantic-search option is added.
+struct SemanticSearchArgs {
+    enabled: bool,
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+}
+
 fn cmd_search(
     query: &str,
     bundle: Option<PathBuf>,
     project: &std::path::Path,
     ranked: bool,
-    semantic: bool,
-    enrich_base_url: Option<String>,
-    enrich_model: Option<String>,
-    enrich_api_key: Option<String>,
+    semantic: SemanticSearchArgs,
 ) -> Result<ExitCode> {
     let bundle = resolve_query_bundle(bundle, project);
-    if semantic {
-        let config = resolve_enrich_config(enrich_base_url, enrich_model, enrich_api_key)?;
+    if semantic.enabled {
+        let config = resolve_enrich_config(semantic.base_url, semantic.model, semantic.api_key)?;
         let client = okf_enrich::EnrichClient::new(config);
         print_query_result(okf_query::search_semantic(&bundle, &client, query, 25))
     } else if ranked {
@@ -1139,7 +1149,16 @@ fn git_repo_root(path: &std::path::Path) -> Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(root))
 }
 
-fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<ExitCode> {
+/// Analyzes `path` as of two git refs, via disposable, non-destructive
+/// `git worktree` checkouts (never touching the caller's working tree —
+/// each [`WorktreeCheckout`] is removed on drop, whether or not analysis
+/// succeeded). Shared by `diff`/`impact`/`review`, which only differ in
+/// what they do with the two resulting [`okf_analyzer::AnalysisResult`]s.
+fn analyze_two_refs(
+    path: &std::path::Path,
+    from_ref: &str,
+    to_ref: &str,
+) -> Result<(okf_analyzer::AnalysisResult, okf_analyzer::AnalysisResult)> {
     let repo_root = git_repo_root(path)?;
     let canonical_path = path
         .canonicalize()
@@ -1153,6 +1172,12 @@ fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<Exit
 
     let to_checkout = WorktreeCheckout::new(&repo_root, to_ref)?;
     let to_result = analyze_path(&to_checkout.path().join(relative_project))?;
+
+    Ok((from_result, to_result))
+}
+
+fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<ExitCode> {
+    let (from_result, to_result) = analyze_two_refs(path, from_ref, to_ref)?;
 
     let report = okf_analyzer::diff(&from_result.concepts, &to_result.concepts);
 
@@ -1192,19 +1217,7 @@ fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<Exit
 }
 
 fn cmd_impact(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<ExitCode> {
-    let repo_root = git_repo_root(path)?;
-    let canonical_path = path
-        .canonicalize()
-        .with_context(|| format!("failed to resolve {}", path.display()))?;
-    let relative_project = canonical_path
-        .strip_prefix(&repo_root)
-        .unwrap_or(std::path::Path::new("."));
-
-    let from_checkout = WorktreeCheckout::new(&repo_root, from_ref)?;
-    let from_result = analyze_path(&from_checkout.path().join(relative_project))?;
-
-    let to_checkout = WorktreeCheckout::new(&repo_root, to_ref)?;
-    let to_result = analyze_path(&to_checkout.path().join(relative_project))?;
+    let (from_result, to_result) = analyze_two_refs(path, from_ref, to_ref)?;
 
     let report = okf_analyzer::impact(&from_result.concepts, &to_result.concepts);
 
@@ -1268,19 +1281,7 @@ fn cmd_review(
     path: &std::path::Path,
     fail_on_risk: Option<usize>,
 ) -> Result<ExitCode> {
-    let repo_root = git_repo_root(path)?;
-    let canonical_path = path
-        .canonicalize()
-        .with_context(|| format!("failed to resolve {}", path.display()))?;
-    let relative_project = canonical_path
-        .strip_prefix(&repo_root)
-        .unwrap_or(std::path::Path::new("."));
-
-    let from_checkout = WorktreeCheckout::new(&repo_root, from_ref)?;
-    let from_result = analyze_path(&from_checkout.path().join(relative_project))?;
-
-    let to_checkout = WorktreeCheckout::new(&repo_root, to_ref)?;
-    let to_result = analyze_path(&to_checkout.path().join(relative_project))?;
+    let (from_result, to_result) = analyze_two_refs(path, from_ref, to_ref)?;
 
     let report = okf_analyzer::impact(&from_result.concepts, &to_result.concepts);
     println!("{}", render_review_markdown(&report, from_ref, to_ref));

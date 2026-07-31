@@ -33,6 +33,18 @@ pub fn list() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "search_semantic",
+            "description": "Ranks concepts by embedding-cosine similarity to the query (\"find by meaning\") instead of exact/substring or lexical-relevance matching, via an OpenAI-compatible /embeddings endpoint configured through this server's OKF_ENRICH_BASE_URL/OKF_ENRICH_MODEL(/OKF_ENRICH_API_KEY) environment variables. Only concepts with a description are considered — run `generate --enrich` first if the bundle has none. Errors clearly if the endpoint isn't configured; prefer search/search_ranked unless you specifically need meaning-based matching.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search text" },
+                    "limit": { "type": "integer", "description": "Maximum hits to return (default 25)" },
+                },
+                "required": ["query"],
+            },
+        }),
+        json!({
             "name": "search_ranked",
             "description": "Ranked, relevance-scored full-text search over the knowledge bundle (title, type, description, signature, and tags), via Tantivy/BM25. Unlike the search tool's exact/substring matching, this also searches description and signature prose and orders results by relevance — better for a natural-language query (e.g. \"parses a jwt\") than an exact symbol name.",
             "inputSchema": {
@@ -144,6 +156,16 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
     match name {
         "search" => okf_query::search(bundle, &arg_str(arguments, "query")?),
         "search_ranked" => okf_query::search_ranked(bundle, &arg_str(arguments, "query")?),
+        "search_semantic" => {
+            let query = arg_str(arguments, "query")?;
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(25) as usize;
+            let config = enrich_config_from_env()?;
+            let client = okf_enrich::EnrichClient::new(config);
+            okf_query::search_semantic(bundle, &client, &query, limit)
+        }
         "explore" => okf_query::explore(bundle, &arg_str(arguments, "query")?),
         "coverage" => okf_query::coverage(bundle),
         "graph_callers" => okf_query::graph_callers(bundle, &arg_str(arguments, "id")?),
@@ -173,6 +195,28 @@ fn arg_str(arguments: &Value, key: &str) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| anyhow!("missing required argument `{key}`"))
+}
+
+/// Resolves an embedding-endpoint config from `OKF_ENRICH_BASE_URL`/
+/// `OKF_ENRICH_MODEL`/`OKF_ENRICH_API_KEY` — the same environment
+/// variables `okf-rs generate --enrich`/`search --semantic` already fall
+/// back to, but the only source of config available here: an MCP tool
+/// call has no equivalent of a CLI flag, and this server is started with
+/// just a project root (see `main.rs`), so there's nowhere else for a
+/// client to pass endpoint settings through.
+fn enrich_config_from_env() -> Result<okf_enrich::EnrichConfig> {
+    let base_url = std::env::var("OKF_ENRICH_BASE_URL").map_err(|_| {
+        anyhow!("search_semantic requires the OKF_ENRICH_BASE_URL environment variable to be set for this server")
+    })?;
+    let model = std::env::var("OKF_ENRICH_MODEL").map_err(|_| {
+        anyhow!("search_semantic requires the OKF_ENRICH_MODEL environment variable to be set for this server")
+    })?;
+    let api_key = std::env::var("OKF_ENRICH_API_KEY").ok();
+    Ok(okf_enrich::EnrichConfig {
+        base_url,
+        model,
+        api_key,
+    })
 }
 
 #[cfg(test)]
@@ -237,6 +281,17 @@ mod tests {
             features,
             "No REST endpoints, database models, or event-flow participants detected"
         );
+    }
+
+    #[test]
+    fn search_semantic_without_an_endpoint_configured_is_a_clear_error() {
+        // No OKF_ENRICH_BASE_URL/MODEL set in this test process -- the
+        // tool must report exactly why, not fail some other way.
+        std::env::remove_var("OKF_ENRICH_BASE_URL");
+        std::env::remove_var("OKF_ENRICH_MODEL");
+        let dir = sample_bundle();
+        let err = call("search_semantic", &json!({ "query": "token" }), dir.path()).unwrap_err();
+        assert!(err.to_string().contains("OKF_ENRICH_BASE_URL"));
     }
 
     #[test]

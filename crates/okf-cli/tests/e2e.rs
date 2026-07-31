@@ -15,7 +15,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -792,6 +792,40 @@ fn standalone_binary_watch_regenerates_the_bundle_on_startup() {
 /// `chat.completions`-shaped JSON body — enough for `okf-rs generate
 /// --enrich` to point its `--enrich-base-url` at, without a real network
 /// call or a real LLM in the test environment.
+/// Reads one HTTP/1.1 request off `stream` far enough to get its body
+/// (headers up to the blank line, then exactly `Content-Length` bytes)
+/// and discards it — shared by every mock OpenAI-compatible endpoint
+/// below, which only differ in what JSON they reply with.
+fn read_http_request_body(stream: &TcpStream) {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        if line.trim_end().is_empty() {
+            break;
+        }
+        if let Some(value) = line.trim_end().strip_prefix("Content-Length: ") {
+            content_length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    let _ = reader.read_exact(&mut body);
+}
+
+/// Writes a well-formed `200 OK` HTTP/1.1 response carrying `payload` as
+/// its JSON body.
+fn write_json_response(mut stream: &TcpStream, payload: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
 fn start_mock_enrich_server(reply_content: &'static str) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -800,33 +834,12 @@ fn start_mock_enrich_server(reply_content: &'static str) -> (String, Arc<AtomicU
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
+            let Ok(stream) = stream else { break };
             counter.fetch_add(1, Ordering::SeqCst);
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut content_length = 0usize;
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    break;
-                }
-                if line.trim_end().is_empty() {
-                    break;
-                }
-                if let Some(value) = line.trim_end().strip_prefix("Content-Length: ") {
-                    content_length = value.trim().parse().unwrap_or(0);
-                }
-            }
-            let mut body = vec![0u8; content_length];
-            let _ = reader.read_exact(&mut body);
-
+            read_http_request_body(&stream);
             let payload =
                 format!(r#"{{"choices":[{{"message":{{"content":"{reply_content}"}}}}]}}"#);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = stream.write_all(response.as_bytes());
+            write_json_response(&stream, &payload);
         }
     });
 
@@ -846,32 +859,10 @@ fn start_mock_embedding_server() -> (String, Arc<AtomicUsize>) {
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
+            let Ok(stream) = stream else { break };
             counter.fetch_add(1, Ordering::SeqCst);
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut content_length = 0usize;
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    break;
-                }
-                if line.trim_end().is_empty() {
-                    break;
-                }
-                if let Some(value) = line.trim_end().strip_prefix("Content-Length: ") {
-                    content_length = value.trim().parse().unwrap_or(0);
-                }
-            }
-            let mut body = vec![0u8; content_length];
-            let _ = reader.read_exact(&mut body);
-
-            let payload = r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#.to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = stream.write_all(response.as_bytes());
+            read_http_request_body(&stream);
+            write_json_response(&stream, r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#);
         }
     });
 

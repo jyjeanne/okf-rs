@@ -189,11 +189,7 @@ impl<'a> Graph<'a> {
     /// concepts are excluded — they're structural containers or
     /// documentation, not API surface.
     pub fn public_api(&self) -> Vec<&'a Concept> {
-        let mut public: Vec<&Concept> = self
-            .concepts
-            .iter()
-            .filter(|c| c.is_public && !is_structural(c.kind))
-            .collect();
+        let mut public: Vec<&Concept> = self.concepts.iter().filter(|c| is_public_api(c)).collect();
         public.sort_by(|a, b| a.id.cmp(&b.id));
         public
     }
@@ -448,6 +444,16 @@ pub fn is_structural(kind: ConceptKind) -> bool {
         kind,
         ConceptKind::Module | ConceptKind::Package | ConceptKind::Document
     )
+}
+
+/// Whether `concept` counts as public API surface — [`Graph::public_api`]'s
+/// own membership test, exposed as a free function so a caller checking
+/// a single already-known concept (e.g. `okf_query::explore`,
+/// `okf_analyzer::score_impact`) can reuse the exact same definition
+/// without rebuilding and sorting the whole public-API list just to test
+/// one id's membership in it.
+pub fn is_public_api(concept: &Concept) -> bool {
+    concept.is_public && !is_structural(concept.kind)
 }
 
 /// Standard recursive Tarjan's strongly-connected-components algorithm,

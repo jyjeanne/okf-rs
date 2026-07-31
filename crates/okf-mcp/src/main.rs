@@ -191,6 +191,7 @@ mod tests {
         assert!(names.contains(&"graph_stats"));
         assert!(names.contains(&"graph_path"));
         assert!(names.contains(&"graph_communities"));
+        assert!(names.contains(&"search_semantic"));
     }
 
     #[test]

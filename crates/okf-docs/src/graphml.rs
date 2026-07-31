@@ -9,27 +9,27 @@
 //! for HTML/Markdown/PDF.
 
 use okf_parser::{Concept, RelationKind};
-use okf_render::escape_markup;
+use okf_render::{escape_markup, RELATIONSHIP_HEADINGS};
 use std::collections::HashSet;
 
-/// Relationship kinds rendered as GraphML edges — every kind except
-/// `CalledBy`: `okf-analyzer` always emits `Calls` and `CalledBy` as two
-/// sides of the same resolved edge (see `okf-validator`'s symmetry
-/// check), so including both here would double-count every call edge in
-/// the exported graph.
-const EDGE_KINDS: [RelationKind; 6] = [
-    RelationKind::Imports,
-    RelationKind::Calls,
-    RelationKind::Implements,
-    RelationKind::Inherits,
-    RelationKind::DependsOn,
-    RelationKind::MemberOf,
-];
+/// Whether `kind` gets rendered as a GraphML edge — every relationship
+/// kind [`okf_render::RELATIONSHIP_HEADINGS`] knows about (the same
+/// complete kind list the HTML/Markdown/Obsidian renderers already
+/// consume) except `CalledBy`: `okf-analyzer` always emits `Calls` and
+/// `CalledBy` as two sides of the same resolved edge (see
+/// `okf-validator`'s symmetry check), so including both would
+/// double-count every call edge in the exported graph. Deriving this
+/// from `RELATIONSHIP_HEADINGS` instead of a second, independently
+/// maintained kind list means a future `RelationKind` variant shows up
+/// here automatically, the same way it would for every other renderer.
+fn is_edge_kind(kind: RelationKind) -> bool {
+    kind != RelationKind::CalledBy && RELATIONSHIP_HEADINGS.iter().any(|(k, _)| *k == kind)
+}
 
 /// Renders `concepts` as a single GraphML document: one `<node>` per
 /// concept (`label`/`kind`/`language`/`public` attributes) and one
-/// `<edge>` per relationship whose kind is in [`EDGE_KINDS`] and whose
-/// target is another concept in the same bundle (an external or
+/// `<edge>` per relationship whose kind passes [`is_edge_kind`] and
+/// whose target is another concept in the same bundle (an external or
 /// otherwise unresolved target has no node to draw an edge to).
 pub fn generate_graphml(concepts: &[Concept]) -> String {
     let mut out = String::from(
@@ -62,7 +62,7 @@ pub fn generate_graphml(concepts: &[Concept]) -> String {
     let ids: HashSet<&str> = concepts.iter().map(|c| c.id.as_str()).collect();
     for concept in concepts {
         for rel in &concept.relationships {
-            if !EDGE_KINDS.contains(&rel.kind) || !ids.contains(rel.target.as_str()) {
+            if !is_edge_kind(rel.kind) || !ids.contains(rel.target.as_str()) {
                 continue;
             }
             out.push_str(&format!(
