@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "okf-analyzer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "okf-core",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "okf-arch"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "okf-graph",
  "okf-parser",
@@ -1007,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "okf-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "okf-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ignore",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "okf-dita"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "okf-parser",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "okf-docs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "okf-parser",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "okf-enrich"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "okf-graph",
@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "okf-generator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1087,14 +1087,14 @@ dependencies = [
 
 [[package]]
 name = "okf-graph"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "okf-parser",
 ]
 
 [[package]]
 name = "okf-lsp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "okf-parser",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "okf-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "okf-core",
@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "okf-parser"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "okf-query"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "okf-arch",
@@ -1143,14 +1143,14 @@ dependencies = [
 
 [[package]]
 name = "okf-render"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "okf-parser",
 ]
 
 [[package]]
 name = "okf-search"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "okf-parser",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "okf-tree-sitter"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "okf-validator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "okf-watch"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "notify",
