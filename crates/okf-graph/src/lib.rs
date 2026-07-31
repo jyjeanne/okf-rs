@@ -9,10 +9,74 @@
 //! uses the latter — it queries an existing bundle on disk rather than
 //! re-analyzing the project from source, the same way `okf-search` and
 //! `okf-validator` do.
+//!
+//! # Stability
+//!
+//! This is a public, documented library crate — not just an internal
+//! implementation detail of `okf-cli`/`okf-mcp` — versioned together with
+//! the rest of the `okf-rs` workspace (a single `Cargo.toml`-wide semver
+//! number, bumped by the same release process for every crate). A
+//! breaking change to `Graph`'s public API is a breaking change for the
+//! whole workspace, not something that can land silently. Every public
+//! item is documented (enforced by `#![deny(missing_docs)]` below), so a
+//! consumer other than `okf-cli`/`okf-mcp` — e.g. `okf-server` in Phase 4
+//! — can embed this crate directly against concepts it already has in
+//! memory, without shelling out to the `okf-rs` binary and parsing its
+//! text output.
+//!
+//! # Example
+//!
+//! ```
+//! # use okf_parser::{Concept, ConceptKind, Language, Location, RelationKind, Relationship};
+//! # fn concept(id: &str) -> Concept {
+//! #     Concept {
+//! #         id: id.to_string(),
+//! #         kind: ConceptKind::Function,
+//! #         language: Language::Rust,
+//! #         name: id.to_string(),
+//! #         qualified_name: id.to_string(),
+//! #         description: None,
+//! #         location: Location { file: "src/lib.rs".to_string(), start_line: 1, end_line: 1 },
+//! #         signature: None,
+//! #         tags: Vec::new(),
+//! #         is_public: true,
+//! #         generated_at: None,
+//! #         relationships: Vec::new(),
+//! #     }
+//! # }
+//! # fn edge(concept: &mut Concept, kind: RelationKind, target: &str) {
+//! #     concept.relationships.push(Relationship {
+//! #         kind,
+//! #         target: target.to_string(),
+//! #         target_display: target.to_string(),
+//! #     });
+//! # }
+//! use okf_graph::Graph;
+//!
+//! // A real bundle carries both sides of a resolved call edge (`Calls`
+//! // on the caller, `CalledBy` on the callee) — `okf_parser::read_bundle`
+//! // hands back concepts already shaped this way.
+//! let (mut a, mut b) = (concept("a"), concept("b"));
+//! edge(&mut a, RelationKind::Calls, "b");
+//! edge(&mut b, RelationKind::CalledBy, "a");
+//!
+//! let concepts = vec![a, b];
+//! let graph = Graph::build(&concepts);
+//!
+//! assert_eq!(graph.callees("a")[0].id, "b");
+//! assert_eq!(graph.callers("b")[0].id, "a");
+//! assert!(graph.cycles().is_empty());
+//! ```
+
+#![deny(missing_docs)]
 
 use okf_parser::{Concept, ConceptKind, RelationKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// A queryable graph over a set of [`Concept`]s: cross-module links,
+/// ownership, public API surface, and cycle/dependency analysis. Borrows
+/// its concepts rather than owning them, so building one is cheap and
+/// doesn't duplicate the underlying data.
 pub struct Graph<'a> {
     concepts: &'a [Concept],
     by_id: HashMap<&'a str, usize>,
@@ -23,6 +87,9 @@ pub struct Graph<'a> {
 }
 
 impl<'a> Graph<'a> {
+    /// Indexes `concepts` by id (and, for `Module` concepts, by owning
+    /// source file) so every query below runs in roughly constant time
+    /// per lookup rather than rescanning the slice.
     pub fn build(concepts: &'a [Concept]) -> Self {
         let by_id = concepts
             .iter()
@@ -43,6 +110,7 @@ impl<'a> Graph<'a> {
         }
     }
 
+    /// Looks up a concept by its exact id, if it's in the graph.
     pub fn get(&self, id: &str) -> Option<&'a Concept> {
         self.by_id.get(id).map(|&i| &self.concepts[i])
     }
@@ -106,16 +174,25 @@ impl<'a> Graph<'a> {
             .collect()
     }
 
+    /// Every concept of a given kind, sorted by id for deterministic
+    /// output — e.g. `of_kind(ConceptKind::Package)` to enumerate every
+    /// package in the bundle, the way `okf-arch`'s architecture-layer and
+    /// domain-boundary analysis does.
+    pub fn of_kind(&self, kind: ConceptKind) -> Vec<&'a Concept> {
+        let mut matches: Vec<&Concept> = self.concepts.iter().filter(|c| c.kind == kind).collect();
+        matches.sort_by(|a, b| a.id.cmp(&b.id));
+        matches
+    }
+
     /// Every concept marked public (see [`Concept::is_public`]), sorted
-    /// by id for deterministic output. `Module`/`Package` concepts are
-    /// excluded — they're structural containers, not API surface.
+    /// by id for deterministic output. `Module`/`Package`/`Document`
+    /// concepts are excluded — they're structural containers or
+    /// documentation, not API surface.
     pub fn public_api(&self) -> Vec<&'a Concept> {
         let mut public: Vec<&Concept> = self
             .concepts
             .iter()
-            .filter(|c| {
-                c.is_public && !matches!(c.kind, ConceptKind::Module | ConceptKind::Package)
-            })
+            .filter(|c| c.is_public && !is_structural(c.kind))
             .collect();
         public.sort_by(|a, b| a.id.cmp(&b.id));
         public
@@ -149,11 +226,11 @@ impl<'a> Graph<'a> {
 
     /// Concepts with no `Calls`/`CalledBy` edge in either direction:
     /// never observed calling anything, and never observed being called.
-    /// `Module`/`Package` concepts are excluded — they're structural
-    /// containers, not call-graph participants, so having no `Calls`
-    /// edge of their own is expected rather than a quality signal (see
-    /// `public_api`, which excludes them for the same reason). Sorted by
-    /// id for deterministic output.
+    /// `Module`/`Package`/`Document` concepts are excluded — they're
+    /// structural containers or documentation, not call-graph
+    /// participants, so having no `Calls` edge of their own is expected
+    /// rather than a quality signal (see `public_api`, which excludes
+    /// them for the same reason). Sorted by id for deterministic output.
     ///
     /// This is a different notion of "orphan" than `okf-validator`'s
     /// index-reachability check: that one asks whether a concept is
@@ -168,7 +245,7 @@ impl<'a> Graph<'a> {
         let mut isolated: Vec<&Concept> = self
             .concepts
             .iter()
-            .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package))
+            .filter(|c| !is_structural(c.kind))
             .filter(|c| {
                 !c.relationships
                     .iter()
@@ -264,14 +341,11 @@ impl<'a> Graph<'a> {
     /// cycles is combinatorially expensive and rarely what "does this
     /// have a cycle" questions actually need.
     pub fn cycles(&self) -> Vec<Vec<&'a str>> {
-        let mut tarjan = Tarjan::new(self);
-        for concept in self.concepts {
-            if !tarjan.index.contains_key(concept.id.as_str()) {
-                tarjan.visit(&concept.id);
-            }
-        }
-        let mut cycles: Vec<Vec<&str>> = tarjan
-            .sccs
+        let nodes = self.concepts.iter().map(|c| c.id.as_str());
+        let sccs = tarjan_scc(nodes, |id| {
+            self.callees(id).iter().map(|c| c.id.as_str()).collect()
+        });
+        let mut cycles: Vec<Vec<&str>> = sccs
             .into_iter()
             .filter(|scc| {
                 scc.len() > 1
@@ -326,69 +400,94 @@ impl<'a> Graph<'a> {
     }
 }
 
-/// Standard recursive Tarjan's SCC algorithm, scoped to the `Calls` graph.
-struct Tarjan<'a, 'g> {
-    graph: &'g Graph<'a>,
-    index_counter: usize,
-    index: HashMap<&'a str, usize>,
-    lowlink: HashMap<&'a str, usize>,
-    on_stack: HashSet<&'a str>,
-    stack: Vec<&'a str>,
-    sccs: Vec<Vec<&'a str>>,
+/// A structural concept: a container (`Module`/`Package`) or
+/// documentation (`Document`), never itself a call-graph participant or
+/// API surface — see [`Graph::public_api`]/[`Graph::isolated_concepts`],
+/// which both exclude these kinds for the same reason. Exposed for reuse
+/// wherever else the same structural/non-structural distinction applies
+/// (e.g. `okf_query`'s coverage report).
+pub fn is_structural(kind: ConceptKind) -> bool {
+    matches!(
+        kind,
+        ConceptKind::Module | ConceptKind::Package | ConceptKind::Document
+    )
 }
 
-impl<'a, 'g> Tarjan<'a, 'g> {
-    fn new(graph: &'g Graph<'a>) -> Self {
-        Tarjan {
-            graph,
-            index_counter: 0,
-            index: HashMap::new(),
-            lowlink: HashMap::new(),
-            on_stack: HashSet::new(),
-            stack: Vec::new(),
-            sccs: Vec::new(),
-        }
+/// Standard recursive Tarjan's strongly-connected-components algorithm,
+/// generic over any string-id node space and neighbor lookup — shared by
+/// [`Graph::cycles`] (scoped to a concept graph's `Calls` edges) and
+/// `okf_arch`'s package-dependency-cycle collapsing (scoped to an
+/// explicit package-id adjacency map), which would otherwise each need
+/// their own copy of the same algorithm. `nodes` is walked explicitly
+/// (not just discovered via `neighbors`) so a node with no edges at all
+/// still gets its own single-node SCC, in the order `nodes` lists them —
+/// deterministic as long as the caller passes a deterministically
+/// ordered `nodes`.
+pub fn tarjan_scc<'a>(
+    nodes: impl IntoIterator<Item = &'a str>,
+    neighbors: impl Fn(&'a str) -> Vec<&'a str>,
+) -> Vec<Vec<&'a str>> {
+    struct Tarjan<'a, F> {
+        neighbors: F,
+        index_counter: usize,
+        index: HashMap<&'a str, usize>,
+        lowlink: HashMap<&'a str, usize>,
+        on_stack: HashSet<&'a str>,
+        stack: Vec<&'a str>,
+        sccs: Vec<Vec<&'a str>>,
     }
 
-    fn visit(&mut self, id: &str) {
-        let Some(concept) = self.graph.get(id) else {
-            return;
-        };
-        let id = concept.id.as_str();
+    impl<'a, F: Fn(&'a str) -> Vec<&'a str>> Tarjan<'a, F> {
+        fn visit(&mut self, node: &'a str) {
+            self.index.insert(node, self.index_counter);
+            self.lowlink.insert(node, self.index_counter);
+            self.index_counter += 1;
+            self.stack.push(node);
+            self.on_stack.insert(node);
 
-        self.index.insert(id, self.index_counter);
-        self.lowlink.insert(id, self.index_counter);
-        self.index_counter += 1;
-        self.stack.push(id);
-        self.on_stack.insert(id);
-
-        for callee in self.graph.callees(id) {
-            let callee_id = callee.id.as_str();
-            if !self.index.contains_key(callee_id) {
-                self.visit(callee_id);
-                let callee_low = self.lowlink[callee_id];
-                let my_low = self.lowlink[id];
-                self.lowlink.insert(id, my_low.min(callee_low));
-            } else if self.on_stack.contains(callee_id) {
-                let callee_idx = self.index[callee_id];
-                let my_low = self.lowlink[id];
-                self.lowlink.insert(id, my_low.min(callee_idx));
-            }
-        }
-
-        if self.lowlink[id] == self.index[id] {
-            let mut scc = Vec::new();
-            loop {
-                let member = self.stack.pop().unwrap();
-                self.on_stack.remove(member);
-                scc.push(member);
-                if member == id {
-                    break;
+            for neighbor in (self.neighbors)(node) {
+                if !self.index.contains_key(neighbor) {
+                    self.visit(neighbor);
+                    let neighbor_low = self.lowlink[neighbor];
+                    let my_low = self.lowlink[node];
+                    self.lowlink.insert(node, my_low.min(neighbor_low));
+                } else if self.on_stack.contains(neighbor) {
+                    let neighbor_idx = self.index[neighbor];
+                    let my_low = self.lowlink[node];
+                    self.lowlink.insert(node, my_low.min(neighbor_idx));
                 }
             }
-            self.sccs.push(scc);
+
+            if self.lowlink[node] == self.index[node] {
+                let mut scc = Vec::new();
+                loop {
+                    let member = self.stack.pop().unwrap();
+                    self.on_stack.remove(member);
+                    scc.push(member);
+                    if member == node {
+                        break;
+                    }
+                }
+                self.sccs.push(scc);
+            }
         }
     }
+
+    let mut tarjan = Tarjan {
+        neighbors,
+        index_counter: 0,
+        index: HashMap::new(),
+        lowlink: HashMap::new(),
+        on_stack: HashSet::new(),
+        stack: Vec::new(),
+        sccs: Vec::new(),
+    };
+    for node in nodes {
+        if !tarjan.index.contains_key(node) {
+            tarjan.visit(node);
+        }
+    }
+    tarjan.sccs
 }
 
 #[cfg(test)]
@@ -496,6 +595,41 @@ mod tests {
         let api = graph.public_api();
         assert_eq!(api.len(), 1);
         assert_eq!(api[0].id, "functions/a/pub_fn");
+    }
+
+    #[test]
+    fn document_concepts_are_excluded_from_public_api_and_isolated_concepts() {
+        // A Document (e.g. an okf-dita-imported DITA topic) is
+        // structural the same way Module/Package are: never expected to
+        // carry a Calls/CalledBy edge, and not API surface.
+        let doc = concept(
+            "documents/readme",
+            ConceptKind::Document,
+            "readme.dita",
+            true,
+        );
+        let concepts = vec![doc];
+        let graph = Graph::build(&concepts);
+
+        assert!(graph.public_api().is_empty());
+        assert!(graph.isolated_concepts().is_empty());
+    }
+
+    #[test]
+    fn of_kind_filters_and_sorts_by_id() {
+        let module = concept("modules/a", ConceptKind::Module, "a.rs", true);
+        let fn_b = concept("functions/b", ConceptKind::Function, "a.rs", true);
+        let fn_a = concept("functions/a", ConceptKind::Function, "a.rs", true);
+
+        let concepts = vec![module, fn_b, fn_a];
+        let graph = Graph::build(&concepts);
+
+        let functions = graph.of_kind(ConceptKind::Function);
+        assert_eq!(
+            functions.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["functions/a", "functions/b"]
+        );
+        assert_eq!(graph.of_kind(ConceptKind::Package), Vec::<&Concept>::new());
     }
 
     #[test]

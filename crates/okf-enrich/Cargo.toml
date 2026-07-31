@@ -1,0 +1,26 @@
+[package]
+name = "okf-enrich"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional AI enrichment (function summaries, module/package descriptions, suggested missing links) via any OpenAI-compatible chat completions endpoint"
+
+[features]
+# Exposes `test_support` (a hand-rolled OpenAI-compatible mock HTTP
+# server) as `pub` instead of `pub(crate)`, so other crates' own test
+# suites (currently `okf-query`'s) can reuse it as a dev-dependency
+# rather than maintaining their own copy.
+test-support = []
+
+[dependencies]
+okf-parser.workspace = true
+okf-graph.workspace = true
+okf-search.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"

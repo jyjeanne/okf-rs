@@ -95,5 +95,16 @@ pub fn extract_source(source: &str, file: &SourceFile) -> Result<FileExtraction>
         Language::Kotlin => kotlin::extract(source, &file.relative_path),
         Language::Cpp => cpp::extract(source, &file.relative_path),
         Language::Swift => swift::extract(source, &file.relative_path),
+        // Unreachable in normal operation: `Language::from_extension`
+        // deliberately never maps a `.dita` file to `Language::Dita`, so
+        // `okf_core::Project::load`'s source-file scan never produces a
+        // `SourceFile` with this language in the first place -- DITA XML
+        // goes through `okf-dita`'s own importer, a separate path from
+        // this source-code extraction dispatch entirely. Still needs an
+        // arm here since `Language` is otherwise exhaustively matched.
+        Language::Dita => Err(anyhow::anyhow!(
+            "{}: DITA files aren't extracted as source code -- use okf-dita's importer instead",
+            file.relative_path
+        )),
     }
 }

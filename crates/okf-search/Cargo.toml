@@ -11,6 +11,8 @@ anyhow.workspace = true
 serde_yaml.workspace = true
 serde.workspace = true
 walkdir.workspace = true
+okf-parser.workspace = true
+tantivy = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

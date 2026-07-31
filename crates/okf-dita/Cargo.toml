@@ -1,0 +1,17 @@
+[package]
+name = "okf-dita"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DITA XML converter: export an OKF bundle to DITA topics, and import an existing DITA corpus as Document concepts"
+
+[dependencies]
+okf-parser.workspace = true
+okf-render.workspace = true
+anyhow.workspace = true
+walkdir.workspace = true
+roxmltree = "0.20"
+
+[dev-dependencies]
+tempfile = "3"

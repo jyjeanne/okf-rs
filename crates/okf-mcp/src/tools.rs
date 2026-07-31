@@ -22,6 +22,17 @@ pub fn list() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "search_ranked",
+            "description": "Ranked, relevance-scored full-text search over the knowledge bundle (title, type, description, signature, and tags), via Tantivy/BM25. Unlike the search tool's exact/substring matching, this also searches description and signature prose and orders results by relevance — better for a natural-language query (e.g. \"parses a jwt\") than an exact symbol name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search text" },
+                },
+                "required": ["query"],
+            },
+        }),
+        json!({
             "name": "graph_callers",
             "description": "List concepts that directly call the given concept id.",
             "inputSchema": {
@@ -85,6 +96,26 @@ pub fn list() -> Vec<Value> {
                 "required": ["from", "to"],
             },
         }),
+        json!({
+            "name": "graph_layers",
+            "description": "Report each package's layer in the layered architecture derived from the package dependency graph (layer 0 = depends on no other package in the bundle).",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
+        json!({
+            "name": "graph_domains",
+            "description": "List domain boundaries: clusters of packages that depend on each other, directly or transitively. A package with no cross-package dependency is its own singleton domain.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
+        json!({
+            "name": "graph_patterns",
+            "description": "List design patterns (Builder, Singleton, Factory, Visitor) detected via structural/naming heuristics — a structural signal to review, not a semantic guarantee the pattern is really implemented as intended.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
+        json!({
+            "name": "graph_features",
+            "description": "List REST endpoints, database models, and event-flow participants detected via structural/naming heuristics (e.g. a public method on a *Controller-named type, a *Model/*Entity-named type, an emit_*/on_*-named function) — a naming-convention signal, not decorator/annotation-aware detection.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
     ]
 }
 
@@ -96,6 +127,7 @@ pub fn list() -> Vec<Value> {
 pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
     match name {
         "search" => okf_query::search(bundle, &arg_str(arguments, "query")?),
+        "search_ranked" => okf_query::search_ranked(bundle, &arg_str(arguments, "query")?),
         "coverage" => okf_query::coverage(bundle),
         "graph_callers" => okf_query::graph_callers(bundle, &arg_str(arguments, "id")?),
         "graph_callees" => okf_query::graph_callees(bundle, &arg_str(arguments, "id")?),
@@ -109,6 +141,10 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
             &arg_str(arguments, "from")?,
             &arg_str(arguments, "to")?,
         ),
+        "graph_layers" => okf_query::graph_layers(bundle),
+        "graph_domains" => okf_query::graph_domains(bundle),
+        "graph_patterns" => okf_query::graph_patterns(bundle),
+        "graph_features" => okf_query::graph_features(bundle),
         other => Err(anyhow!("unknown tool `{other}`")),
     }
 }
@@ -153,6 +189,36 @@ mod tests {
         let text = call("search", &json!({ "query": "decode_jwt" }), dir.path()).unwrap();
         assert!(text.contains("decode_jwt"));
         assert!(text.contains("functions/auth/decode_jwt"));
+    }
+
+    #[test]
+    fn search_ranked_finds_a_concept_by_title() {
+        let dir = sample_bundle();
+        let text = call(
+            "search_ranked",
+            &json!({ "query": "decode_jwt" }),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(text.contains("functions/auth/decode_jwt"));
+    }
+
+    #[test]
+    fn graph_layers_domains_patterns_and_features_run_without_error() {
+        let dir = sample_bundle();
+        // No Package concepts in this fixture -- both should report the
+        // clear "none found" text, not error.
+        let layers = call("graph_layers", &json!({}), dir.path()).unwrap();
+        assert!(layers.contains("No packages found"));
+        let domains = call("graph_domains", &json!({}), dir.path()).unwrap();
+        assert!(domains.contains("No packages found"));
+        let patterns = call("graph_patterns", &json!({}), dir.path()).unwrap();
+        assert_eq!(patterns, "No design patterns detected");
+        let features = call("graph_features", &json!({}), dir.path()).unwrap();
+        assert_eq!(
+            features,
+            "No REST endpoints, database models, or event-flow participants detected"
+        );
     }
 
     #[test]

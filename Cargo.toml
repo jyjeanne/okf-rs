@@ -12,6 +12,9 @@ members = [
     "crates/okf-search",
     "crates/okf-graph",
     "crates/okf-query",
+    "crates/okf-enrich",
+    "crates/okf-arch",
+    "crates/okf-dita",
     "crates/okf-mcp",
     "crates/okf-watch",
     "crates/okf-docs",
@@ -36,6 +39,9 @@ okf-validator = { path = "crates/okf-validator" }
 okf-search = { path = "crates/okf-search" }
 okf-graph = { path = "crates/okf-graph" }
 okf-query = { path = "crates/okf-query" }
+okf-enrich = { path = "crates/okf-enrich" }
+okf-arch = { path = "crates/okf-arch" }
+okf-dita = { path = "crates/okf-dita" }
 okf-watch = { path = "crates/okf-watch" }
 okf-docs = { path = "crates/okf-docs" }
 

@@ -16,9 +16,15 @@
 //!   doesn't give you — useful for pasting into a wiki/README, or
 //!   feeding to a single-file-oriented tool.
 
+mod pdf;
+
+pub use pdf::generate_pdf;
+
 use anyhow::Result;
-use okf_parser::{Concept, RelationKind};
-use okf_render::{capitalize, contains_members, group_by_kind_dir};
+use okf_parser::Concept;
+use okf_render::{
+    capitalize, contains_members, escape_markup, group_by_kind_dir, RELATIONSHIP_HEADINGS,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -48,16 +54,6 @@ a:hover { text-decoration: underline; }
 /// `@` can't appear in an extracted identifier in any supported language,
 /// so this can never collide with a real concept id.
 const DIR_INDEX_NAME: &str = "@index";
-
-const RELATIONSHIP_HEADINGS: [(RelationKind, &str); 7] = [
-    (RelationKind::Imports, "Imports"),
-    (RelationKind::Calls, "Calls"),
-    (RelationKind::CalledBy, "Called by"),
-    (RelationKind::Implements, "Implements"),
-    (RelationKind::Inherits, "Inherits"),
-    (RelationKind::DependsOn, "Depends on"),
-    (RelationKind::MemberOf, "Member of"),
-];
 
 /// Writes a static HTML documentation site for `concepts` to `output_dir`:
 /// one page per concept (`<id>.html`), a per-kind-directory index, and a
@@ -98,19 +94,6 @@ fn relative_link(from_pseudo_id: &str, to_pseudo_id: &str) -> String {
     okf_render::relative_link(from_pseudo_id, to_pseudo_id, "html")
 }
 
-/// Escapes text for safe inclusion in HTML — signatures routinely contain
-/// `<`/`>`/`&` on their own merits (Rust/C#/Kotlin generics, C++
-/// templates, comparisons), not just from adversarial input, so every
-/// piece of concept-derived text must go through this before being
-/// embedded in a page.
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
 fn html_page(title: &str, body: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>{title}</title>\n{STYLE}</head>\n<body>\n{body}</body>\n</html>\n"
@@ -118,8 +101,8 @@ fn html_page(title: &str, body: &str) -> String {
 }
 
 fn render_concept_html(concept: &Concept, all: &[Concept], bundle_ids: &HashSet<&str>) -> String {
-    let name = escape_html(&concept.name);
-    let type_label = escape_html(&concept.frontmatter_type());
+    let name = escape_markup(&concept.name);
+    let type_label = escape_markup(&concept.frontmatter_type());
     let home = relative_link(&concept.id, "index");
     let kind_dir = concept.kind.bundle_dir();
     let kind_index = relative_link(&concept.id, &format!("{kind_dir}/{DIR_INDEX_NAME}"));
@@ -127,7 +110,7 @@ fn render_concept_html(concept: &Concept, all: &[Concept], bundle_ids: &HashSet<
     let mut body = String::new();
     body.push_str(&format!(
         "<nav><a href=\"{home}\">Home</a> / <a href=\"{kind_index}\">{}</a></nav>\n",
-        escape_html(kind_dir)
+        escape_markup(kind_dir)
     ));
     body.push_str(&format!(
         "<h1>{name}</h1>\n<p class=\"type\">{type_label}</p>\n"
@@ -140,16 +123,16 @@ fn render_concept_html(concept: &Concept, all: &[Concept], bundle_ids: &HashSet<
     if let Some(signature) = &concept.signature {
         body.push_str(&format!(
             "<pre><code>{}</code></pre>\n",
-            escape_html(signature)
+            escape_markup(signature)
         ));
     }
 
     if let Some(description) = &concept.description {
-        body.push_str(&format!("<p>{}</p>\n", escape_html(description)));
+        body.push_str(&format!("<p>{}</p>\n", escape_markup(description)));
     }
 
     if !concept.tags.is_empty() {
-        let tags: Vec<String> = concept.tags.iter().map(|t| escape_html(t)).collect();
+        let tags: Vec<String> = concept.tags.iter().map(|t| escape_markup(t)).collect();
         body.push_str(&format!(
             "<p class=\"tags\">Tags: {}</p>\n",
             tags.join(", ")
@@ -174,12 +157,12 @@ fn render_concept_html(concept: &Concept, all: &[Concept], bundle_ids: &HashSet<
                 body.push_str(&format!(
                     "<li><a href=\"{}\">{}</a></li>\n",
                     relative_link(&concept.id, &rel.target),
-                    escape_html(&rel.target_display)
+                    escape_markup(&rel.target_display)
                 ));
             } else {
                 body.push_str(&format!(
                     "<li><code>{}</code></li>\n",
-                    escape_html(&rel.target_display)
+                    escape_markup(&rel.target_display)
                 ));
             }
         }
@@ -188,7 +171,7 @@ fn render_concept_html(concept: &Concept, all: &[Concept], bundle_ids: &HashSet<
 
     body.push_str(&format!(
         "<p class=\"resource\">Source: {}</p>\n",
-        escape_html(&concept.location.to_string())
+        escape_markup(&concept.location.to_string())
     ));
 
     html_page(&format!("{name} — {type_label}"), &body)
@@ -203,8 +186,8 @@ fn render_link_section(body: &mut String, heading: &str, members: &[&Concept], f
         body.push_str(&format!(
             "<li><a href=\"{}\">{}</a> — {}</li>\n",
             relative_link(from_id, &member.id),
-            escape_html(&member.name),
-            escape_html(&member.frontmatter_type())
+            escape_markup(&member.name),
+            escape_markup(&member.frontmatter_type())
         ));
     }
     body.push_str("</ul>\n");
@@ -217,14 +200,14 @@ fn write_dir_index_html(output_dir: &Path, dir: &str, entries: &[&Concept]) -> R
 
     let mut body = format!(
         "<nav><a href=\"{home}\">Home</a></nav>\n<h1>{}</h1>\n<ul>\n",
-        escape_html(&title)
+        escape_markup(&title)
     );
     for concept in entries {
         body.push_str(&format!(
             "<li><a href=\"{}\">{}</a> — {}</li>\n",
             relative_link(&pseudo_id, &concept.id),
-            escape_html(&concept.name),
-            escape_html(&concept.frontmatter_type())
+            escape_markup(&concept.name),
+            escape_markup(&concept.frontmatter_type())
         ));
     }
     body.push_str("</ul>\n");
@@ -241,7 +224,7 @@ fn write_root_index_html(output_dir: &Path, by_dir: &BTreeMap<&str, Vec<&Concept
     for (dir, entries) in by_dir {
         body.push_str(&format!(
             "<li><a href=\"{dir}/{DIR_INDEX_NAME}.html\">{}</a> ({})</li>\n",
-            escape_html(&capitalize(dir)),
+            escape_markup(&capitalize(dir)),
             entries.len()
         ));
     }
@@ -330,7 +313,7 @@ fn slug(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use okf_parser::{ConceptKind, Language, Location, Relationship};
+    use okf_parser::{ConceptKind, Language, Location, RelationKind, Relationship};
 
     fn concept(kind: ConceptKind, name: &str, qualified: &str, file: &str) -> Concept {
         Concept {

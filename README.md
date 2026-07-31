@@ -44,7 +44,7 @@ See [`docs/specification.md`](docs/specification.md) for the full project specif
 - **Graph queries** — callers/callees, call-graph cycle detection, isolated-concept detection, cross-module dependencies, shortest call path, and topology statistics (per-kind counts, relationship edge counts, connected components)
 - **Coverage metrics** — `okf-rs coverage` reports description/tag completeness and call-graph participation across the bundle
 - **Bundle diffing** — compare a project's concepts between two git refs without touching your working tree
-- **Documentation generation** — `okf-rs docs` renders a bundle into a browsable static HTML site or a single consolidated Markdown document, templated directly from the concept data — no LLM required
+- **Documentation generation** — `okf-rs docs` renders a bundle into a browsable static HTML site, a single consolidated Markdown document, or a single paginated PDF, templated directly from the concept data — no LLM required
 - **AI agent integration** — `okf-rs init` writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md`, idempotently; `AGENTS.md` holds the generated content and `CLAUDE.md` just imports it (`@AGENTS.md`), so tools that prefer `AGENTS.md` over `CLAUDE.md` (e.g. opencode) never end up reading stale or missing content; `okf-mcp` exposes search and graph queries as an MCP server for tools like Claude Code and opencode
 - **Standalone binary** — no runtime dependency beyond the OS's standard C library; see [Packaging & Distribution](docs/specification.md#packaging--distribution)
 
@@ -156,13 +156,42 @@ This is safe to run on a large, real codebase: it's `.gitignore`-aware (never de
 
 Decide whether `knowledge/` itself belongs in git. Both are reasonable: committing it means the bundle reviews alongside the code that produced it (and is diffable, per PR, in `git diff`); `.gitignore`-ing it means treating it as a build artifact regenerated in CI. Either way, run `okf-rs validate --ci` in CI (see step 6) so a stale or broken bundle never ships silently.
 
+#### Optional: fill in missing descriptions with an LLM
+
+```sh
+okf-rs generate --enrich --enrich-base-url http://localhost:11434/v1 --enrich-model llama3.1
+```
+
+Entirely optional, and never a hard dependency on one vendor: `--enrich` speaks the same `chat/completions` shape every OpenAI-compatible endpoint implements, so it works unmodified against [Ollama](https://ollama.com), LM Studio, LocalAI, [Crustly](https://github.com/jyjeanne/crustly), or a cloud provider (pass `--enrich-api-key`, or set `OKF_ENRICH_API_KEY`) — a local server generally doesn't need one. Only concepts with no description are ever queried or overwritten: a hand-written one is left alone, and a previous `--enrich` run's output is reused straight from the bundle on disk rather than re-querying the endpoint on every `generate`.
+
+Once descriptions exist, `okf-rs suggest-links` (same `--enrich-*` flags) looks for concepts that are semantically close by full-text search but have no relationship edge yet, and asks the endpoint whether each candidate looks like a genuinely missing link — advisory only, nothing is written back into the bundle:
+
+```sh
+okf-rs suggest-links --enrich-base-url http://localhost:11434/v1 --enrich-model llama3.1
+```
+
+#### Optional: bring in an existing DITA corpus
+
+```sh
+okf-rs generate --dita path/to/dita-topics/
+```
+
+A technical-writing team's existing DITA XML topics import as `Document` concepts, merged into the same bundle alongside everything extracted from source — so `search`, `graph`, and every other command work over docs and code together. A topic that fails to parse is skipped with a warning rather than failing the whole command. Going the other way, `okf-rs docs --format dita` exports a bundle (code, imported docs, or both) back out as a DITA topic set.
+
 ### 4. Explore it
 
 ```sh
 okf-rs search verify_token                              # find a symbol by name
+okf-rs search "parses a jwt" --ranked                    # ranked, relevance-scored full-text search (title/type/description/signature/tags)
 okf-rs graph callers functions/src/auth/verify_token     # who calls it
 okf-rs graph api                                         # the whole public API surface
+okf-rs graph layers                                      # each package's layer in the dependency graph (0 = foundational)
+okf-rs graph domains                                     # clusters of packages that depend on each other
+okf-rs graph patterns                                    # Builder/Singleton/Factory/Visitor matches, by structural heuristic
+okf-rs graph features                                    # REST endpoints, database models, event-flow participants, by naming heuristic
 okf-rs docs --format html                                # a browsable static site, into docs/
+okf-rs docs --format pdf                                 # a single paginated PDF, into docs.pdf
+okf-rs docs --format dita                                # a DITA topic set + ditamap, into docs-dita/
 ```
 
 Concept ids (like `functions/src/auth/verify_token` above) come from `search`'s output — copy one from there rather than guessing the path convention.
@@ -208,7 +237,7 @@ Commands:
   docs      Generate human-readable documentation (HTML site or Markdown) from an OKF bundle
 ```
 
-Run `okf-rs <command> --help` for each command's options. `okf-rs generate` persists a `.okf-cache.json` at the project root keyed by each file's content hash, so a re-run only re-parses files that actually changed since the last one (report line: `N files parsed, M reused from cache`); pass `--no-cache` to bypass it and re-parse everything (the bundle it produces is byte-identical either way — the cache only affects how long it takes). Pass `--lsp` to also resolve calls whose name is ambiguous project-wide (more than one function/method sharing that name) by asking the call site's real language server (`rust-analyzer` for Rust, `pyright-langserver` for Python, wired up so far); this is strictly additive to Tree-sitter's own resolution and never changes the concept set, only adds `Calls`/`CalledBy` edges Tree-sitter's name-matching alone can't draw — it spawns and queries a real language server process, so it's meaningfully slower than a plain `generate` and skipped silently for a language with no available server. `okf-rs watch` runs that same cycle continuously: it regenerates once immediately, then again each time a burst of filesystem activity settles (`--debounce-ms`, default 300), printing a line only when something actually changed — silent on a wakeup caused by unrelated churn (e.g. a background `cargo build` touching `target/`) — and keeps running until interrupted (Ctrl+C). `okf-rs graph` has its own subcommands (`callers`, `callees`, `cycles`, `isolated`, `api`, `modules`, `stats`, `path`) — e.g. `okf-rs graph callers functions/src/auth/verify_token` lists everything that calls it, `okf-rs graph cycles` flags any call-graph cycles, `okf-rs graph isolated` lists concepts with no `Calls`/`CalledBy` edge at all (dead code or unresolved calls), and `okf-rs graph stats` reports per-kind concept counts, relationship edge counts by kind, and connected components of the call graph. Like `search` and `validate`, `graph` reads a previously generated bundle rather than re-analyzing the project, so run `okf-rs generate` first (and again after source changes). `okf-rs coverage` reports what fraction of the bundle has a description, has at least one tag, and actually participates in the call graph — a quick signal for how filled-in the knowledge base is, distinct from `validate`'s pass/fail checks. `okf-rs diff <ref-a> <ref-b>` compares two git refs' concepts without touching your working tree (it uses a temporary `git worktree` checkout for each ref). `okf-rs docs` reads a previously generated bundle (like `search`/`validate`/`graph`) and renders it for humans: `--format html` (the default) writes a browsable static site — one page per concept, cross-linked, plus a root index and one index per concept kind — into `docs/`; `--format markdown` writes a single consolidated `docs.md` with a table of contents instead. Both are templated directly from the bundle's concept data, no LLM involved. `okf-rs init` also writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md` to point AI coding agents at the bundle — pass `--no-agent-files` to skip that.
+Run `okf-rs <command> --help` for each command's options. `okf-rs generate` persists a `.okf-cache.json` at the project root keyed by each file's content hash, so a re-run only re-parses files that actually changed since the last one (report line: `N files parsed, M reused from cache`); pass `--no-cache` to bypass it and re-parse everything (the bundle it produces is byte-identical either way — the cache only affects how long it takes). Pass `--lsp` to also resolve calls whose name is ambiguous project-wide (more than one function/method sharing that name) by asking the call site's real language server (`rust-analyzer` for Rust, `pyright-langserver` for Python, wired up so far); this is strictly additive to Tree-sitter's own resolution and never changes the concept set, only adds `Calls`/`CalledBy` edges Tree-sitter's name-matching alone can't draw — it spawns and queries a real language server process, so it's meaningfully slower than a plain `generate` and skipped silently for a language with no available server. `okf-rs watch` runs that same cycle continuously: it regenerates once immediately, then again each time a burst of filesystem activity settles (`--debounce-ms`, default 300), printing a line only when something actually changed — silent on a wakeup caused by unrelated churn (e.g. a background `cargo build` touching `target/`) — and keeps running until interrupted (Ctrl+C). `okf-rs graph` has its own subcommands (`callers`, `callees`, `cycles`, `isolated`, `api`, `modules`, `stats`, `path`) — e.g. `okf-rs graph callers functions/src/auth/verify_token` lists everything that calls it, `okf-rs graph cycles` flags any call-graph cycles, `okf-rs graph isolated` lists concepts with no `Calls`/`CalledBy` edge at all (dead code or unresolved calls), and `okf-rs graph stats` reports per-kind concept counts, relationship edge counts by kind, and connected components of the call graph. Like `search` and `validate`, `graph` reads a previously generated bundle rather than re-analyzing the project, so run `okf-rs generate` first (and again after source changes). `okf-rs coverage` reports what fraction of the bundle has a description, has at least one tag, and actually participates in the call graph — a quick signal for how filled-in the knowledge base is, distinct from `validate`'s pass/fail checks. `okf-rs diff <ref-a> <ref-b>` compares two git refs' concepts without touching your working tree (it uses a temporary `git worktree` checkout for each ref). `okf-rs docs` reads a previously generated bundle (like `search`/`validate`/`graph`) and renders it for humans: `--format html` (the default) writes a browsable static site — one page per concept, cross-linked, plus a root index and one index per concept kind — into `docs/`; `--format markdown` writes a single consolidated `docs.md` with a table of contents instead; `--format pdf` writes a single paginated `docs.pdf` (grouped by kind, with a PDF outline/bookmark per concept for navigation) for printing, archiving, or sharing as one file. All three are templated directly from the bundle's concept data, no LLM involved. `okf-rs init` also writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md` to point AI coding agents at the bundle — pass `--no-agent-files` to skip that.
 
 ## Architecture
 

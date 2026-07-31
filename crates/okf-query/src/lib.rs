@@ -1,14 +1,53 @@
 //! Shared query layer wrapping `okf-search`/`okf-graph`/
 //! `okf_parser::read_bundle`, so `okf-cli` and `okf-mcp` express the same
-//! seven operations (search, and `okf_graph::Graph`'s six queries) exactly
-//! once — same bundle-loading, same "unknown concept id" check, same
-//! result text — instead of two independently maintained copies that can
-//! silently drift. Each caller decides how to surface the `Result` this
-//! returns: `okf-cli` prints the `Ok` text and exits non-zero on `Err`;
-//! `okf-mcp` wraps either into an MCP tool response.
+//! operations exactly once — same bundle-loading, same "unknown concept
+//! id" check, same result text — instead of two independently maintained
+//! copies that can silently drift. Each caller decides how to surface the
+//! `Result` this returns: `okf-cli` prints the `Ok` text and exits
+//! non-zero on `Err`; `okf-mcp` wraps either into an MCP tool response.
+//!
+//! # Stability
+//!
+//! Public, documented, and versioned together with the rest of the
+//! `okf-rs` workspace, the same as `okf-graph` (see that crate's own
+//! `# Stability` section) — not just an internal detail of
+//! `okf-cli`/`okf-mcp`. Most of these functions (`search`,
+//! `graph_callers`, ...) return pre-formatted text, which is the right
+//! shape for a CLI/MCP caller but not for a Rust tool that wants to work
+//! with the data directly. The two operations that compute real
+//! aggregated data rather than just relaying `okf-graph`/`okf-search`
+//! results — [`coverage`] and [`graph_stats`] — additionally expose that
+//! data as a plain struct (`Serialize`, so it's JSON-embeddable too) via
+//! [`coverage_report`] and [`graph_stats_report`]; everywhere else, embed
+//! `okf_graph::Graph`/`okf_search::SearchIndex`/`FullTextIndex` directly,
+//! which already return structured, borrowed data rather than text.
+//!
+//! # Example
+//!
+//! ```
+//! # use std::fs;
+//! # let dir = std::env::temp_dir().join(format!("okf-query-doctest-{}", std::process::id()));
+//! # let _ = fs::remove_dir_all(&dir);
+//! # fs::create_dir_all(dir.join("functions")).unwrap();
+//! # fs::write(
+//! #     dir.join("functions/f.md"),
+//! #     "---\ntype: Rust Function\ntitle: f\nresource: src/lib.rs#L1\n---\n\nbody\n",
+//! # ).unwrap();
+//! // A Rust tool embedding okf-query directly gets a typed report, not
+//! // text to re-parse.
+//! let report = okf_query::coverage_report(&dir)?;
+//! assert_eq!(report.total_concepts, 1);
+//! # fs::remove_dir_all(&dir).unwrap();
+//! # Ok::<(), anyhow::Error>(())
+//! ```
+
+#![deny(missing_docs)]
 
 use anyhow::{anyhow, Result};
 use okf_parser::{Concept, ConceptKind, RelationKind};
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
 
 /// Errors if `bundle` doesn't exist yet, with a pointer to `okf-rs
@@ -56,6 +95,33 @@ pub fn search(bundle: &Path, query: &str) -> Result<String> {
             format!(
                 "{:>3}  {:<24} {:<20} {}",
                 hit.score, hit.entry.title, hit.entry.concept_type, hit.entry.id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Ranked, relevance-scored full-text search over the bundle's title,
+/// type, description, signature, and tags (via `okf_search::FullTextIndex`,
+/// backed by Tantivy). Distinct from [`search`]'s exact/substring matching:
+/// this also searches description/signature prose and orders results by
+/// relevance rather than a fixed field-priority score, so a
+/// natural-language query (e.g. "parses a jwt") can surface a concept
+/// whose *description* mentions it even when the query matches no title,
+/// type, or tag at all.
+pub fn search_ranked(bundle: &Path, query: &str) -> Result<String> {
+    require_bundle(bundle)?;
+    let index = okf_search::FullTextIndex::build(bundle)?;
+    let hits = index.search(query, 25)?;
+    if hits.is_empty() {
+        return Ok(format!("No matches for `{query}`"));
+    }
+    Ok(hits
+        .iter()
+        .map(|hit| {
+            format!(
+                "{:>6.2}  {:<24} {:<20} {}",
+                hit.score, hit.title, hit.concept_type, hit.id
             )
         })
         .collect::<Vec<_>>()
@@ -133,25 +199,90 @@ pub fn graph_isolated(bundle: &Path) -> Result<String> {
     Ok(concept_lines(&isolated))
 }
 
+/// Bundle-wide content-completeness metrics, as a plain struct rather
+/// than the pre-formatted text [`coverage`] returns — for a Rust tool
+/// that wants the numbers directly (e.g. to serve as JSON) instead of
+/// re-parsing a report meant for a terminal. `Serialize`, so it can be
+/// handed straight to `serde_json`/an HTTP response without another
+/// conversion step.
+///
+/// The call-graph-participation metric excludes `Module`/`Package`/
+/// `Document` concepts from its denominator, matching
+/// `Graph::isolated_concepts`'s own exclusion: they're structural
+/// containers or documentation that are never expected to carry a
+/// `Calls`/`CalledBy` edge, so counting them would understate coverage
+/// for reasons that have nothing to do with documentation or analysis
+/// quality.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoverageReport {
+    /// Total number of concepts in the bundle.
+    pub total_concepts: usize,
+    /// How many concepts have a non-empty `description`.
+    pub with_description: usize,
+    /// How many concepts have at least one tag.
+    pub with_tags: usize,
+    /// Call-graph participation, or `None` when there are no non-
+    /// `Module`/`Package`/`Document` concepts to measure it against (the
+    /// "N/A" case in [`coverage`]'s rendered text) — a bundle made only
+    /// of structural containers/documentation has nothing this metric
+    /// could report on.
+    pub graph_participation: Option<GraphParticipation>,
+}
+
+/// How much of a bundle's call-graph-eligible concepts (everything
+/// except `Module`/`Package`/`Document`) actually participate in the
+/// `Calls`/`CalledBy` graph — see [`CoverageReport::graph_participation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GraphParticipation {
+    /// Concepts with at least one `Calls`/`CalledBy` edge.
+    pub connected: usize,
+    /// Concepts eligible to participate at all (excludes
+    /// `Module`/`Package`/`Document`).
+    pub eligible: usize,
+}
+
+impl fmt::Display for CoverageReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.total_concepts == 0 {
+            return write!(f, "Bundle has no concepts");
+        }
+        let graph_line = match self.graph_participation {
+            None => "  N/A (no non-Module/Package/Document concepts to measure) participate in the call graph"
+                .to_string(),
+            Some(GraphParticipation { connected, eligible }) => format!(
+                "  {}% ({connected}/{eligible}) participate in the call graph (excludes Module/Package/Document; see `graph isolated` for the rest)",
+                percent(connected, eligible)
+            ),
+        };
+        write!(
+            f,
+            "{} concepts\n  {}% ({}/{}) have a description\n  {}% ({}/{}) have at least one tag\n{graph_line}",
+            self.total_concepts,
+            percent(self.with_description, self.total_concepts),
+            self.with_description,
+            self.total_concepts,
+            percent(self.with_tags, self.total_concepts),
+            self.with_tags,
+            self.total_concepts,
+        )
+    }
+}
+
 /// Bundle-wide content-completeness metrics: how much of the knowledge
 /// base is actually filled in, as distinct from `okf-rs validate`'s
 /// pass/fail structural checks. Computed entirely from the bundle
 /// already on disk (via [`load_concepts`]/[`okf_graph::Graph`]) — no
 /// re-scan of the source project, so there's no second source of truth
-/// to keep in sync.
-///
-/// The call-graph-participation metric excludes `Module`/`Package`
-/// concepts from its denominator, matching `Graph::isolated_concepts`'s
-/// own exclusion: they're structural containers that are never expected
-/// to carry a `Calls`/`CalledBy` edge, so counting them would understate
-/// coverage for reasons that have nothing to do with documentation or
-/// analysis quality.
+/// to keep in sync. See [`coverage_report`] for the same data as a typed
+/// struct instead of this rendered text.
 pub fn coverage(bundle: &Path) -> Result<String> {
+    Ok(coverage_report(bundle)?.to_string())
+}
+
+/// The data behind [`coverage`], as a [`CoverageReport`] instead of text.
+pub fn coverage_report(bundle: &Path) -> Result<CoverageReport> {
     let concepts = load_concepts(bundle)?;
-    if concepts.is_empty() {
-        return Ok("Bundle has no concepts".to_string());
-    }
-    let total = concepts.len();
+    let total_concepts = concepts.len();
     let with_description = concepts
         .iter()
         .filter(|c| {
@@ -168,31 +299,31 @@ pub fn coverage(bundle: &Path) -> Result<String> {
         .iter()
         .map(|c| c.id.as_str())
         .collect();
-    let graph_eligible = concepts
+    let eligible = concepts
         .iter()
-        .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package))
+        .filter(|c| !okf_graph::is_structural(c.kind))
         .count();
-    let graph_connected = concepts
+    let connected = concepts
         .iter()
-        .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package))
+        .filter(|c| !okf_graph::is_structural(c.kind))
         .filter(|c| !isolated.contains(c.id.as_str()))
         .count();
 
-    let graph_line = if graph_eligible == 0 {
-        "  N/A (no non-Module/Package concepts to measure) participate in the call graph"
-            .to_string()
+    let graph_participation = if eligible == 0 {
+        None
     } else {
-        format!(
-            "  {}% ({graph_connected}/{graph_eligible}) participate in the call graph (excludes Module/Package; see `graph isolated` for the rest)",
-            percent(graph_connected, graph_eligible)
-        )
+        Some(GraphParticipation {
+            connected,
+            eligible,
+        })
     };
 
-    Ok(format!(
-        "{total} concepts\n  {}% ({with_description}/{total}) have a description\n  {}% ({with_tags}/{total}) have at least one tag\n{graph_line}",
-        percent(with_description, total),
-        percent(with_tags, total),
-    ))
+    Ok(CoverageReport {
+        total_concepts,
+        with_description,
+        with_tags,
+        graph_participation,
+    })
 }
 
 fn percent(part: usize, total: usize) -> usize {
@@ -214,62 +345,105 @@ pub fn graph_modules(bundle: &Path) -> Result<String> {
         .join("\n"))
 }
 
-/// Bundle-wide graph topology metrics: concept-kind breakdown, edge
-/// counts per relationship kind, and connected components of the
-/// `Calls`/`CalledBy` graph. Edges are counted per kind rather than as a
-/// single total, to sidestep the ambiguous question of whether a
-/// resolved `Calls`/`CalledBy` pair is one edge or two.
+/// Bundle-wide graph topology metrics, as a plain struct rather than the
+/// pre-formatted text [`graph_stats`] returns — see [`CoverageReport`]
+/// for why. Edges are counted per kind rather than as a single total, to
+/// sidestep the ambiguous question of whether a resolved `Calls`/
+/// `CalledBy` pair is one edge or two.
 ///
 /// Deliberately doesn't report a "depth" metric: the call graph isn't
 /// guaranteed acyclic (see `graph_cycles`), so there's no single
 /// well-defined notion of depth to report without first committing to a
 /// much narrower definition than the word implies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GraphStatsReport {
+    /// Total number of concepts in the bundle.
+    pub total_concepts: usize,
+    /// Concept count by kind (`Function`, `Struct`, `Module`, ...).
+    pub by_kind: BTreeMap<ConceptKind, usize>,
+    /// Relationship edge count by kind (`Calls`, `Imports`, ...).
+    pub by_relation: BTreeMap<RelationKind, usize>,
+    /// Connected components of the undirected `Calls`/`CalledBy` graph
+    /// (see `Graph::connected_components`), each as a sorted list of
+    /// concept ids.
+    pub components: Vec<Vec<String>>,
+    /// Concepts with no `Calls`/`CalledBy` edge in either direction.
+    pub isolated_count: usize,
+}
+
+impl fmt::Display for GraphStatsReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = format!("{} concepts\n\nBy kind:\n", self.total_concepts);
+        for (kind, count) in &self.by_kind {
+            out.push_str(&format!("  {:<12} {count}\n", kind.as_str()));
+        }
+
+        out.push_str("\nRelationship edges by kind:\n");
+        if self.by_relation.is_empty() {
+            out.push_str("  (none)\n");
+        } else {
+            for (kind, count) in &self.by_relation {
+                out.push_str(&format!("  {:<12} {count}\n", kind.label()));
+            }
+        }
+
+        out.push_str(&format!(
+            "\nCall graph: {} connected component(s) with at least one Calls/CalledBy edge (sizes shown below — a lone self-recursive concept forms its own size-1 component), {} isolated concept(s) with no edge at all (see `graph isolated`)\n",
+            self.components.len(),
+            self.isolated_count
+        ));
+        for component in &self.components {
+            out.push_str(&format!(
+                "  [{}] {}\n",
+                component.len(),
+                component.join(", ")
+            ));
+        }
+
+        f.write_str(out.trim_end())
+    }
+}
+
+/// Bundle-wide graph topology metrics: concept-kind breakdown, edge
+/// counts per relationship kind, and connected components of the
+/// `Calls`/`CalledBy` graph. See [`graph_stats_report`] for the same
+/// data as a typed struct instead of this rendered text.
 pub fn graph_stats(bundle: &Path) -> Result<String> {
+    Ok(graph_stats_report(bundle)?.to_string())
+}
+
+/// The data behind [`graph_stats`], as a [`GraphStatsReport`] instead of
+/// text.
+pub fn graph_stats_report(bundle: &Path) -> Result<GraphStatsReport> {
     let concepts = load_concepts(bundle)?;
     let graph = okf_graph::Graph::build(&concepts);
 
-    let mut by_kind: std::collections::BTreeMap<ConceptKind, usize> = Default::default();
+    let mut by_kind: BTreeMap<ConceptKind, usize> = Default::default();
     for c in &concepts {
         *by_kind.entry(c.kind).or_default() += 1;
     }
 
-    let mut by_relation: std::collections::BTreeMap<RelationKind, usize> = Default::default();
+    let mut by_relation: BTreeMap<RelationKind, usize> = Default::default();
     for c in &concepts {
         for rel in &c.relationships {
             *by_relation.entry(rel.kind).or_default() += 1;
         }
     }
 
-    let components = graph.connected_components();
+    let components = graph
+        .connected_components()
+        .into_iter()
+        .map(|component| component.into_iter().map(str::to_string).collect())
+        .collect();
     let isolated_count = graph.isolated_concepts().len();
 
-    let mut out = format!("{} concepts\n\nBy kind:\n", concepts.len());
-    for (kind, count) in &by_kind {
-        out.push_str(&format!("  {:<12} {count}\n", kind.as_str()));
-    }
-
-    out.push_str("\nRelationship edges by kind:\n");
-    if by_relation.is_empty() {
-        out.push_str("  (none)\n");
-    } else {
-        for (kind, count) in &by_relation {
-            out.push_str(&format!("  {:<12} {count}\n", kind.label()));
-        }
-    }
-
-    out.push_str(&format!(
-        "\nCall graph: {} connected component(s) with at least one Calls/CalledBy edge (sizes shown below — a lone self-recursive concept forms its own size-1 component), {isolated_count} isolated concept(s) with no edge at all (see `graph isolated`)\n",
-        components.len()
-    ));
-    for component in &components {
-        out.push_str(&format!(
-            "  [{}] {}\n",
-            component.len(),
-            component.join(", ")
-        ));
-    }
-
-    Ok(out.trim_end().to_string())
+    Ok(GraphStatsReport {
+        total_concepts: concepts.len(),
+        by_kind,
+        by_relation,
+        components,
+        isolated_count,
+    })
 }
 
 /// The shortest call path between two concept ids.
@@ -282,6 +456,105 @@ pub fn graph_path(bundle: &Path, from: &str, to: &str) -> Result<String> {
         Some(steps) => Ok(steps.join(" -> ")),
         None => Ok(format!("No call path found from `{from}` to `{to}`")),
     }
+}
+
+/// Each package's position in the layered architecture derived from the
+/// package dependency graph (`okf_arch::layers`) — layer 0 is a package
+/// with no dependency on any other package in the bundle. Unlike
+/// [`coverage`]/[`graph_stats`], `okf-arch`'s own [`okf_arch::PackageLayer`]
+/// is already the structured form; there's no separate `*_report`
+/// function here to duplicate it.
+pub fn graph_layers(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let graph = okf_graph::Graph::build(&concepts);
+    let layers = okf_arch::layers(&graph);
+    if layers.is_empty() {
+        return Ok("No packages found to layer (no Package concepts in the bundle)".to_string());
+    }
+    Ok(layers
+        .iter()
+        .map(|l| format!("{:<3} {}", l.layer, l.package_id))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Clusters of packages that depend on each other, directly or
+/// transitively (`okf_arch::domains`) — a package with no cross-package
+/// dependency in or out is still its own singleton domain.
+pub fn graph_domains(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let graph = okf_graph::Graph::build(&concepts);
+    let domains = okf_arch::domains(&graph);
+    if domains.is_empty() {
+        return Ok("No packages found (no Package concepts in the bundle)".to_string());
+    }
+    Ok(domains
+        .iter()
+        .enumerate()
+        .map(|(i, d)| format!("[{}] {}", i + 1, d.package_ids.join(", ")))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Design patterns detected via structural/naming heuristics
+/// (`okf_arch::detect_patterns`) — see that function's own docs for what
+/// this does and doesn't claim to detect.
+pub fn graph_patterns(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let found = okf_arch::detect_patterns(&concepts);
+    if found.is_empty() {
+        return Ok("No design patterns detected".to_string());
+    }
+    Ok(found
+        .iter()
+        .map(|p| format!("{:<10} {} — {}", p.kind.as_str(), p.concept_id, p.evidence))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// REST endpoints, database models, and event-flow participants detected
+/// via structural/naming heuristics (`okf_arch::detect_features`) — see
+/// that function's own docs for what this does and doesn't claim to
+/// detect.
+pub fn graph_features(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let found = okf_arch::detect_features(&concepts);
+    if found.is_empty() {
+        return Ok(
+            "No REST endpoints, database models, or event-flow participants detected".to_string(),
+        );
+    }
+    Ok(found
+        .iter()
+        .map(|f| format!("{:<13} {} — {}", f.kind.as_str(), f.concept_id, f.evidence))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// AI-suggested missing links between semantically close concepts —
+/// `okf_enrich::suggest_missing_links`, the one query-layer operation
+/// that needs an already-configured [`okf_enrich::EnrichClient`] rather
+/// than just a bundle path, since (unlike every other function here) it
+/// makes network calls to an OpenAI-compatible endpoint. Building that
+/// client (resolving `--enrich-*`/`OKF_ENRICH_*` config) is the caller's
+/// job, the same way `okf-cli`'s `generate --enrich` already does it —
+/// this function's role is only to load the bundle and format the
+/// result, matching every other function here.
+pub fn suggest_links(
+    bundle: &Path,
+    client: &okf_enrich::EnrichClient,
+    max_candidates: usize,
+) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let suggestions = okf_enrich::suggest_missing_links(client, &concepts, max_candidates)?;
+    if suggestions.is_empty() {
+        return Ok("No missing links suggested".to_string());
+    }
+    Ok(suggestions
+        .iter()
+        .map(|s| format!("{} <-> {}: {}", s.from_id, s.to_id, s.reason))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn concept_lines(concepts: &[&Concept]) -> String {
@@ -324,6 +597,73 @@ mod tests {
         let text = search(dir.path(), "decode_jwt").unwrap();
         assert!(text.contains("decode_jwt"));
         assert!(text.contains("functions/auth/decode_jwt"));
+    }
+
+    #[test]
+    fn search_ranked_finds_a_concept_by_description_text() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/other.md",
+            "---\ntype: Rust Function\ntitle: other\ndescription: Verifies the signature on a JSON Web Token.\nresource: src/auth.rs#L20\n---\n\nbody\n",
+        );
+
+        let text = search_ranked(dir.path(), "signature").unwrap();
+        assert!(text.contains("functions/auth/other"));
+    }
+
+    #[test]
+    fn coverage_report_exposes_typed_fields_matching_the_rendered_text() {
+        let dir = sample_bundle();
+        let report = coverage_report(dir.path()).unwrap();
+        assert_eq!(report.total_concepts, 2);
+        assert_eq!(report.with_description, 0);
+        assert_eq!(report.with_tags, 0);
+        assert_eq!(
+            report.graph_participation,
+            Some(GraphParticipation {
+                connected: 2,
+                eligible: 2
+            })
+        );
+        // The struct and the text `coverage()` builds from it must agree.
+        assert_eq!(report.to_string(), coverage(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn coverage_report_serializes_to_json_for_an_embedding_tool() {
+        let dir = sample_bundle();
+        let report = coverage_report(dir.path()).unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["total_concepts"], 2);
+        assert_eq!(json["graph_participation"]["connected"], 2);
+    }
+
+    #[test]
+    fn graph_stats_report_exposes_typed_fields_matching_the_rendered_text() {
+        let dir = sample_bundle();
+        let report = graph_stats_report(dir.path()).unwrap();
+        assert_eq!(report.total_concepts, 2);
+        assert_eq!(report.by_kind.get(&ConceptKind::Function), Some(&2));
+        assert_eq!(report.by_relation.get(&RelationKind::Calls), Some(&1));
+        assert_eq!(report.isolated_count, 0);
+        assert_eq!(report.components.len(), 1);
+        assert_eq!(report.to_string(), graph_stats(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn graph_stats_report_serializes_to_json_for_an_embedding_tool() {
+        let dir = sample_bundle();
+        let report = graph_stats_report(dir.path()).unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["total_concepts"], 2);
+        assert_eq!(json["isolated_count"], 0);
+    }
+
+    #[test]
+    fn search_ranked_missing_bundle_points_at_generate() {
+        let err = search_ranked(Path::new("/nonexistent"), "x").unwrap_err();
+        assert!(err.to_string().contains("okf-rs generate"));
     }
 
     #[test]
@@ -415,7 +755,7 @@ mod tests {
         let text = coverage(dir.path()).unwrap();
         assert!(text.starts_with("2 concepts"));
         assert!(
-            text.contains("N/A (no non-Module/Package concepts to measure) participate in the call graph"),
+            text.contains("N/A (no non-Module/Package/Document concepts to measure) participate in the call graph"),
             "a bundle with nothing but Module/Package concepts should report N/A, not a misleading 0%: {text}"
         );
         assert!(!text.contains("0% (0/0)"));
@@ -504,6 +844,150 @@ mod tests {
         assert_eq!(
             graph_isolated(dir.path()).unwrap(),
             "No isolated concepts found"
+        );
+    }
+
+    #[test]
+    fn graph_layers_and_domains_report_none_found_without_any_package() {
+        let dir = sample_bundle();
+        assert_eq!(
+            graph_layers(dir.path()).unwrap(),
+            "No packages found to layer (no Package concepts in the bundle)"
+        );
+        assert_eq!(
+            graph_domains(dir.path()).unwrap(),
+            "No packages found (no Package concepts in the bundle)"
+        );
+    }
+
+    #[test]
+    fn graph_layers_and_domains_report_a_two_package_dependency() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "packages/core.md",
+            "---\ntype: Rust Package\ntitle: core\nresource: core/Cargo.toml\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "packages/app.md",
+            "---\ntype: Rust Package\ntitle: app\nresource: app/Cargo.toml\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "modules/core.md",
+            "---\ntype: Rust Module\ntitle: core\nresource: core/src/lib.rs#L1\nrelationships:\n  member_of:\n    - packages/core\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "modules/app.md",
+            "---\ntype: Rust Module\ntitle: app\nresource: app/src/lib.rs#L1\nrelationships:\n  member_of:\n    - packages/app\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/app_fn.md",
+            "---\ntype: Rust Function\ntitle: app_fn\nresource: app/src/lib.rs#L1\nrelationships:\n  calls:\n    - functions/core_fn\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/core_fn.md",
+            "---\ntype: Rust Function\ntitle: core_fn\nresource: core/src/lib.rs#L1\n---\n\nbody\n",
+        );
+
+        let layers = graph_layers(dir.path()).unwrap();
+        assert!(layers.contains("0   packages/core"));
+        assert!(layers.contains("1   packages/app"));
+
+        let domains = graph_domains(dir.path()).unwrap();
+        assert!(domains.contains("packages/app, packages/core"));
+    }
+
+    #[test]
+    fn graph_patterns_finds_a_builder() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "classes/RequestBuilder.md",
+            "---\ntype: Rust Class\ntitle: RequestBuilder\nresource: src/req.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/RequestBuilder/build.md",
+            "---\ntype: Rust Method\ntitle: build\nresource: src/req.rs#L5\n---\n\nbody\n",
+        );
+
+        let text = graph_patterns(dir.path()).unwrap();
+        assert!(text.contains("Builder"));
+        assert!(text.contains("classes/RequestBuilder"));
+    }
+
+    #[test]
+    fn graph_patterns_reports_none_found_when_there_are_no_matches() {
+        let dir = sample_bundle();
+        assert_eq!(
+            graph_patterns(dir.path()).unwrap(),
+            "No design patterns detected"
+        );
+    }
+
+    #[test]
+    fn graph_features_finds_a_database_model() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "classes/UserModel.md",
+            "---\ntype: Rust Class\ntitle: UserModel\nresource: src/models.rs#L1\n---\n\nbody\n",
+        );
+
+        let text = graph_features(dir.path()).unwrap();
+        assert!(text.contains("DatabaseModel"));
+        assert!(text.contains("classes/UserModel"));
+    }
+
+    #[test]
+    fn graph_features_reports_none_found_when_there_are_no_matches() {
+        let dir = sample_bundle();
+        assert_eq!(
+            graph_features(dir.path()).unwrap(),
+            "No REST endpoints, database models, or event-flow participants detected"
+        );
+    }
+
+    #[test]
+    fn suggest_links_reports_a_suggestion_from_the_endpoint() {
+        use okf_enrich::test_support::{client_for, start_mock_server};
+
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/other.md",
+            "---\ntype: Rust Function\ntitle: other\ndescription: Reads an auth token from the request header.\nresource: src/auth.rs#L20\n---\n\nbody\n",
+        );
+
+        let server = start_mock_server("looks related");
+        let client = client_for(&server);
+
+        let text = suggest_links(dir.path(), &client, 5).unwrap();
+        assert!(text.contains("looks related"));
+    }
+
+    #[test]
+    fn suggest_links_reports_none_found_when_the_model_says_no() {
+        use okf_enrich::test_support::{client_for, start_mock_server};
+
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/other.md",
+            "---\ntype: Rust Function\ntitle: other\ndescription: Reads an auth token from the request header.\nresource: src/auth.rs#L20\n---\n\nbody\n",
+        );
+
+        let server = start_mock_server("NO");
+        let client = client_for(&server);
+
+        assert_eq!(
+            suggest_links(dir.path(), &client, 5).unwrap(),
+            "No missing links suggested"
         );
     }
 }

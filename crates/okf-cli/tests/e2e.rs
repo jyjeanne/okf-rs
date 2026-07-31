@@ -14,10 +14,12 @@
 //! other across parallel tests.
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 fn bin_path() -> PathBuf {
@@ -265,6 +267,105 @@ fn standalone_binary_runs_the_full_command_surface_against_this_project() {
     );
     assert_success(&docs_html, &["docs html"]);
     assert!(project.join("docs-site/index.html").exists());
+
+    // docs --format pdf: a single paginated PDF.
+    let docs_pdf = run(
+        &project,
+        &[
+            "docs",
+            "--project",
+            ".",
+            "--format",
+            "pdf",
+            "--output",
+            "docs.pdf",
+        ],
+    );
+    assert_success(&docs_pdf, &["docs pdf"]);
+    let docs_pdf_path = project.join("docs.pdf");
+    let pdf_bytes = fs::read(&docs_pdf_path).unwrap();
+    assert!(
+        pdf_bytes.starts_with(b"%PDF-"),
+        "expected a well-formed PDF header"
+    );
+    assert!(pdf_bytes.len() > 1000, "suspiciously small PDF output");
+
+    // docs --format dita: one DITA topic per concept plus a root map.
+    let docs_dita = run(
+        &project,
+        &[
+            "docs",
+            "--project",
+            ".",
+            "--format",
+            "dita",
+            "--output",
+            "docs-dita",
+        ],
+    );
+    assert_success(&docs_dita, &["docs dita"]);
+    assert!(project.join("docs-dita/root.ditamap").exists());
+}
+
+/// `okf-rs generate --dita` imports a DITA corpus as `Document` concepts,
+/// merged into the same bundle as concepts extracted from source — and,
+/// since export and import are the two halves of one converter, this
+/// exercises them together: export a tiny bundle to DITA, then import
+/// that exact output back into a second project's `generate --dita` run.
+#[test]
+fn standalone_binary_generate_dita_imports_topics_as_document_concepts() {
+    let workspace = tempfile::tempdir().unwrap();
+
+    let source_project = workspace.path().join("source");
+    fs::create_dir_all(source_project.join("src")).unwrap();
+    fs::write(
+        source_project.join("src/lib.rs"),
+        "pub fn hello() -> &'static str {\n    \"hello\"\n}\n",
+    )
+    .unwrap();
+    let generate = run(&source_project, &["generate", "."]);
+    assert_success(&generate, &["generate (source project)"]);
+
+    let dita_dir = workspace.path().join("dita-export");
+    let export = run(
+        &source_project,
+        &[
+            "docs",
+            "--project",
+            ".",
+            "--format",
+            "dita",
+            "--output",
+            dita_dir.to_str().unwrap(),
+        ],
+    );
+    assert_success(&export, &["docs --format dita"]);
+
+    let target_project = workspace.path().join("target");
+    fs::create_dir_all(target_project.join("src")).unwrap();
+    fs::write(
+        target_project.join("src/lib.rs"),
+        "pub fn world() -> &'static str {\n    \"world\"\n}\n",
+    )
+    .unwrap();
+    let import = run(
+        &target_project,
+        &["generate", ".", "--dita", dita_dir.to_str().unwrap()],
+    );
+    assert_success(&import, &["generate --dita"]);
+    let import_out = stdout_of(&import);
+    assert!(import_out.contains("Imported 2 DITA topics as Document concepts"));
+    assert!(import_out.contains("Document     2"));
+
+    let validate = run(&target_project, &["validate", "--project", "."]);
+    assert_success(&validate, &["validate"]);
+    assert!(stdout_of(&validate).contains("no issues found"));
+
+    // The imported Document concept is searchable alongside the target
+    // project's own extracted code, not living in a separate system.
+    let search = run(&target_project, &["search", "hello", "--project", "."]);
+    assert_success(&search, &["search"]);
+    assert!(stdout_of(&search).contains("DITA Document"));
 }
 
 /// `okf-rs diff` compares two git refs' OKF concepts via disposable
@@ -474,6 +575,236 @@ fn standalone_binary_watch_regenerates_the_bundle_on_startup() {
         "expected the baseline regenerate to be reported, got: {lines:?}"
     );
     assert!(project.join("knowledge/index.md").exists());
+}
+
+/// A minimal, single-endpoint OpenAI-compatible mock server: reads one
+/// HTTP/1.1 request off each accepted connection, ignores everything
+/// about it except that it arrived, and replies with a canned
+/// `chat.completions`-shaped JSON body — enough for `okf-rs generate
+/// --enrich` to point its `--enrich-base-url` at, without a real network
+/// call or a real LLM in the test environment.
+fn start_mock_enrich_server(reply_content: &'static str) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&request_count);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line.trim_end().is_empty() {
+                    break;
+                }
+                if let Some(value) = line.trim_end().strip_prefix("Content-Length: ") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+
+            let payload =
+                format!(r#"{{"choices":[{{"message":{{"content":"{reply_content}"}}}}]}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    (format!("http://127.0.0.1:{port}/v1"), request_count)
+}
+
+/// `okf-rs generate --enrich` fills in missing function/module
+/// descriptions via an OpenAI-compatible endpoint, and a second run
+/// against the same output reuses them from the bundle already on disk
+/// instead of re-querying the (mock) endpoint.
+#[test]
+fn standalone_binary_generate_enrich_fills_descriptions_and_a_second_run_reuses_them() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn undocumented() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
+
+    let (base_url, request_count) = start_mock_enrich_server("a generated description");
+    let enrich_args = [
+        "generate",
+        ".",
+        "--enrich",
+        "--enrich-base-url",
+        &base_url,
+        "--enrich-model",
+        "test-model",
+    ];
+
+    // The tiny fixture above has two enrichable concepts: the `src/lib.rs`
+    // Module, and the `undocumented` Function (no manifest, so no Package).
+    let first = run(&project, &enrich_args);
+    assert_success(&first, &["generate --enrich"]);
+    let first_out = stdout_of(&first);
+    assert!(first_out.contains("Enriched 2 concepts (2 generated, 0 reused"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let bundle_file = project.join("knowledge/functions/src/undocumented.md");
+    let content = fs::read_to_string(&bundle_file).unwrap();
+    assert!(content.contains("description: a generated description"));
+
+    // A second run: the concepts still have no doc comment in source, but
+    // the bundle written above already carries a description for both,
+    // so they must be reused rather than triggering another mock-server
+    // call.
+    let second = run(&project, &enrich_args);
+    assert_success(&second, &["generate --enrich (second run)"]);
+    let second_out = stdout_of(&second);
+    assert!(second_out.contains("Enriched 2 concepts (0 generated, 2 reused"));
+    assert_eq!(
+        request_count.load(Ordering::SeqCst),
+        2,
+        "the second run should not have queried the enrichment endpoint again"
+    );
+
+    let validate = run(&project, &["validate", "--project", "."]);
+    assert_success(&validate, &["validate"]);
+    assert!(stdout_of(&validate).contains("no issues found"));
+}
+
+/// `--enrich` without an endpoint configured (no `--enrich-base-url`/
+/// `--enrich-model`, no matching env var) is a clear, non-zero-exit
+/// error naming both the flag and its env var fallback — not a panic or
+/// an opaque network error from a client that was never configured.
+#[test]
+fn standalone_binary_generate_enrich_without_an_endpoint_is_a_clear_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path();
+    fs::write(project.join("lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let result = Command::new(bin_path())
+        .args(["generate", ".", "--enrich"])
+        .current_dir(project)
+        .env_remove("OKF_ENRICH_BASE_URL")
+        .env_remove("OKF_ENRICH_MODEL")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let stderr = stderr_of(&result);
+    assert!(stderr.contains("--enrich-base-url"));
+    assert!(stderr.contains("OKF_ENRICH_BASE_URL"));
+}
+
+/// A late `--enrich` failure (the endpoint is configured but unreachable,
+/// so it fails partway through — after analysis, and potentially after
+/// enriching some concepts already) must not discard the analysis work
+/// that already happened: the bundle is still written to disk from
+/// whatever `result.concepts` ended up with, and only the exit code and
+/// stderr report the enrichment failure.
+#[test]
+fn standalone_binary_generate_enrich_endpoint_failure_still_writes_the_bundle() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn undocumented() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
+
+    // A `127.0.0.1` port nothing is listening on: connection refused, the
+    // same shape of failure a real unreachable/misconfigured endpoint
+    // would produce.
+    let result = Command::new(bin_path())
+        .args([
+            "generate",
+            ".",
+            "--enrich",
+            "--enrich-base-url",
+            "http://127.0.0.1:1/v1",
+            "--enrich-model",
+            "test-model",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+
+    let bundle_file = project.join("knowledge/functions/src/undocumented.md");
+    assert!(
+        bundle_file.exists(),
+        "the analysis result must still be written even though enrichment failed"
+    );
+    let content = fs::read_to_string(&bundle_file).unwrap();
+    assert!(!content.contains("description:"));
+
+    assert!(project.join(".okf-cache.json").exists());
+}
+
+/// `okf-rs suggest-links` builds on `--enrich`: after descriptions exist
+/// (via `generate --enrich`), it finds full-text-search candidates with
+/// no existing relationship and asks the (mock) endpoint whether each
+/// looks like a genuinely missing link.
+#[test]
+fn standalone_binary_suggest_links_reports_a_suggestion_from_the_endpoint() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn verify_token() -> bool {\n    true\n}\n\npub fn decode_jwt() -> i32 {\n    0\n}\n",
+    )
+    .unwrap();
+
+    // Step 1: populate descriptions so there's something for full-text
+    // search to match candidates on.
+    let (describe_url, _) = start_mock_enrich_server("handles authentication tokens");
+    let generate = run(
+        &project,
+        &[
+            "generate",
+            ".",
+            "--enrich",
+            "--enrich-base-url",
+            &describe_url,
+            "--enrich-model",
+            "test-model",
+        ],
+    );
+    assert_success(&generate, &["generate --enrich"]);
+
+    // Step 2: suggest-links, against a second mock endpoint that always
+    // says the candidate pair looks related.
+    let (suggest_url, suggest_requests) = start_mock_enrich_server("these likely belong together");
+    let suggest = run(
+        &project,
+        &[
+            "suggest-links",
+            "--project",
+            ".",
+            "--enrich-base-url",
+            &suggest_url,
+            "--enrich-model",
+            "test-model",
+        ],
+    );
+    assert_success(&suggest, &["suggest-links"]);
+    let out = stdout_of(&suggest);
+    assert!(out.contains("these likely belong together"));
+    assert!(
+        suggest_requests.load(Ordering::SeqCst) > 0,
+        "expected at least one candidate to be judged"
+    );
 }
 
 /// Commands that read an existing bundle fail with a clear, non-zero-exit

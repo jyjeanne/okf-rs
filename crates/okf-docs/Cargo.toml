@@ -10,6 +10,12 @@ description = "Static HTML and consolidated Markdown documentation generation fo
 okf-parser.workspace = true
 okf-render.workspace = true
 anyhow.workspace = true
+# Pinned below the current 0.12: every version from 0.8 onward pulls in
+# azul-layout (a CSS layout engine) by default, dependency weight this
+# crate's write-only PDF export has no use for. See .cargo/audit.toml for
+# the resulting RUSTSEC-2026-0187 (lopdf) ignore entry and why it's not
+# exploitable via this crate's actual usage.
+printpdf = "0.7"
 
 [dev-dependencies]
 tempfile = "3"

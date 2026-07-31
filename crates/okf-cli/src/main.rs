@@ -59,6 +59,36 @@ enum Command {
         /// than a plain `generate`.
         #[arg(long)]
         lsp: bool,
+        /// Fill in missing function/method/module/package descriptions
+        /// via an OpenAI-compatible chat completions endpoint (Ollama, LM
+        /// Studio, LocalAI, Crustly, or a cloud provider). A concept that
+        /// already has a description — including one from a previous
+        /// `--enrich` run, carried forward from the existing bundle at
+        /// `--output` — is never re-queried or overwritten. Requires
+        /// `--enrich-base-url`/`--enrich-model` (or the
+        /// `OKF_ENRICH_BASE_URL`/`OKF_ENRICH_MODEL` environment variables).
+        #[arg(long)]
+        enrich: bool,
+        /// Enrichment endpoint base URL, e.g. `http://localhost:11434/v1`
+        /// for Ollama. Falls back to `OKF_ENRICH_BASE_URL` if unset.
+        #[arg(long)]
+        enrich_base_url: Option<String>,
+        /// Enrichment model name, e.g. `llama3.1`. Falls back to
+        /// `OKF_ENRICH_MODEL` if unset.
+        #[arg(long)]
+        enrich_model: Option<String>,
+        /// Enrichment endpoint API key, sent as `Authorization: Bearer
+        /// <key>`. Omit for a local server that doesn't need one. Falls
+        /// back to `OKF_ENRICH_API_KEY` if unset.
+        #[arg(long)]
+        enrich_api_key: Option<String>,
+        /// Also import an existing DITA XML corpus (a directory of
+        /// `.dita`/`.xml` topic files, or a single file) as `Document`
+        /// concepts, merged into the same bundle alongside the concepts
+        /// extracted from source code. A topic that fails to parse is
+        /// skipped with a warning rather than failing the whole command.
+        #[arg(long)]
+        dita: Option<PathBuf>,
     },
     /// Watch a project and keep its OKF bundle up to date as files change.
     /// Runs until interrupted (Ctrl+C). Regenerates once immediately, then
@@ -94,6 +124,12 @@ enum Command {
         /// Project directory to look up `okf.toml` in (not the bundle itself).
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
+        /// Use ranked, relevance-scored full-text search (via Tantivy)
+        /// instead of exact/substring matching. Also searches
+        /// description/signature text, not just title/type/tags — better
+        /// for a natural-language query than an exact symbol name.
+        #[arg(long)]
+        ranked: bool,
     },
     /// Report content-completeness metrics for a bundle: description/tag
     /// coverage, and how much of the bundle participates in the call
@@ -105,6 +141,39 @@ enum Command {
         /// Project directory to look up `okf.toml` in (not the bundle itself).
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
+    },
+    /// AI-suggested missing relationship links between semantically close
+    /// concepts that aren't already connected — advisory only, nothing is
+    /// written back into the bundle. Builds on the same OpenAI-compatible
+    /// endpoint `generate --enrich` uses: candidates are generated for
+    /// free via full-text search (`search --ranked`'s own index), and
+    /// only those candidates are sent to the endpoint for a yes/no
+    /// judgment, so this is bounded by the bundle's described-concept
+    /// count, not every possible pair.
+    SuggestLinks {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+        /// Enrichment endpoint base URL, e.g. `http://localhost:11434/v1`
+        /// for Ollama. Falls back to `OKF_ENRICH_BASE_URL` if unset.
+        #[arg(long)]
+        enrich_base_url: Option<String>,
+        /// Enrichment model name, e.g. `llama3.1`. Falls back to
+        /// `OKF_ENRICH_MODEL` if unset.
+        #[arg(long)]
+        enrich_model: Option<String>,
+        /// Enrichment endpoint API key, sent as `Authorization: Bearer
+        /// <key>`. Falls back to `OKF_ENRICH_API_KEY` if unset.
+        #[arg(long)]
+        enrich_api_key: Option<String>,
+        /// Maximum full-text-search candidates considered per described
+        /// concept (and therefore the upper bound on endpoint calls per
+        /// concept). Kept small by default since this is O(described
+        /// concepts × candidates) network calls, not a one-off.
+        #[arg(long, default_value_t = 3)]
+        candidates: usize,
     },
     /// Query the concept graph: callers, callees, cycles, public API, and
     /// cross-module dependencies. Reads relationships directly from a
@@ -124,16 +193,17 @@ enum Command {
         path: PathBuf,
     },
     /// Generate human-readable documentation from a previously generated OKF
-    /// bundle: either a browsable static HTML site, or a single consolidated
-    /// Markdown document.
+    /// bundle: a browsable static HTML site, a single consolidated Markdown
+    /// document, a single paginated PDF, or a DITA topic set.
     Docs {
         /// Defaults to the value in `okf.toml`, or `knowledge`.
         bundle: Option<PathBuf>,
         /// Project directory to look up `okf.toml` in (not the bundle itself).
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
-        /// Output path: a directory for `--format html`, a file for
-        /// `--format markdown`. Defaults to `docs/` or `docs.md` respectively.
+        /// Output path: a directory for `--format html`/`--format dita`,
+        /// a file for `--format markdown`/`--format pdf`. Defaults to
+        /// `docs/`, `docs.md`, `docs.pdf`, or `docs-dita/` respectively.
         #[arg(short, long)]
         output: Option<PathBuf>,
         #[arg(short, long, value_enum, default_value_t = DocsFormat::Html)]
@@ -145,6 +215,8 @@ enum Command {
 enum DocsFormat {
     Html,
     Markdown,
+    Pdf,
+    Dita,
 }
 
 #[derive(Subcommand)]
@@ -220,6 +292,45 @@ enum GraphQuery {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+    /// Report each package's layer in the layered architecture derived
+    /// from the package dependency graph (layer 0 = depends on nothing
+    /// else in the bundle).
+    Layers {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// List domain boundaries: clusters of packages that depend on each
+    /// other, directly or transitively.
+    Domains {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// List design patterns detected via structural/naming heuristics
+    /// (Builder, Singleton, Factory, Visitor).
+    Patterns {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// List REST endpoints, database models, and event-flow participants
+    /// detected via structural/naming heuristics (e.g. a public method on
+    /// a `*Controller`-named type, a `*Model`/`*Entity`-named type, an
+    /// `emit_*`/`on_*`-named function).
+    Features {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -246,7 +357,24 @@ fn run(command: Command) -> Result<ExitCode> {
             output,
             no_cache,
             lsp,
-        } => cmd_generate(&path, output, no_cache, lsp),
+            enrich,
+            enrich_base_url,
+            enrich_model,
+            enrich_api_key,
+            dita,
+        } => cmd_generate(
+            &path,
+            output,
+            no_cache,
+            lsp,
+            EnrichArgs {
+                enrich,
+                base_url: enrich_base_url,
+                model: enrich_model,
+                api_key: enrich_api_key,
+            },
+            dita,
+        ),
         Command::Watch {
             path,
             output,
@@ -261,11 +389,27 @@ fn run(command: Command) -> Result<ExitCode> {
             query,
             bundle,
             project,
-        } => cmd_search(&query, bundle, &project),
+            ranked,
+        } => cmd_search(&query, bundle, &project, ranked),
         Command::Coverage { bundle, project } => {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::coverage(&bundle))
         }
+        Command::SuggestLinks {
+            bundle,
+            project,
+            enrich_base_url,
+            enrich_model,
+            enrich_api_key,
+            candidates,
+        } => cmd_suggest_links(
+            bundle,
+            &project,
+            enrich_base_url,
+            enrich_model,
+            enrich_api_key,
+            candidates,
+        ),
         Command::Graph { query } => cmd_graph(query),
         Command::Diff {
             from_ref,
@@ -356,11 +500,22 @@ fn cmd_scan(path: &std::path::Path) -> Result<ExitCode> {
 /// `.gitignore` like `target/`.
 const CACHE_FILE: &str = ".okf-cache.json";
 
+/// The `--enrich*` flags bundled together, so `cmd_generate` takes one
+/// parameter for them instead of four.
+struct EnrichArgs {
+    enrich: bool,
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+}
+
 fn cmd_generate(
     path: &std::path::Path,
     output: Option<PathBuf>,
     no_cache: bool,
     lsp: bool,
+    enrich: EnrichArgs,
+    dita: Option<PathBuf>,
 ) -> Result<ExitCode> {
     let project = Project::load(path)?;
     let output = resolve_bundle_arg(&project.root, output);
@@ -371,7 +526,66 @@ fn cmd_generate(
     } else {
         okf_analyzer::AnalysisCache::load(&cache_path)
     };
-    let (result, stats) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache, lsp)?;
+    let (mut result, stats) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache, lsp)?;
+
+    let dita_imported = if let Some(dita_path) = &dita {
+        let (concepts, skipped) = okf_dita::import_dita(dita_path)
+            .with_context(|| format!("failed to import DITA corpus at {}", dita_path.display()))?;
+        for skip in &skipped {
+            eprintln!("warning: skipped DITA topic {skip}");
+        }
+        let imported = concepts.len();
+        result.concepts.extend(concepts);
+        Some(imported)
+    } else {
+        None
+    };
+
+    // A config or endpoint failure here is captured rather than
+    // propagated immediately: the analysis (and any DITA import) above
+    // already did real work, and `?`-ing out of this block would discard
+    // all of it — the bundle/cache below get written from whatever
+    // `result.concepts` ended up with (unenriched, if enrichment never
+    // got to run; partially enriched, if it failed partway through)
+    // either way, and the enrichment failure itself is reported after,
+    // as a non-zero exit rather than silently swallowed.
+    let mut enrich_error: Option<anyhow::Error> = None;
+    let enrich_stats = if enrich.enrich {
+        match resolve_enrich_config(enrich.base_url, enrich.model, enrich.api_key) {
+            Ok(config) => {
+                let client = okf_enrich::EnrichClient::new(config);
+                // The bundle previously written to `output` (if any), read
+                // before `write_bundle` below overwrites it — a concept
+                // whose id already carries a description there (human-
+                // written, or from an earlier `--enrich` run) is reused
+                // instead of re-queried, since a fresh `analyze` never
+                // carries descriptions forward on its own.
+                let previous = if output.is_dir() {
+                    okf_parser::read_bundle(&output)?
+                } else {
+                    Vec::new()
+                };
+                match okf_enrich::enrich_missing_descriptions(
+                    &client,
+                    &mut result.concepts,
+                    &previous,
+                ) {
+                    Ok(stats) => Some(stats),
+                    Err(e) => {
+                        enrich_error = Some(e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                enrich_error = Some(e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     okf_generator::write_bundle(&result.concepts, &output)?;
     if !no_cache {
         cache.save(&cache_path)?;
@@ -388,10 +602,74 @@ fn cmd_generate(
         stats.reparsed,
         stats.reused
     );
+    if let Some(enrich_stats) = enrich_stats {
+        println!(
+            "Enriched {} concepts ({} generated, {} reused from the previous bundle)",
+            enrich_stats.generated + enrich_stats.reused,
+            enrich_stats.generated,
+            enrich_stats.reused
+        );
+    }
+    if let Some(imported) = dita_imported {
+        println!("Imported {imported} DITA topics as Document concepts");
+    }
     for (kind, count) in by_kind {
         println!("  {:<12} {count}", kind.as_str());
     }
+
+    if let Some(e) = enrich_error {
+        eprintln!("error: {e:#}");
+        return Ok(ExitCode::FAILURE);
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Resolves `--enrich-*` flags, falling back to the matching
+/// `OKF_ENRICH_*` environment variable, then erroring clearly (naming
+/// both the flag and the env var) if neither supplies a required value.
+/// `api_key` alone has no required fallback — a local server (Ollama, LM
+/// Studio, LocalAI) typically doesn't need one. Shared by `generate
+/// --enrich` and `suggest-links`, the two commands that talk to an
+/// enrichment endpoint.
+fn resolve_enrich_config(
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+) -> Result<okf_enrich::EnrichConfig> {
+    let base_url = base_url
+        .or_else(|| std::env::var("OKF_ENRICH_BASE_URL").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this command requires --enrich-base-url (or the OKF_ENRICH_BASE_URL environment variable)"
+            )
+        })?;
+    let model = model
+        .or_else(|| std::env::var("OKF_ENRICH_MODEL").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this command requires --enrich-model (or the OKF_ENRICH_MODEL environment variable)"
+            )
+        })?;
+    let api_key = api_key.or_else(|| std::env::var("OKF_ENRICH_API_KEY").ok());
+    Ok(okf_enrich::EnrichConfig {
+        base_url,
+        model,
+        api_key,
+    })
+}
+
+fn cmd_suggest_links(
+    bundle: Option<PathBuf>,
+    project: &std::path::Path,
+    enrich_base_url: Option<String>,
+    enrich_model: Option<String>,
+    enrich_api_key: Option<String>,
+    candidates: usize,
+) -> Result<ExitCode> {
+    let bundle = resolve_query_bundle(bundle, project);
+    let config = resolve_enrich_config(enrich_base_url, enrich_model, enrich_api_key)?;
+    let client = okf_enrich::EnrichClient::new(config);
+    print_query_result(okf_query::suggest_links(&bundle, &client, candidates))
 }
 
 fn cmd_watch(
@@ -493,9 +771,18 @@ fn print_query_result(result: Result<String>) -> Result<ExitCode> {
     }
 }
 
-fn cmd_search(query: &str, bundle: Option<PathBuf>, project: &std::path::Path) -> Result<ExitCode> {
+fn cmd_search(
+    query: &str,
+    bundle: Option<PathBuf>,
+    project: &std::path::Path,
+    ranked: bool,
+) -> Result<ExitCode> {
     let bundle = resolve_query_bundle(bundle, project);
-    print_query_result(okf_query::search(&bundle, query))
+    if ranked {
+        print_query_result(okf_query::search_ranked(&bundle, query))
+    } else {
+        print_query_result(okf_query::search(&bundle, query))
+    }
 }
 
 fn analyze_path(path: &std::path::Path) -> Result<okf_analyzer::AnalysisResult> {
@@ -550,6 +837,22 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::graph_path(&bundle, &from, &to))
         }
+        GraphQuery::Layers { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_layers(&bundle))
+        }
+        GraphQuery::Domains { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_domains(&bundle))
+        }
+        GraphQuery::Patterns { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_patterns(&bundle))
+        }
+        GraphQuery::Features { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_features(&bundle))
+        }
     }
 }
 
@@ -578,6 +881,26 @@ fn cmd_docs(
                 .with_context(|| format!("failed to write {}", output.display()))?;
             println!(
                 "Generated Markdown documentation for {} concepts into {}",
+                concepts.len(),
+                output.display()
+            );
+        }
+        DocsFormat::Pdf => {
+            let output = output.unwrap_or_else(|| PathBuf::from("docs.pdf"));
+            let pdf = okf_docs::generate_pdf(&concepts)?;
+            std::fs::write(&output, pdf)
+                .with_context(|| format!("failed to write {}", output.display()))?;
+            println!(
+                "Generated PDF documentation for {} concepts into {}",
+                concepts.len(),
+                output.display()
+            );
+        }
+        DocsFormat::Dita => {
+            let output = output.unwrap_or_else(|| PathBuf::from("docs-dita"));
+            okf_dita::export_dita(&concepts, &output)?;
+            println!(
+                "Generated DITA documentation for {} concepts into {}",
                 concepts.len(),
                 output.display()
             );

@@ -73,6 +73,34 @@ pub fn capitalize(s: &str) -> String {
     }
 }
 
+/// The relationship kinds every per-concept renderer (`okf-docs`'s HTML
+/// and consolidated Markdown, `okf-dita`'s DITA topics) lists as its own
+/// heading, in the same fixed display order.
+pub const RELATIONSHIP_HEADINGS: [(RelationKind, &str); 7] = [
+    (RelationKind::Imports, "Imports"),
+    (RelationKind::Calls, "Calls"),
+    (RelationKind::CalledBy, "Called by"),
+    (RelationKind::Implements, "Implements"),
+    (RelationKind::Inherits, "Inherits"),
+    (RelationKind::DependsOn, "Depends on"),
+    (RelationKind::MemberOf, "Member of"),
+];
+
+/// Escapes text for safe inclusion in HTML or XML markup — signatures
+/// routinely contain `<`/`>`/`&` on their own merits (Rust/C#/Kotlin
+/// generics, C++ templates, comparisons), not just from adversarial
+/// input, so every piece of concept-derived text must go through this
+/// before being embedded in a page or topic. `&#39;` is the numeric
+/// apostrophe reference valid in both HTML and XML, unlike the named
+/// `&apos;` entity HTML doesn't recognize.
+pub fn escape_markup(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

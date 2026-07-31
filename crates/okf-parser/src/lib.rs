@@ -24,6 +24,12 @@ pub enum Language {
     Kotlin,
     Cpp,
     Swift,
+    /// Not a programming language — the tag `okf-dita`'s importer gives a
+    /// `Document` concept read from a DITA XML topic, so a mixed
+    /// code+docs bundle's frontmatter `type` still reads as `<origin>
+    /// <kind>` (e.g. `DITA Document`) the same way every code concept's
+    /// does (e.g. `Rust Function`), rather than needing a special case.
+    Dita,
 }
 
 impl Language {
@@ -41,6 +47,7 @@ impl Language {
             Language::Kotlin => "Kotlin",
             Language::Cpp => "C++",
             Language::Swift => "Swift",
+            Language::Dita => "DITA",
         }
     }
 
@@ -82,6 +89,7 @@ impl Language {
             "Kotlin" => Some(Language::Kotlin),
             "C++" => Some(Language::Cpp),
             "Swift" => Some(Language::Swift),
+            "DITA" => Some(Language::Dita),
             _ => None,
         }
     }
@@ -107,6 +115,14 @@ pub enum ConceptKind {
     Method,
     Variable,
     Constant,
+    /// A documentation topic imported from a non-code source (currently
+    /// only `okf-dita`'s DITA importer produces these) rather than
+    /// extracted from source code. Structural like `Module`/`Package` in
+    /// the sense that it's not a call-graph participant or API surface —
+    /// see `Graph::public_api`/`Graph::isolated_concepts`, which exclude
+    /// it the same way — but it's a leaf concept, not a container: it has
+    /// no `# Contains` section of its own.
+    Document,
 }
 
 impl ConceptKind {
@@ -123,6 +139,7 @@ impl ConceptKind {
             ConceptKind::Method => "Method",
             ConceptKind::Variable => "Variable",
             ConceptKind::Constant => "Constant",
+            ConceptKind::Document => "Document",
         }
     }
 
@@ -135,6 +152,7 @@ impl ConceptKind {
             ConceptKind::Trait | ConceptKind::Interface => "interfaces",
             ConceptKind::Function | ConceptKind::Method => "functions",
             ConceptKind::Variable | ConceptKind::Constant => "variables",
+            ConceptKind::Document => "documents",
         }
     }
 
@@ -153,6 +171,7 @@ impl ConceptKind {
             "Method" => Some(ConceptKind::Method),
             "Variable" => Some(ConceptKind::Variable),
             "Constant" => Some(ConceptKind::Constant),
+            "Document" => Some(ConceptKind::Document),
             _ => None,
         }
     }
