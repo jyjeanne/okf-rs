@@ -9,6 +9,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase 1 — Foundations | ✅ Complete |
 | Phase 2 — Depth & Integration | ✅ Complete (11/11) |
 | Phase 3 — Search, Interop & Intelligence | ✅ Complete (15/15) |
+| Improvement Plan Delivery (competitive gap-closing) | ✅ Complete (7/7) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -167,6 +168,24 @@ Verified three ways, and the third one caught a real bug. Unit tests cover both 
 
 Finally, dogfooded end-to-end against this repository's own bundle: `okf-rs docs --format dita` on this repo's 715-concept bundle produced 715 topic files plus a `root.ditamap`; feeding that whole exported corpus into `okf-rs generate --dita <path>` against a fresh synthetic one-function project imported all 715 back as `Document` concepts with zero skips (after the doctype fix — before it, every single one was skipped, which is exactly what surfaced the bug above outside the unit tests too). The resulting 717-concept mixed code+docs bundle validated clean; `okf-rs coverage` correctly reported call-graph participation as 1/1 (excluding all 715 `Document`s and the one `Module`, not diluting the denominator); `okf-rs graph api`/`graph isolated` correctly listed only the one real function, never a documentation topic; and both `okf-rs search Domain` and `okf-rs search --ranked "package dependency graph"` correctly found and ranked `Document` concepts imported from this repo's own DITA export — proving imported documentation and extracted code genuinely share one search index, one graph, one bundle, not two parallel systems glued together at the CLI.
 
+## Improvement Plan Delivery — Competitive Gap-Closing
+
+[`docs/improvement-plan.md`](docs/improvement-plan.md) compares `okf-rs` against two adjacent codebase-knowledge-graph tools (CodeGraph, code-review-graph) and scores a set of candidate improvements GO / conditional-GO / no-go. All five items scored **GO**, plus both items scored **CONDITIONAL GO** (gated on determinism and on sequencing after change-impact analysis shipped first, respectively), are now delivered:
+
+- [x] Parallel extraction (`okf-analyzer`): per-file read+tree-sitter-parse now runs across a `rayon` thread pool, merged back in deterministic file order — makes the "Parallel" design principle real rather than aspirational, with no change to output.
+- [x] Composite `explore` query: `okf-rs explore <query>` / the `explore` MCP tool bundles a concept's signature, description, callers, callees, blast radius, public-API membership, and cycle membership into one response, instead of composing several separate `search`/`graph_*` calls.
+- [x] Change-impact analysis: a new `Graph::transitive_callers` primitive (the "blast radius" building block) plus `okf_analyzer::impact()` — scoring every added/removed/changed concept between two git refs by transitive-caller count, public-API membership, and cycle membership — and `okf-rs impact <ref-a> <ref-b>`.
+- [x] GraphML + Obsidian documentation export: `okf-rs docs --format graphml` (for Gephi/yEd/any GraphML tool) and `--format obsidian` (a vault of `[[wikilink]]`-cross-linked notes), alongside the existing HTML/Markdown/PDF/DITA formats.
+- [x] Embedding-based semantic search: `EnrichClient::embed()` against any OpenAI-compatible `/embeddings` endpoint, cosine-ranked in `okf-enrich`, exposed as `okf-rs search --semantic` and the `search_semantic` MCP tool.
+- [x] Modularity-based community detection (`okf-arch`): a deterministic greedy modularity-optimization algorithm (Clauset-Newman-Moore agglomerative merging) over weighted package-dependency edges, alongside the existing connected-components `domains()` — `okf-rs graph communities` / `graph_communities` MCP tool.
+- [x] PR review automation: `okf-rs review <ref-a> <ref-b>` renders `impact()` as a Markdown, sticky-comment-ready report (`--fail-on-risk <N>` for optional CI gating), plus [`.github/workflows/pr-review.yml`](.github/workflows/pr-review.yml), a ready-to-use GitHub Action.
+
+Verified by dogfooding: two `--no-cache` runs of the now-parallelized extraction produce byte-identical bundles on this repository's own ~850-concept source tree, confirming parallelism changed performance, not output. `okf-rs graph communities` demonstrates the exact gap the improvement plan named: on this repo's own 18-crate dependency graph, `graph domains` (plain connected components) collapses everything into one component, while `graph communities` splits it into three meaningful clusters — and a hand-built "two dense triangles joined by one thin bridge" test confirms the algorithm can split what connected components structurally cannot. `okf-rs impact`/`okf-rs review` were run against real commit ranges from this repository's own history (e.g. the Phase 3 architecture-extraction commits), correctly computing blast radius and rendering a well-formed Markdown report with a sticky-comment marker; a dedicated end-to-end test confirms `--fail-on-risk` gates correctly at, but not below, its configured threshold. `okf-rs search --semantic` and the `explore` composite query were both verified end-to-end via mock-endpoint e2e tests through the real compiled binary, not just unit tests.
+
+A follow-up code review of this delivery (five independent finder passes, plus a numerical verification pass) surfaced 15 real findings — mostly duplicated worktree-checkout/edge-resolution logic and a couple of avoidable inefficiencies (`explore` building a full-text index even for exact-id lookups, redundant vector-norm recomputation) — and one incorrect finding worth recording as a negative result: a claimed modularity-formula bug in the community-detection merge loop, checked by directly computing modularity on 2000 random graphs rather than taken on faith. The shipped formula turned out to be a positive constant multiple of the mathematically exact value, which provably preserves both the merge-decision sign and the candidate ranking the algorithm actually uses it for (zero mismatches across every trial), while the reviewer's proposed "fix" would have introduced real mismatches in a meaningful fraction of cases — so the code was left as shipped. All 15 real findings are fixed; a separate, genuine bug a later review pass found — the PR review GitHub Action diffing against `github.sha`, which for `pull_request` events is GitHub's ephemeral test-merge commit rather than the PR's actual head commit — is also fixed, using `github.event.pull_request.head.sha` instead.
+
+---
+
 ## Phase 4 — Ecosystem
 
 Both items below build directly on Phase 3's stable `okf-graph`/`okf-query` library API rather than re-implementing graph access.
@@ -176,7 +195,7 @@ Both items below build directly on Phase 3's stable `okf-graph`/`okf-query` libr
 - [ ] Visualization: interactive graph explorer over `okf-server`
 - [ ] Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
 
-See [`docs/improvement-plan.md`](docs/improvement-plan.md) for a gap analysis against two other codebase-knowledge-graph tools (CodeGraph, code-review-graph) and a reprioritization of several Phase 4 items — change-impact analysis, a composite MCP tool, parallel extraction, and real community detection — in light of what they've already shipped.
+The improvement plan's remaining conditional-GO/no-go items — bundled local embedding runtime, persisted query cache, static SVG export, multi-repo/daemon serving — stay deliberately out of scope; see [`docs/improvement-plan.md`](docs/improvement-plan.md#6-costbenefit-study-and-gonogo) for why each was scored that way.
 
 ---
 
