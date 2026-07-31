@@ -190,6 +190,45 @@ inputs, no proprietary runtime) while directly matching the concrete, benchmarke
 proposition (blast-radius-scoped context, PR-automation) that's currently `okf-rs`'s biggest
 competitive gap against both CodeGraph and code-review-graph.
 
+## 6. Cost/benefit study and go/no-go
+
+Effort is sized against this codebase specifically (existing crates, existing test/CI
+harness), not in the abstract: **S** = a few focused hours to a day, well-contained in one
+crate; **M** = multi-day, touches 2-3 crates and their tests; **L** = a new crate or a genuinely
+new capability with real design risk; **XL** = server/infra-scale, comparable to `okf-server`
+itself. Benefit is scored against how directly the item closes one of §3's three named gaps
+(impact analysis, single-call MCP query, query performance at scale) versus how speculative or
+"nice-to-have" it is. Risk covers both regression risk to the deterministic core and
+maintenance/scope-creep risk.
+
+| # | Item | Effort | Benefit | Risk | Decision |
+|---|---|---|---|---|---|
+| 1 | Parallelize extraction (`rayon`) | S | Medium — real, but this repo's own 700-concept bundle already generates fast; benefit is proportional to repo size, unproven at the 10k+-file scale competitors benchmark | Low — per-file extraction is already independent; the deterministic-output tests already guard against order-dependent bugs | **GO** |
+| 2 | Composite MCP tool (`okf_explore`) | S | High — directly answers the round-trip cost named in §3.2, and is pure composition over functions that already exist and are already tested | Low — additive; the 15 granular tools stay, nothing existing changes shape | **GO** |
+| 3 | Change-impact analysis (`okf-rs impact`) | M | High — the single biggest named gap (§3.1); reuses existing worktree diffing and call-graph traversal, no new dependency | Medium — transitive closure over a graph that can contain cycles needs to reuse the existing `cycles()`-safe traversal correctly, or it can loop or double-count; needs real test coverage on a cyclic fixture, not just an acyclic one | **GO** |
+| 4 | Community detection for `okf_arch::domains` (Louvain) | M | Medium — fixes a documented, real known limitation, but only changes behavior on large/dense graphs; small projects (most of this tool's own dogfooding) see no visible difference | Medium-High — a from-scratch modularity-optimization implementation is genuinely easy to get subtly wrong, and naive Louvain has randomized tie-breaking that would quietly break the "deterministic core" principle if not deliberately pinned (fixed iteration order, no RNG, or an explicit seed) | **CONDITIONAL GO** — only with a deterministic (seeded or order-stable) implementation and a test asserting byte-identical output across repeated runs on the same input, matching the bar every other `okf-rs` analysis already meets; ship §3's cheaper items first and revisit this with real large-graph test data, not just this repo's own bundle |
+| 5 | Deterministic viz export: GraphML + Obsidian vault | S-M | Medium — genuine, low-cost visualization story using free existing tools (Gephi/yEd/Obsidian), same "hand-templated, no new heavy dependency" pattern as the DITA/PDF exporters | Low — output-only, read-only over the existing `Graph`, same shape as `okf-docs`'s existing exporters | **GO** |
+| 5b | Deterministic viz export: SVG (force-directed static render) | M-L | Low-Medium — a static force-directed layout is a real graph-drawing problem (node overlap, edge crossing minimization), not a templating exercise like GraphML/Obsidian, and the eventual interactive explorer over `okf-server` (Phase 4) is the actual right answer for exploration, not a static image | Medium — either a hand-rolled layout algorithm (real effort, mediocre result) or a new layout-crate dependency, for a deliverable the Phase 4 item will likely obsolete | **NO-GO** — defer to the Phase 4 interactive explorer; GraphML/Obsidian already cover "open it in a real graph tool" at a fraction of the cost |
+| 6 | Persisted/derived query cache (Tantivy index on disk, not in-memory rebuild) | M | Unproven — real only if query latency is actually a measured problem; this repo's own ~700-concept bundle gives no evidence either way, and CLI/MCP calls are typically one-shot per invocation, not a hot loop, so an in-memory rebuild's cost is paid once per process, not per query | Medium — cache-invalidation bugs are a classic source of "stale answer silently served," which directly undercuts the trust story `--ci` validation and the OKF `stale_after` fields exist to protect; adds a second cache format to keep consistent alongside `.okf-cache.json` | **NO-GO for now** — benchmark first: add a `hyperfine`/criterion-style benchmark of `search`/`graph` commands against a synthetic 10k-concept bundle before building this. Revisit as a **GO** only if that benchmark shows the in-memory rebuild is actually the bottleneck, not a hypothetical one |
+| 7 | PR review automation (`okf-rs review` + GitHub Action) | L | High — directly matches code-review-graph's flagship, most-marketable use case; strong adoption/differentiation value once shippable | Medium-High — a GitHub Action is an ongoing maintenance surface (auth/token handling, sticky-comment update logic, API version drift) distinct from a pure CLI feature, and it's only as good as the impact analysis (#3) it's built on | **CONDITIONAL GO** — sequence strictly after #3 ships and is dogfooded on a few real PRs via the plain CLI report first; don't build the Action until the underlying report is already trustworthy standalone |
+| 8a | Optional semantic search via an existing OpenAI-compatible embeddings endpoint (reusing the `--enrich-base-url` pattern) | S-M | Medium — extends a pattern (`okf-enrich`'s pluggable, no-hard-vendor-dependency HTTP client) that already exists and is already tested; genuinely additive to Tantivy ranked search for "find by meaning, not wording" queries | Low — no new runtime dependency (`ureq` already there), opt-in, same "never a hard dependency on one vendor" posture as `--enrich` today | **GO** |
+| 8b | Bundled/local embedding **model runtime** (e.g. sentence-transformers via ONNX, shipped in-process) | L | Medium — matches code-review-graph's local-first default, but Tantivy ranked search already covers most of the practical "find by meaning" need day to day | High — directly contradicts the "standalone binary, no runtime dependency beyond the OS's standard C library" packaging property this project explicitly verifies (§ Packaging & Distribution in `docs/specification.md`); bundling a model runtime or weights is a real regression on binary size, build complexity, and the "no proprietary runtime required" openness claim this project uses to differentiate itself from Graphify | **NO-GO** — 8a already delivers the actual capability (semantic search) without the packaging regression; a bundled local model runtime is the wrong trade for this project's own stated principles |
+| 9 | Multi-repo / daemon indexing (`okf-server` scope) | XL | High long-term, but already correctly scoped as Phase 4 and not something either competitor makes look urgent to pull forward — both are single-project-first tools too, with multi-repo as an add-on (`register`/`unregister`), not their core value prop | High — full server/auth/lifecycle surface, the largest single item in this entire plan | **NO-GO (no change)** — confirm existing Phase 4 placement is correct; nothing in this comparison argues for accelerating it |
+
+### Net recommendation
+
+Ship, in order: **#1 → #2 → #3 → #5 → #8a**, all **GO** with no unresolved conditions — this
+sequence alone closes both concretely-scored-High gaps (impact analysis, single-call MCP query)
+plus the parallelism gap, at a combined cost of roughly S+S+M+S+S-M, before touching anything
+conditional. **#7** (PR review automation) is the highest-value remaining item but is
+deliberately sequenced *after* #3, not parallel to it — building the GitHub Action against an
+impact report that hasn't been validated standalone risks shipping automation on top of an
+unproven signal. **#4** (community detection) is worth doing but is not blocking anything else
+and carries a real determinism risk if rushed, so it's explicitly not in the critical path.
+**#5b**, **#6**, **#8b**, and **#9** are deliberate no-gos for now, each for a different reason
+(wrong tool for the job, unproven need, contradicts a stated project principle, and
+correctly-already-deferred scope, respectively) — not oversights.
+
 ## References
 
 - [CodeGraph](https://github.com/colbymchenry/codegraph)
