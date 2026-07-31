@@ -10,6 +10,9 @@ use std::cmp::Reverse;
 use std::fs;
 use std::path::Path;
 
+mod full_text;
+pub use full_text::{FullTextHit, FullTextIndex};
+
 #[derive(Debug, Clone)]
 pub struct SearchEntry {
     /// Concept id (bundle-relative path without `.md`).

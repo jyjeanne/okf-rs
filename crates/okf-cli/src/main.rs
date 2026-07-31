@@ -94,6 +94,12 @@ enum Command {
         /// Project directory to look up `okf.toml` in (not the bundle itself).
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
+        /// Use ranked, relevance-scored full-text search (via Tantivy)
+        /// instead of exact/substring matching. Also searches
+        /// description/signature text, not just title/type/tags — better
+        /// for a natural-language query than an exact symbol name.
+        #[arg(long)]
+        ranked: bool,
     },
     /// Report content-completeness metrics for a bundle: description/tag
     /// coverage, and how much of the bundle participates in the call
@@ -261,7 +267,8 @@ fn run(command: Command) -> Result<ExitCode> {
             query,
             bundle,
             project,
-        } => cmd_search(&query, bundle, &project),
+            ranked,
+        } => cmd_search(&query, bundle, &project, ranked),
         Command::Coverage { bundle, project } => {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::coverage(&bundle))
@@ -493,9 +500,18 @@ fn print_query_result(result: Result<String>) -> Result<ExitCode> {
     }
 }
 
-fn cmd_search(query: &str, bundle: Option<PathBuf>, project: &std::path::Path) -> Result<ExitCode> {
+fn cmd_search(
+    query: &str,
+    bundle: Option<PathBuf>,
+    project: &std::path::Path,
+    ranked: bool,
+) -> Result<ExitCode> {
     let bundle = resolve_query_bundle(bundle, project);
-    print_query_result(okf_query::search(&bundle, query))
+    if ranked {
+        print_query_result(okf_query::search_ranked(&bundle, query))
+    } else {
+        print_query_result(okf_query::search(&bundle, query))
+    }
 }
 
 fn analyze_path(path: &std::path::Path) -> Result<okf_analyzer::AnalysisResult> {

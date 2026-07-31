@@ -22,6 +22,17 @@ pub fn list() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "search_ranked",
+            "description": "Ranked, relevance-scored full-text search over the knowledge bundle (title, type, description, signature, and tags), via Tantivy/BM25. Unlike the search tool's exact/substring matching, this also searches description and signature prose and orders results by relevance — better for a natural-language query (e.g. \"parses a jwt\") than an exact symbol name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search text" },
+                },
+                "required": ["query"],
+            },
+        }),
+        json!({
             "name": "graph_callers",
             "description": "List concepts that directly call the given concept id.",
             "inputSchema": {
@@ -96,6 +107,7 @@ pub fn list() -> Vec<Value> {
 pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
     match name {
         "search" => okf_query::search(bundle, &arg_str(arguments, "query")?),
+        "search_ranked" => okf_query::search_ranked(bundle, &arg_str(arguments, "query")?),
         "coverage" => okf_query::coverage(bundle),
         "graph_callers" => okf_query::graph_callers(bundle, &arg_str(arguments, "id")?),
         "graph_callees" => okf_query::graph_callees(bundle, &arg_str(arguments, "id")?),
@@ -152,6 +164,13 @@ mod tests {
         let dir = sample_bundle();
         let text = call("search", &json!({ "query": "decode_jwt" }), dir.path()).unwrap();
         assert!(text.contains("decode_jwt"));
+        assert!(text.contains("functions/auth/decode_jwt"));
+    }
+
+    #[test]
+    fn search_ranked_finds_a_concept_by_title() {
+        let dir = sample_bundle();
+        let text = call("search_ranked", &json!({ "query": "decode_jwt" }), dir.path()).unwrap();
         assert!(text.contains("functions/auth/decode_jwt"));
     }
 

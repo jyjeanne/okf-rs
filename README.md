@@ -160,6 +160,7 @@ Decide whether `knowledge/` itself belongs in git. Both are reasonable: committi
 
 ```sh
 okf-rs search verify_token                              # find a symbol by name
+okf-rs search "parses a jwt" --ranked                    # ranked, relevance-scored full-text search (title/type/description/signature/tags)
 okf-rs graph callers functions/src/auth/verify_token     # who calls it
 okf-rs graph api                                         # the whole public API surface
 okf-rs docs --format html                                # a browsable static site, into docs/

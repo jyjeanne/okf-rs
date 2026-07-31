@@ -8,7 +8,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 |---|---|
 | Phase 1 — Foundations | ✅ Complete |
 | Phase 2 — Depth & Integration | ✅ Complete (11/11) |
-| Phase 3 — Search, Interop & Intelligence | 🔶 In progress (7/15) |
+| Phase 3 — Search, Interop & Intelligence | 🔶 In progress (8/15) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -84,7 +84,7 @@ Hardened following an internal code review of the LSP integration: `okf-lsp`'s r
 
 Ordered deterministic/offline work first (no new runtime dependency, no external service, nothing optional), then interop, then the genuinely optional AI-dependent items last — each later item builds on a stable knowledge graph the earlier ones establish, and none of them are required for the ones before to be useful.
 
-- [ ] Full-text search engine: ranked, relevance-scored search (via [Tantivy](https://github.com/quickwit-oss/tantivy)) layered onto today's exact/substring `okf-search`
+- [x] Full-text search engine: ranked, relevance-scored search (via [Tantivy](https://github.com/quickwit-oss/tantivy)) layered onto today's exact/substring `okf-search`
 - [ ] Stable, versioned public library API: `okf-graph`/`okf-query` promoted from an internal implementation detail of `okf-cli`/`okf-mcp` to a documented, semver'd crate other Rust tools — including `okf-server` in Phase 4 — can embed directly
 - [ ] DITA ⇄ OKF converter: export an OKF bundle to DITA (as before), plus *import* existing DITA XML as a source
 - [ ] Optional AI enrichment: function summaries, module descriptions, architecture explanations, usage examples, glossary entries — pluggable via any OpenAI-compatible endpoint ([Ollama](https://ollama.com)/LM Studio/LocalAI, [Crustly](https://github.com/jyjeanne/crustly), or a cloud provider), never a hard dependency on one vendor
@@ -106,6 +106,10 @@ Verified by dogfooding: an initial `okf-rs generate .` (474 concepts) followed b
 Verified by dogfooding again after the symmetry/coverage/stats additions: on this repository's own 527-concept bundle, `okf-rs validate` still reports "no issues found" (the new symmetry check found no asymmetric `Calls`/`CalledBy` pairs, as expected on a purely `okf-rs generate`d bundle); `okf-rs coverage` reports 74% (356/477) of non-`Module`/`Package` concepts participate in the call graph; `okf-rs graph stats` reports 663 `Calls` edges, 663 `Called by` edges (symmetric, as expected), and 3 connected components — one large 352-concept cluster plus two small 2-concept ones, alongside 121 isolated concepts.
 
 `okf-generator` now deduplicates relationship targets by `(kind, target)` before rendering — both in the `relationships` frontmatter field and in the human-readable `# Calls`/`# Called by`/... body sections — via a shared `unique_by_kind_and_target` helper, so a concept calling the same target from multiple call sites in its body is listed once, not once per call site. This is the fix the redundant-link warning above pointed at, rather than a separate roadmap item: the validator's new check was correctly surfacing real duplication already present in generated bundles, and the actual bug was in the generator, not something for hand-edited bundles to work around.
+
+`okf-search::FullTextIndex` adds ranked, relevance-scored search on top of the exact/substring `SearchIndex` above, via an in-memory Tantivy index rebuilt fresh from `okf_parser::read_bundle` on every call (no persistent index file to keep in sync with the bundle, matching how `okf-graph`/`okf-query` already read a bundle back off disk). It searches title, type, description, signature, and tags — not just title/type/tags like the exact index — and a lightweight identifier splitter (`split_identifier_words`) inserts word boundaries at `snake_case`/`camelCase`/`PascalCase` transitions so a query for `verifyToken` matches a `snake_case`-named concept and vice versa; Tantivy's own tokenizer already splits on `_`/`-` for free. Exposed as `okf-rs search <query> --ranked` and the `search_ranked` MCP tool, alongside (not replacing) the existing exact/substring `search`/`search` tool, so both stay independently available and independently tested. Wired through `okf-query::search_ranked`, the same shared query layer `okf-cli` and `okf-mcp` already share for every other operation.
+
+Verified by dogfooding: on this repository's own 555-concept bundle, `okf-rs search "ranks results by relevance" --ranked` correctly surfaces `ranks_exact_title_match_first` and other concepts whose *doc comment* (captured as each concept's `description`) contains that phrase, none of which the exact/substring `search` finds at all ("No matches for `ranks results by relevance`"), since it never looks past title/type/tags. `okf-rs search buildBundle --ranked` correctly ranks `SearchIndex::build`, `FullTextIndex::build`, and `Graph::build` above unrelated concepts, confirming the `camelCase`-to-`snake_case` boundary matching works across real crate boundaries, not just the unit tests' synthetic fixtures. `okf-rs validate` still reports "no issues found" afterward — this is a read-only query feature, and doesn't touch bundle generation.
 
 ## Phase 4 — Ecosystem
 

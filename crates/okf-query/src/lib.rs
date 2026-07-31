@@ -62,6 +62,33 @@ pub fn search(bundle: &Path, query: &str) -> Result<String> {
         .join("\n"))
 }
 
+/// Ranked, relevance-scored full-text search over the bundle's title,
+/// type, description, signature, and tags (via `okf_search::FullTextIndex`,
+/// backed by Tantivy). Distinct from [`search`]'s exact/substring matching:
+/// this also searches description/signature prose and orders results by
+/// relevance rather than a fixed field-priority score, so a
+/// natural-language query (e.g. "parses a jwt") can surface a concept
+/// whose *description* mentions it even when the query matches no title,
+/// type, or tag at all.
+pub fn search_ranked(bundle: &Path, query: &str) -> Result<String> {
+    require_bundle(bundle)?;
+    let index = okf_search::FullTextIndex::build(bundle)?;
+    let hits = index.search(query, 25)?;
+    if hits.is_empty() {
+        return Ok(format!("No matches for `{query}`"));
+    }
+    Ok(hits
+        .iter()
+        .map(|hit| {
+            format!(
+                "{:>6.2}  {:<24} {:<20} {}",
+                hit.score, hit.title, hit.concept_type, hit.id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 /// Concepts that directly call `id`.
 pub fn graph_callers(bundle: &Path, id: &str) -> Result<String> {
     let concepts = load_concepts(bundle)?;
@@ -324,6 +351,25 @@ mod tests {
         let text = search(dir.path(), "decode_jwt").unwrap();
         assert!(text.contains("decode_jwt"));
         assert!(text.contains("functions/auth/decode_jwt"));
+    }
+
+    #[test]
+    fn search_ranked_finds_a_concept_by_description_text() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/other.md",
+            "---\ntype: Rust Function\ntitle: other\ndescription: Verifies the signature on a JSON Web Token.\nresource: src/auth.rs#L20\n---\n\nbody\n",
+        );
+
+        let text = search_ranked(dir.path(), "signature").unwrap();
+        assert!(text.contains("functions/auth/other"));
+    }
+
+    #[test]
+    fn search_ranked_missing_bundle_points_at_generate() {
+        let err = search_ranked(Path::new("/nonexistent"), "x").unwrap_err();
+        assert!(err.to_string().contains("okf-rs generate"));
     }
 
     #[test]
