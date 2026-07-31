@@ -54,8 +54,12 @@ pub struct DetectedPattern {
     pub evidence: String,
 }
 
-/// Runs every detector below over `concepts` and returns every match,
-/// sorted by kind then concept id for deterministic output.
+/// Runs every detector below over `concepts` in one pass and returns
+/// every match, sorted by kind then concept id for deterministic output.
+/// Builder/Singleton/Visitor are all evaluated per type concept (a type
+/// can match more than one), Factory per function/method concept — a
+/// single pass branching on `c.kind` covers every category without
+/// scanning `concepts` once per detector.
 pub fn detect_patterns(concepts: &[Concept]) -> Vec<DetectedPattern> {
     let methods_by_owner = group_methods_by_owner(concepts);
     let types_by_path: HashMap<&str, &Concept> = concepts
@@ -65,10 +69,16 @@ pub fn detect_patterns(concepts: &[Concept]) -> Vec<DetectedPattern> {
         .collect();
 
     let mut found = Vec::new();
-    found.extend(detect_builder(concepts, &methods_by_owner));
-    found.extend(detect_singleton(concepts, &methods_by_owner));
-    found.extend(detect_factory(concepts, &types_by_path));
-    found.extend(detect_visitor(concepts, &methods_by_owner));
+    for c in concepts {
+        if is_type_kind(c.kind) {
+            let methods = methods_by_owner.get(path_after_kind_dir(&c.id));
+            found.extend(builder_for(c, methods));
+            found.extend(singleton_for(c, methods));
+            found.extend(visitor_for(c, methods));
+        } else if matches!(c.kind, ConceptKind::Function | ConceptKind::Method) {
+            found.extend(factory_for(c, &types_by_path));
+        }
+    }
 
     found.sort_by(|a, b| (a.kind, &a.concept_id).cmp(&(b.kind, &b.concept_id)));
     found
@@ -82,113 +92,88 @@ fn has_method_named(methods: Option<&Vec<&Concept>>, names: &[&str]) -> Option<S
         .map(|m| m.name.clone())
 }
 
-/// A type named `*Builder` (case-insensitive) with a `build` method on
-/// it, e.g. `RequestBuilder::build`.
-fn detect_builder<'a>(
-    concepts: &'a [Concept],
-    methods_by_owner: &HashMap<&str, Vec<&'a Concept>>,
-) -> Vec<DetectedPattern> {
-    concepts
-        .iter()
-        .filter(|c| is_type_kind(c.kind) && c.name.to_ascii_lowercase().ends_with("builder"))
-        .filter_map(|c| {
-            let method_name =
-                has_method_named(methods_by_owner.get(path_after_kind_dir(&c.id)), &["build"])?;
-            Some(DetectedPattern {
-                kind: PatternKind::Builder,
-                concept_id: c.id.clone(),
-                evidence: format!("`{}` (named *Builder) has a `{method_name}` method", c.name),
-            })
-        })
-        .collect()
+/// Whether `c` is a type named `*Builder` (case-insensitive) with a
+/// `build` method on it, e.g. `RequestBuilder::build`. Assumes
+/// `is_type_kind(c.kind)`.
+fn builder_for(c: &Concept, methods: Option<&Vec<&Concept>>) -> Option<DetectedPattern> {
+    if !c.name.to_ascii_lowercase().ends_with("builder") {
+        return None;
+    }
+    let method_name = has_method_named(methods, &["build"])?;
+    Some(DetectedPattern {
+        kind: PatternKind::Builder,
+        concept_id: c.id.clone(),
+        evidence: format!("`{}` (named *Builder) has a `{method_name}` method", c.name),
+    })
 }
 
-/// A type with an `instance`/`get_instance`/`shared`/`singleton`-named
-/// method on it, e.g. `Logger::get_instance`.
-fn detect_singleton<'a>(
-    concepts: &'a [Concept],
-    methods_by_owner: &HashMap<&str, Vec<&'a Concept>>,
-) -> Vec<DetectedPattern> {
-    const NAMES: &[&str] = &["instance", "get_instance", "getinstance", "shared", "singleton"];
-    concepts
-        .iter()
-        .filter(|c| is_type_kind(c.kind))
-        .filter_map(|c| {
-            let method_name =
-                has_method_named(methods_by_owner.get(path_after_kind_dir(&c.id)), NAMES)?;
-            Some(DetectedPattern {
-                kind: PatternKind::Singleton,
-                concept_id: c.id.clone(),
-                evidence: format!("`{}` has a `{method_name}` method", c.name),
-            })
-        })
-        .collect()
+const SINGLETON_METHOD_NAMES: &[&str] =
+    &["instance", "get_instance", "getinstance", "shared", "singleton"];
+
+/// Whether `c` is a type with an `instance`/`get_instance`/`shared`/
+/// `singleton`-named method on it, e.g. `Logger::get_instance`. Assumes
+/// `is_type_kind(c.kind)`.
+fn singleton_for(c: &Concept, methods: Option<&Vec<&Concept>>) -> Option<DetectedPattern> {
+    let method_name = has_method_named(methods, SINGLETON_METHOD_NAMES)?;
+    Some(DetectedPattern {
+        kind: PatternKind::Singleton,
+        concept_id: c.id.clone(),
+        evidence: format!("`{}` has a `{method_name}` method", c.name),
+    })
 }
 
-/// A function/method named `create_*`/`make_*`, or a method on a
-/// `*Factory`-named type, e.g. `create_user` or `AuthFactory::build_token`.
-fn detect_factory<'a>(
-    concepts: &'a [Concept],
-    types_by_path: &HashMap<&str, &'a Concept>,
-) -> Vec<DetectedPattern> {
-    concepts
-        .iter()
-        .filter(|c| matches!(c.kind, ConceptKind::Function | ConceptKind::Method))
-        .filter_map(|c| {
-            let lower = c.name.to_ascii_lowercase();
-            if lower.starts_with("create_") || lower.starts_with("make_") {
-                return Some(DetectedPattern {
-                    kind: PatternKind::Factory,
-                    concept_id: c.id.clone(),
-                    evidence: format!("`{}` is named create_*/make_*", c.name),
-                });
-            }
-            if c.kind == ConceptKind::Method {
-                let owner = types_by_path.get(owner_path(&c.id)?)?;
-                if owner.name.to_ascii_lowercase().ends_with("factory") {
-                    return Some(DetectedPattern {
-                        kind: PatternKind::Factory,
-                        concept_id: c.id.clone(),
-                        evidence: format!("`{}` is a method on `{}` (named *Factory)", c.name, owner.name),
-                    });
-                }
-            }
-            None
-        })
-        .collect()
-}
-
-/// A type with two or more `visit_*`-named methods on it, e.g. a
-/// `NodeVisitor` trait/interface with `visit_binary`/`visit_literal`.
-fn detect_visitor<'a>(
-    concepts: &'a [Concept],
-    methods_by_owner: &HashMap<&str, Vec<&'a Concept>>,
-) -> Vec<DetectedPattern> {
-    concepts
-        .iter()
-        .filter(|c| is_type_kind(c.kind))
-        .filter_map(|c| {
-            let methods = methods_by_owner.get(path_after_kind_dir(&c.id))?;
-            let visit_methods: Vec<&str> = methods
-                .iter()
-                .filter(|m| m.name.to_ascii_lowercase().starts_with("visit"))
-                .map(|m| m.name.as_str())
-                .collect();
-            if visit_methods.len() < 2 {
-                return None;
-            }
-            Some(DetectedPattern {
-                kind: PatternKind::Visitor,
+/// Whether `c` is a function/method named `create_*`/`make_*`, or a
+/// method on a `*Factory`-named type, e.g. `create_user` or
+/// `AuthFactory::build_token`. Assumes `c.kind` is `Function` or
+/// `Method`.
+fn factory_for(c: &Concept, types_by_path: &HashMap<&str, &Concept>) -> Option<DetectedPattern> {
+    let lower = c.name.to_ascii_lowercase();
+    if lower.starts_with("create_") || lower.starts_with("make_") {
+        return Some(DetectedPattern {
+            kind: PatternKind::Factory,
+            concept_id: c.id.clone(),
+            evidence: format!("`{}` is named create_*/make_*", c.name),
+        });
+    }
+    if c.kind == ConceptKind::Method {
+        let owner = types_by_path.get(owner_path(&c.id)?)?;
+        if owner.name.to_ascii_lowercase().ends_with("factory") {
+            return Some(DetectedPattern {
+                kind: PatternKind::Factory,
                 concept_id: c.id.clone(),
                 evidence: format!(
-                    "`{}` has {} visit_*-named methods ({})",
-                    c.name,
-                    visit_methods.len(),
-                    visit_methods.join(", ")
+                    "`{}` is a method on `{}` (named *Factory)",
+                    c.name, owner.name
                 ),
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    None
+}
+
+/// Whether `c` is a type with two or more `visit_*`-named methods on it,
+/// e.g. a `NodeVisitor` trait/interface with `visit_binary`/
+/// `visit_literal`. Assumes `is_type_kind(c.kind)`.
+fn visitor_for(c: &Concept, methods: Option<&Vec<&Concept>>) -> Option<DetectedPattern> {
+    let methods = methods?;
+    let visit_methods: Vec<&str> = methods
+        .iter()
+        .filter(|m| m.name.to_ascii_lowercase().starts_with("visit"))
+        .map(|m| m.name.as_str())
+        .collect();
+    if visit_methods.len() < 2 {
+        return None;
+    }
+    Some(DetectedPattern {
+        kind: PatternKind::Visitor,
+        concept_id: c.id.clone(),
+        evidence: format!(
+            "`{}` has {} visit_*-named methods ({})",
+            c.name,
+            visit_methods.len(),
+            visit_methods.join(", ")
+        ),
+    })
 }
 
 #[cfg(test)]

@@ -39,30 +39,44 @@ fn parsing_options() -> ParsingOptions {
 /// imported (malformed XML, or an empty/unreadable file), sorted by
 /// relative path for deterministic output either way.
 pub fn import_dita(input_path: &Path) -> Result<(Vec<Concept>, Vec<String>)> {
+    let mut skipped = Vec::new();
     let (base, mut files) = if input_path.is_file() {
         (
             input_path.parent().unwrap_or(input_path).to_path_buf(),
             vec![input_path.to_path_buf()],
         )
     } else {
-        let files = walkdir::WalkDir::new(input_path)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_file())
-            .map(|entry| entry.into_path())
-            .filter(|path| {
-                matches!(
-                    path.extension().and_then(|e| e.to_str()),
-                    Some("dita") | Some("xml")
-                )
-            })
-            .collect();
+        let mut files = Vec::new();
+        for entry in walkdir::WalkDir::new(input_path) {
+            match entry {
+                Ok(entry) => {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let path = entry.into_path();
+                    if matches!(
+                        path.extension().and_then(|e| e.to_str()),
+                        Some("dita") | Some("xml")
+                    ) {
+                        files.push(path);
+                    }
+                }
+                Err(e) => {
+                    let label = e
+                        .path()
+                        .and_then(|p| p.strip_prefix(input_path).ok())
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| input_path.display().to_string());
+                    skipped.push(format!("{label}: {e}"));
+                }
+            }
+        }
         (input_path.to_path_buf(), files)
     };
     files.sort();
 
     let mut concepts = Vec::new();
-    let mut skipped = Vec::new();
     for path in files {
         let relative = path
             .strip_prefix(&base)
@@ -232,6 +246,21 @@ mod tests {
         assert_eq!(concepts[0].name, "Fine");
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].starts_with("broken.dita:"));
+    }
+
+    #[test]
+    fn a_nonexistent_root_path_is_reported_as_skipped_not_silently_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+
+        let (concepts, skipped) = import_dita(&missing).unwrap();
+        assert!(concepts.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].contains("does-not-exist"),
+            "expected the missing path in the skip message, got: {}",
+            skipped[0]
+        );
     }
 
     #[test]

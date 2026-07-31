@@ -703,6 +703,53 @@ fn standalone_binary_generate_enrich_without_an_endpoint_is_a_clear_error() {
     assert!(stderr.contains("OKF_ENRICH_BASE_URL"));
 }
 
+/// A late `--enrich` failure (the endpoint is configured but unreachable,
+/// so it fails partway through — after analysis, and potentially after
+/// enriching some concepts already) must not discard the analysis work
+/// that already happened: the bundle is still written to disk from
+/// whatever `result.concepts` ended up with, and only the exit code and
+/// stderr report the enrichment failure.
+#[test]
+fn standalone_binary_generate_enrich_endpoint_failure_still_writes_the_bundle() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn undocumented() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
+
+    // A `127.0.0.1` port nothing is listening on: connection refused, the
+    // same shape of failure a real unreachable/misconfigured endpoint
+    // would produce.
+    let result = Command::new(bin_path())
+        .args([
+            "generate",
+            ".",
+            "--enrich",
+            "--enrich-base-url",
+            "http://127.0.0.1:1/v1",
+            "--enrich-model",
+            "test-model",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+
+    let bundle_file = project.join("knowledge/functions/src/undocumented.md");
+    assert!(
+        bundle_file.exists(),
+        "the analysis result must still be written even though enrichment failed"
+    );
+    let content = fs::read_to_string(&bundle_file).unwrap();
+    assert!(!content.contains("description:"));
+
+    assert!(project.join(".okf-cache.json").exists());
+}
+
 /// `okf-rs suggest-links` builds on `--enrich`: after descriptions exist
 /// (via `generate --enrich`), it finds full-text-search candidates with
 /// no existing relationship and asks the (mock) endpoint whether each

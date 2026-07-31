@@ -59,98 +59,92 @@ pub struct DetectedFeature {
     pub evidence: String,
 }
 
-/// Runs every detector below over `concepts` and returns every match,
-/// sorted by kind then concept id for deterministic output.
+/// Runs every detector below over `concepts` in one pass and returns
+/// every match, sorted by kind then concept id for deterministic output.
+/// A type concept and a function/method concept are never both eligible
+/// for the same detector, so a single pass branching on `c.kind` covers
+/// every category without scanning `concepts` once per detector.
 pub fn detect_features(concepts: &[Concept]) -> Vec<DetectedFeature> {
     let methods_by_owner = group_methods_by_owner(concepts);
 
     let mut found = Vec::new();
-    found.extend(detect_rest_endpoints(concepts, &methods_by_owner));
-    found.extend(detect_database_models(concepts));
-    found.extend(detect_event_flow(concepts));
+    for c in concepts {
+        if is_type_kind(c.kind) {
+            if c.name.ends_with("Controller") {
+                found.extend(rest_endpoints_for_controller(c, &methods_by_owner));
+            }
+            found.extend(database_model_for(c));
+        } else if matches!(c.kind, ConceptKind::Function | ConceptKind::Method) {
+            found.extend(event_flow_for(c));
+        }
+    }
 
     found.sort_by(|a, b| (a.kind, &a.concept_id).cmp(&(b.kind, &b.concept_id)));
     found
 }
 
-/// Every public method on a `*Controller`-named type (ASP.NET MVC/Web
-/// API, Spring MVC, NestJS naming convention) — one finding per method,
-/// since the roadmap asks for endpoint-level detection, not just
-/// flagging the controller type itself.
-fn detect_rest_endpoints<'a>(
-    concepts: &'a [Concept],
-    methods_by_owner: &HashMap<&str, Vec<&'a Concept>>,
+/// Every public method on `controller` (ASP.NET MVC/Web API, Spring MVC,
+/// NestJS naming convention) — one finding per method, since the roadmap
+/// asks for endpoint-level detection, not just flagging the controller
+/// type itself. Assumes `controller.name` already ends with
+/// `"Controller"`.
+fn rest_endpoints_for_controller(
+    controller: &Concept,
+    methods_by_owner: &HashMap<&str, Vec<&Concept>>,
 ) -> Vec<DetectedFeature> {
-    concepts
-        .iter()
-        .filter(|c| is_type_kind(c.kind) && c.name.ends_with("Controller"))
-        .flat_map(|c| {
-            let controller_name = c.name.clone();
-            methods_by_owner
-                .get(path_after_kind_dir(&c.id))
-                .into_iter()
-                .flatten()
-                .filter(|m| m.is_public)
-                .map(move |m| DetectedFeature {
-                    kind: FeatureKind::RestEndpoint,
-                    concept_id: m.id.clone(),
-                    evidence: format!(
-                        "public method `{}` on `{controller_name}` (named *Controller)",
-                        m.name
-                    ),
-                })
+    methods_by_owner
+        .get(path_after_kind_dir(&controller.id))
+        .into_iter()
+        .flatten()
+        .filter(|m| m.is_public)
+        .map(|m| DetectedFeature {
+            kind: FeatureKind::RestEndpoint,
+            concept_id: m.id.clone(),
+            evidence: format!(
+                "public method `{}` on `{}` (named *Controller)",
+                m.name, controller.name
+            ),
         })
         .collect()
 }
 
 const MODEL_SUFFIXES: &[&str] = &["Model", "Entity", "Record"];
 
-/// A type named `*Model`/`*Entity`/`*Record` — common ORM/database-
-/// model naming conventions (Django/Rails-adjacent "Model", JPA-adjacent
-/// "Entity", plain-data-object "Record").
-fn detect_database_models(concepts: &[Concept]) -> Vec<DetectedFeature> {
-    concepts
-        .iter()
-        .filter(|c| is_type_kind(c.kind))
-        .filter_map(|c| {
-            let suffix = MODEL_SUFFIXES.iter().find(|s| c.name.ends_with(**s))?;
-            Some(DetectedFeature {
-                kind: FeatureKind::DatabaseModel,
-                concept_id: c.id.clone(),
-                evidence: format!(
-                    "`{}` is named *{suffix} (a common ORM/database-model naming convention)",
-                    c.name
-                ),
-            })
-        })
-        .collect()
+/// Whether `c` is a type named `*Model`/`*Entity`/`*Record` — common
+/// ORM/database-model naming conventions (Django/Rails-adjacent "Model",
+/// JPA-adjacent "Entity", plain-data-object "Record"). Assumes
+/// `is_type_kind(c.kind)`.
+fn database_model_for(c: &Concept) -> Option<DetectedFeature> {
+    let suffix = MODEL_SUFFIXES.iter().find(|s| c.name.ends_with(**s))?;
+    Some(DetectedFeature {
+        kind: FeatureKind::DatabaseModel,
+        concept_id: c.id.clone(),
+        evidence: format!(
+            "`{}` is named *{suffix} (a common ORM/database-model naming convention)",
+            c.name
+        ),
+    })
 }
 
-/// A function/method named `emit_*`/`publish_*` (produces an event),
-/// `subscribe_*`/`on_*` (reacts to one), or `*_handler`/`*_event`
-/// (either role, less specifically named).
-fn detect_event_flow(concepts: &[Concept]) -> Vec<DetectedFeature> {
-    concepts
-        .iter()
-        .filter(|c| matches!(c.kind, ConceptKind::Function | ConceptKind::Method))
-        .filter_map(|c| {
-            let lower = c.name.to_ascii_lowercase();
-            let role = if lower.starts_with("emit_") || lower.starts_with("publish_") {
-                "emits"
-            } else if lower.starts_with("subscribe_") || lower.starts_with("on_") {
-                "subscribes to"
-            } else if lower.ends_with("_handler") || lower.ends_with("_event") {
-                "handles"
-            } else {
-                return None;
-            };
-            Some(DetectedFeature {
-                kind: FeatureKind::EventFlow,
-                concept_id: c.id.clone(),
-                evidence: format!("`{}` {role} an event, by naming convention", c.name),
-            })
-        })
-        .collect()
+/// Whether `c` is a function/method named `emit_*`/`publish_*` (produces
+/// an event), `subscribe_*`/`on_*` (reacts to one), or `*_handler`/
+/// `*_event` (either role, less specifically named).
+fn event_flow_for(c: &Concept) -> Option<DetectedFeature> {
+    let lower = c.name.to_ascii_lowercase();
+    let role = if lower.starts_with("emit_") || lower.starts_with("publish_") {
+        "emits"
+    } else if lower.starts_with("subscribe_") || lower.starts_with("on_") {
+        "subscribes to"
+    } else if lower.ends_with("_handler") || lower.ends_with("_event") {
+        "handles"
+    } else {
+        return None;
+    };
+    Some(DetectedFeature {
+        kind: FeatureKind::EventFlow,
+        concept_id: c.id.clone(),
+        evidence: format!("`{}` {role} an event, by naming convention", c.name),
+    })
 }
 
 #[cfg(test)]

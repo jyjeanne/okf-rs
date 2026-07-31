@@ -301,11 +301,11 @@ pub fn coverage_report(bundle: &Path) -> Result<CoverageReport> {
         .collect();
     let eligible = concepts
         .iter()
-        .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package | ConceptKind::Document))
+        .filter(|c| !okf_graph::is_structural(c.kind))
         .count();
     let connected = concepts
         .iter()
-        .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package | ConceptKind::Document))
+        .filter(|c| !okf_graph::is_structural(c.kind))
         .filter(|c| !isolated.contains(c.id.as_str()))
         .count();
 
@@ -949,53 +949,10 @@ mod tests {
         );
     }
 
-    /// A minimal, single-endpoint OpenAI-compatible mock server — see
-    /// `okf-enrich`'s own `test_support` module for the twin of this
-    /// helper; not reused directly since it's `pub(crate)` there.
-    fn start_mock_server(reply_content: &'static str) -> String {
-        use std::io::{BufRead, BufReader, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut content_length = 0usize;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                        break;
-                    }
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        break;
-                    }
-                    if let Some(value) = trimmed.strip_prefix("Content-Length: ") {
-                        content_length = value.trim().parse().unwrap_or(0);
-                    }
-                }
-                let mut body = vec![0u8; content_length];
-                std::io::Read::read_exact(&mut reader, &mut body).unwrap();
-
-                let payload =
-                    format!(r#"{{"choices":[{{"message":{{"content":"{reply_content}"}}}}]}}"#);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    payload.len(),
-                    payload
-                );
-                let _ = stream.write_all(response.as_bytes());
-            }
-        });
-
-        format!("http://127.0.0.1:{port}/v1")
-    }
-
     #[test]
     fn suggest_links_reports_a_suggestion_from_the_endpoint() {
+        use okf_enrich::test_support::{client_for, start_mock_server};
+
         let dir = sample_bundle();
         write(
             dir.path(),
@@ -1003,12 +960,8 @@ mod tests {
             "---\ntype: Rust Function\ntitle: other\ndescription: Reads an auth token from the request header.\nresource: src/auth.rs#L20\n---\n\nbody\n",
         );
 
-        let base_url = start_mock_server("looks related");
-        let client = okf_enrich::EnrichClient::new(okf_enrich::EnrichConfig {
-            base_url,
-            model: "test-model".to_string(),
-            api_key: None,
-        });
+        let server = start_mock_server("looks related");
+        let client = client_for(&server);
 
         let text = suggest_links(dir.path(), &client, 5).unwrap();
         assert!(text.contains("looks related"));
@@ -1016,6 +969,8 @@ mod tests {
 
     #[test]
     fn suggest_links_reports_none_found_when_the_model_says_no() {
+        use okf_enrich::test_support::{client_for, start_mock_server};
+
         let dir = sample_bundle();
         write(
             dir.path(),
@@ -1023,12 +978,8 @@ mod tests {
             "---\ntype: Rust Function\ntitle: other\ndescription: Reads an auth token from the request header.\nresource: src/auth.rs#L20\n---\n\nbody\n",
         );
 
-        let base_url = start_mock_server("NO");
-        let client = okf_enrich::EnrichClient::new(okf_enrich::EnrichConfig {
-            base_url,
-            model: "test-model".to_string(),
-            api_key: None,
-        });
+        let server = start_mock_server("NO");
+        let client = client_for(&server);
 
         assert_eq!(
             suggest_links(dir.path(), &client, 5).unwrap(),

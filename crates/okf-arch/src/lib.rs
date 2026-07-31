@@ -107,7 +107,9 @@ pub fn layers(graph: &Graph<'_>) -> Vec<PackageLayer> {
         deps.entry(from.as_str()).or_default().insert(to.as_str());
     }
 
-    let sccs = strongly_connected_components(&packages, &deps);
+    let sccs = okf_graph::tarjan_scc(packages.iter().copied(), |node| {
+        deps.get(node).into_iter().flatten().copied().collect()
+    });
     let scc_of: HashMap<&str, usize> = sccs
         .iter()
         .enumerate()
@@ -214,81 +216,6 @@ pub fn domains(graph: &Graph<'_>) -> Vec<Domain> {
             package_ids: ids.into_iter().map(String::from).collect(),
         })
         .collect()
-}
-
-/// Standard iterative-free (recursive) Tarjan's SCC algorithm over a
-/// plain adjacency map — a self-contained twin of `okf-graph`'s own
-/// (private, `Calls`/`CalledBy`-specific) Tarjan implementation, since
-/// this one runs over an arbitrary package-id adjacency instead of a
-/// `Graph`'s call edges. `nodes` (not just `adjacency`'s keys) is walked
-/// explicitly so a node with no edges at all still gets its own
-/// single-node SCC, in the order `nodes` lists them — deterministic as
-/// long as the caller passes a deterministically ordered `nodes`.
-fn strongly_connected_components<'a>(
-    nodes: &[&'a str],
-    adjacency: &HashMap<&'a str, HashSet<&'a str>>,
-) -> Vec<Vec<&'a str>> {
-    struct Tarjan<'a, 'g> {
-        adjacency: &'g HashMap<&'a str, HashSet<&'a str>>,
-        index_counter: usize,
-        index: HashMap<&'a str, usize>,
-        lowlink: HashMap<&'a str, usize>,
-        on_stack: HashSet<&'a str>,
-        stack: Vec<&'a str>,
-        sccs: Vec<Vec<&'a str>>,
-    }
-
-    impl<'a, 'g> Tarjan<'a, 'g> {
-        fn visit(&mut self, node: &'a str) {
-            self.index.insert(node, self.index_counter);
-            self.lowlink.insert(node, self.index_counter);
-            self.index_counter += 1;
-            self.stack.push(node);
-            self.on_stack.insert(node);
-
-            for &neighbor in self.adjacency.get(node).into_iter().flatten() {
-                if !self.index.contains_key(neighbor) {
-                    self.visit(neighbor);
-                    let neighbor_low = self.lowlink[neighbor];
-                    let my_low = self.lowlink[node];
-                    self.lowlink.insert(node, my_low.min(neighbor_low));
-                } else if self.on_stack.contains(neighbor) {
-                    let neighbor_idx = self.index[neighbor];
-                    let my_low = self.lowlink[node];
-                    self.lowlink.insert(node, my_low.min(neighbor_idx));
-                }
-            }
-
-            if self.lowlink[node] == self.index[node] {
-                let mut scc = Vec::new();
-                loop {
-                    let member = self.stack.pop().unwrap();
-                    self.on_stack.remove(member);
-                    scc.push(member);
-                    if member == node {
-                        break;
-                    }
-                }
-                self.sccs.push(scc);
-            }
-        }
-    }
-
-    let mut tarjan = Tarjan {
-        adjacency,
-        index_counter: 0,
-        index: HashMap::new(),
-        lowlink: HashMap::new(),
-        on_stack: HashSet::new(),
-        stack: Vec::new(),
-        sccs: Vec::new(),
-    };
-    for &node in nodes {
-        if !tarjan.index.contains_key(node) {
-            tarjan.visit(node);
-        }
-    }
-    tarjan.sccs
 }
 
 #[cfg(test)]

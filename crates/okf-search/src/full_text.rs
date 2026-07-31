@@ -122,11 +122,16 @@ impl FullTextIndex {
 
         let (parsed, _errors) = parser.parse_query_lenient(&split_identifier_words(query));
 
-        // Rank the full result set ourselves (rather than trusting
+        // Re-rank a bounded oversample ourselves (rather than trusting
         // `TopDocs::with_limit(limit)` alone) so a tie in Tantivy's BM25
         // score doesn't leave the order dependent on internal doc-id
-        // assignment.
-        let capacity = searcher.num_docs().max(1) as usize;
+        // assignment. An 8x oversample (with a floor so a small `limit`
+        // still re-ranks a meaningful pool) makes that tie-breaking
+        // deterministic for realistic levels of score ambiguity without
+        // paying to sort the entire corpus on every call regardless of
+        // how small `limit` is.
+        let corpus_size = searcher.num_docs().max(1) as usize;
+        let capacity = limit.saturating_mul(8).max(50).min(corpus_size);
         let top_docs = searcher.search(&parsed, &TopDocs::with_limit(capacity))?;
 
         let mut hits = Vec::with_capacity(top_docs.len());

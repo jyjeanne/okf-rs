@@ -13,21 +13,11 @@
 //! doesn't already give a DITA toolkit that opens this output.
 
 use anyhow::{Context, Result};
-use okf_parser::{Concept, RelationKind};
-use okf_render::{capitalize, group_by_kind_dir};
+use okf_parser::Concept;
+use okf_render::{capitalize, escape_markup, group_by_kind_dir, RELATIONSHIP_HEADINGS};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-
-const RELATIONSHIP_HEADINGS: [(RelationKind, &str); 7] = [
-    (RelationKind::Imports, "Imports"),
-    (RelationKind::Calls, "Calls"),
-    (RelationKind::CalledBy, "Called by"),
-    (RelationKind::Implements, "Implements"),
-    (RelationKind::Inherits, "Inherits"),
-    (RelationKind::DependsOn, "Depends on"),
-    (RelationKind::MemberOf, "Member of"),
-];
 
 /// Writes `concepts` as one DITA topic per concept (`<id>.dita`, mirroring
 /// the bundle's own per-kind directory layout) plus a root `root.ditamap`
@@ -62,39 +52,27 @@ fn topic_id(concept_id: &str) -> String {
     concept_id.replace('/', "-")
 }
 
-/// Escapes text for safe inclusion in DITA (XML) content — the same
-/// necessity `okf_docs`'s `escape_html` documents: signatures routinely
-/// contain `<`/`>`/`&` on their own merits (generics, templates), not
-/// just from adversarial input.
-fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 fn render_topic(concept: &Concept) -> String {
     let mut body = String::new();
 
     if let Some(signature) = &concept.signature {
         body.push_str(&format!(
             "<section><title>Signature</title><codeblock>{}</codeblock></section>\n",
-            escape_xml(signature)
+            escape_markup(signature)
         ));
     }
     body.push_str(&format!(
         "<section><title>Type</title><p>{}</p></section>\n",
-        escape_xml(&concept.frontmatter_type())
+        escape_markup(&concept.frontmatter_type())
     ));
     body.push_str(&format!(
         "<section><title>Location</title><p>{}</p></section>\n",
-        escape_xml(&concept.location.to_string())
+        escape_markup(&concept.location.to_string())
     ));
     if !concept.tags.is_empty() {
         body.push_str(&format!(
             "<section><title>Tags</title><p>{}</p></section>\n",
-            escape_xml(&concept.tags.join(", "))
+            escape_markup(&concept.tags.join(", "))
         ));
     }
     for (kind, heading) in RELATIONSHIP_HEADINGS {
@@ -109,7 +87,7 @@ fn render_topic(concept: &Concept) -> String {
         }
         body.push_str(&format!("<section><title>{heading}</title><ul>\n"));
         for target in targets {
-            body.push_str(&format!("<li>{}</li>\n", escape_xml(target)));
+            body.push_str(&format!("<li>{}</li>\n", escape_markup(target)));
         }
         body.push_str("</ul></section>\n");
     }
@@ -117,13 +95,13 @@ fn render_topic(concept: &Concept) -> String {
     let shortdesc = concept
         .description
         .as_deref()
-        .map(|d| format!("<shortdesc>{}</shortdesc>\n", escape_xml(d)))
+        .map(|d| format!("<shortdesc>{}</shortdesc>\n", escape_markup(d)))
         .unwrap_or_default();
 
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE topic PUBLIC \"-//OASIS//DTD DITA Topic//EN\" \"topic.dtd\">\n<topic id=\"{}\">\n<title>{}</title>\n{shortdesc}<body>\n{body}</body>\n</topic>\n",
         topic_id(&concept.id),
-        escape_xml(&concept.name),
+        escape_markup(&concept.name),
     )
 }
 
@@ -134,12 +112,12 @@ fn render_map(by_dir: &BTreeMap<&str, Vec<&Concept>>) -> String {
     for (dir, entries) in by_dir {
         out.push_str(&format!(
             "<topichead navtitle=\"{}\">\n",
-            escape_xml(&capitalize(dir))
+            escape_markup(&capitalize(dir))
         ));
         for concept in entries {
             out.push_str(&format!(
                 "<topicref href=\"{}.dita\"/>\n",
-                escape_xml(&concept.id)
+                escape_markup(&concept.id)
             ));
         }
         out.push_str("</topichead>\n");
@@ -151,7 +129,7 @@ fn render_map(by_dir: &BTreeMap<&str, Vec<&Concept>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use okf_parser::{ConceptKind, Language, Location, Relationship};
+    use okf_parser::{ConceptKind, Language, Location, RelationKind, Relationship};
 
     fn concept(kind: ConceptKind, name: &str, qualified: &str, file: &str) -> Concept {
         Concept {

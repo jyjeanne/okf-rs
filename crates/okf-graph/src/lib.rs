@@ -341,14 +341,11 @@ impl<'a> Graph<'a> {
     /// cycles is combinatorially expensive and rarely what "does this
     /// have a cycle" questions actually need.
     pub fn cycles(&self) -> Vec<Vec<&'a str>> {
-        let mut tarjan = Tarjan::new(self);
-        for concept in self.concepts {
-            if !tarjan.index.contains_key(concept.id.as_str()) {
-                tarjan.visit(&concept.id);
-            }
-        }
-        let mut cycles: Vec<Vec<&str>> = tarjan
-            .sccs
+        let nodes = self.concepts.iter().map(|c| c.id.as_str());
+        let sccs = tarjan_scc(nodes, |id| {
+            self.callees(id).iter().map(|c| c.id.as_str()).collect()
+        });
+        let mut cycles: Vec<Vec<&str>> = sccs
             .into_iter()
             .filter(|scc| {
                 scc.len() > 1
@@ -406,77 +403,91 @@ impl<'a> Graph<'a> {
 /// A structural concept: a container (`Module`/`Package`) or
 /// documentation (`Document`), never itself a call-graph participant or
 /// API surface — see [`Graph::public_api`]/[`Graph::isolated_concepts`],
-/// which both exclude these kinds for the same reason.
-fn is_structural(kind: ConceptKind) -> bool {
+/// which both exclude these kinds for the same reason. Exposed for reuse
+/// wherever else the same structural/non-structural distinction applies
+/// (e.g. `okf_query`'s coverage report).
+pub fn is_structural(kind: ConceptKind) -> bool {
     matches!(
         kind,
         ConceptKind::Module | ConceptKind::Package | ConceptKind::Document
     )
 }
 
-/// Standard recursive Tarjan's SCC algorithm, scoped to the `Calls` graph.
-struct Tarjan<'a, 'g> {
-    graph: &'g Graph<'a>,
-    index_counter: usize,
-    index: HashMap<&'a str, usize>,
-    lowlink: HashMap<&'a str, usize>,
-    on_stack: HashSet<&'a str>,
-    stack: Vec<&'a str>,
-    sccs: Vec<Vec<&'a str>>,
-}
-
-impl<'a, 'g> Tarjan<'a, 'g> {
-    fn new(graph: &'g Graph<'a>) -> Self {
-        Tarjan {
-            graph,
-            index_counter: 0,
-            index: HashMap::new(),
-            lowlink: HashMap::new(),
-            on_stack: HashSet::new(),
-            stack: Vec::new(),
-            sccs: Vec::new(),
-        }
+/// Standard recursive Tarjan's strongly-connected-components algorithm,
+/// generic over any string-id node space and neighbor lookup — shared by
+/// [`Graph::cycles`] (scoped to a concept graph's `Calls` edges) and
+/// `okf_arch`'s package-dependency-cycle collapsing (scoped to an
+/// explicit package-id adjacency map), which would otherwise each need
+/// their own copy of the same algorithm. `nodes` is walked explicitly
+/// (not just discovered via `neighbors`) so a node with no edges at all
+/// still gets its own single-node SCC, in the order `nodes` lists them —
+/// deterministic as long as the caller passes a deterministically
+/// ordered `nodes`.
+pub fn tarjan_scc<'a>(
+    nodes: impl IntoIterator<Item = &'a str>,
+    neighbors: impl Fn(&'a str) -> Vec<&'a str>,
+) -> Vec<Vec<&'a str>> {
+    struct Tarjan<'a, F> {
+        neighbors: F,
+        index_counter: usize,
+        index: HashMap<&'a str, usize>,
+        lowlink: HashMap<&'a str, usize>,
+        on_stack: HashSet<&'a str>,
+        stack: Vec<&'a str>,
+        sccs: Vec<Vec<&'a str>>,
     }
 
-    fn visit(&mut self, id: &str) {
-        let Some(concept) = self.graph.get(id) else {
-            return;
-        };
-        let id = concept.id.as_str();
+    impl<'a, F: Fn(&'a str) -> Vec<&'a str>> Tarjan<'a, F> {
+        fn visit(&mut self, node: &'a str) {
+            self.index.insert(node, self.index_counter);
+            self.lowlink.insert(node, self.index_counter);
+            self.index_counter += 1;
+            self.stack.push(node);
+            self.on_stack.insert(node);
 
-        self.index.insert(id, self.index_counter);
-        self.lowlink.insert(id, self.index_counter);
-        self.index_counter += 1;
-        self.stack.push(id);
-        self.on_stack.insert(id);
-
-        for callee in self.graph.callees(id) {
-            let callee_id = callee.id.as_str();
-            if !self.index.contains_key(callee_id) {
-                self.visit(callee_id);
-                let callee_low = self.lowlink[callee_id];
-                let my_low = self.lowlink[id];
-                self.lowlink.insert(id, my_low.min(callee_low));
-            } else if self.on_stack.contains(callee_id) {
-                let callee_idx = self.index[callee_id];
-                let my_low = self.lowlink[id];
-                self.lowlink.insert(id, my_low.min(callee_idx));
-            }
-        }
-
-        if self.lowlink[id] == self.index[id] {
-            let mut scc = Vec::new();
-            loop {
-                let member = self.stack.pop().unwrap();
-                self.on_stack.remove(member);
-                scc.push(member);
-                if member == id {
-                    break;
+            for neighbor in (self.neighbors)(node) {
+                if !self.index.contains_key(neighbor) {
+                    self.visit(neighbor);
+                    let neighbor_low = self.lowlink[neighbor];
+                    let my_low = self.lowlink[node];
+                    self.lowlink.insert(node, my_low.min(neighbor_low));
+                } else if self.on_stack.contains(neighbor) {
+                    let neighbor_idx = self.index[neighbor];
+                    let my_low = self.lowlink[node];
+                    self.lowlink.insert(node, my_low.min(neighbor_idx));
                 }
             }
-            self.sccs.push(scc);
+
+            if self.lowlink[node] == self.index[node] {
+                let mut scc = Vec::new();
+                loop {
+                    let member = self.stack.pop().unwrap();
+                    self.on_stack.remove(member);
+                    scc.push(member);
+                    if member == node {
+                        break;
+                    }
+                }
+                self.sccs.push(scc);
+            }
         }
     }
+
+    let mut tarjan = Tarjan {
+        neighbors,
+        index_counter: 0,
+        index: HashMap::new(),
+        lowlink: HashMap::new(),
+        on_stack: HashSet::new(),
+        stack: Vec::new(),
+        sccs: Vec::new(),
+    };
+    for node in nodes {
+        if !tarjan.index.contains_key(node) {
+            tarjan.visit(node);
+        }
+    }
+    tarjan.sccs
 }
 
 #[cfg(test)]

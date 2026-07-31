@@ -541,24 +541,47 @@ fn cmd_generate(
         None
     };
 
+    // A config or endpoint failure here is captured rather than
+    // propagated immediately: the analysis (and any DITA import) above
+    // already did real work, and `?`-ing out of this block would discard
+    // all of it — the bundle/cache below get written from whatever
+    // `result.concepts` ended up with (unenriched, if enrichment never
+    // got to run; partially enriched, if it failed partway through)
+    // either way, and the enrichment failure itself is reported after,
+    // as a non-zero exit rather than silently swallowed.
+    let mut enrich_error: Option<anyhow::Error> = None;
     let enrich_stats = if enrich.enrich {
-        let config = resolve_enrich_config(enrich.base_url, enrich.model, enrich.api_key)?;
-        let client = okf_enrich::EnrichClient::new(config);
-        // The bundle previously written to `output` (if any), read before
-        // `write_bundle` below overwrites it — a concept whose id already
-        // carries a description there (human-written, or from an earlier
-        // `--enrich` run) is reused instead of re-queried, since a fresh
-        // `analyze` never carries descriptions forward on its own.
-        let previous = if output.is_dir() {
-            okf_parser::read_bundle(&output)?
-        } else {
-            Vec::new()
-        };
-        Some(okf_enrich::enrich_missing_descriptions(
-            &client,
-            &mut result.concepts,
-            &previous,
-        )?)
+        match resolve_enrich_config(enrich.base_url, enrich.model, enrich.api_key) {
+            Ok(config) => {
+                let client = okf_enrich::EnrichClient::new(config);
+                // The bundle previously written to `output` (if any), read
+                // before `write_bundle` below overwrites it — a concept
+                // whose id already carries a description there (human-
+                // written, or from an earlier `--enrich` run) is reused
+                // instead of re-queried, since a fresh `analyze` never
+                // carries descriptions forward on its own.
+                let previous = if output.is_dir() {
+                    okf_parser::read_bundle(&output)?
+                } else {
+                    Vec::new()
+                };
+                match okf_enrich::enrich_missing_descriptions(
+                    &client,
+                    &mut result.concepts,
+                    &previous,
+                ) {
+                    Ok(stats) => Some(stats),
+                    Err(e) => {
+                        enrich_error = Some(e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                enrich_error = Some(e);
+                None
+            }
+        }
     } else {
         None
     };
@@ -592,6 +615,11 @@ fn cmd_generate(
     }
     for (kind, count) in by_kind {
         println!("  {:<12} {count}", kind.as_str());
+    }
+
+    if let Some(e) = enrich_error {
+        eprintln!("error: {e:#}");
+        return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
 }
