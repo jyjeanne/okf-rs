@@ -156,6 +156,14 @@ This is safe to run on a large, real codebase: it's `.gitignore`-aware (never de
 
 Decide whether `knowledge/` itself belongs in git. Both are reasonable: committing it means the bundle reviews alongside the code that produced it (and is diffable, per PR, in `git diff`); `.gitignore`-ing it means treating it as a build artifact regenerated in CI. Either way, run `okf-rs validate --ci` in CI (see step 6) so a stale or broken bundle never ships silently.
 
+#### Optional: fill in missing descriptions with an LLM
+
+```sh
+okf-rs generate --enrich --enrich-base-url http://localhost:11434/v1 --enrich-model llama3.1
+```
+
+Entirely optional, and never a hard dependency on one vendor: `--enrich` speaks the same `chat/completions` shape every OpenAI-compatible endpoint implements, so it works unmodified against [Ollama](https://ollama.com), LM Studio, LocalAI, [Crustly](https://github.com/jyjeanne/crustly), or a cloud provider (pass `--enrich-api-key`, or set `OKF_ENRICH_API_KEY`) — a local server generally doesn't need one. Only concepts with no description are ever queried or overwritten: a hand-written one is left alone, and a previous `--enrich` run's output is reused straight from the bundle on disk rather than re-querying the endpoint on every `generate`.
+
 ### 4. Explore it
 
 ```sh

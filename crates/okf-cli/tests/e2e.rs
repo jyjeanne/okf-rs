@@ -14,10 +14,12 @@
 //! other across parallel tests.
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 fn bin_path() -> PathBuf {
@@ -474,6 +476,132 @@ fn standalone_binary_watch_regenerates_the_bundle_on_startup() {
         "expected the baseline regenerate to be reported, got: {lines:?}"
     );
     assert!(project.join("knowledge/index.md").exists());
+}
+
+/// A minimal, single-endpoint OpenAI-compatible mock server: reads one
+/// HTTP/1.1 request off each accepted connection, ignores everything
+/// about it except that it arrived, and replies with a canned
+/// `chat.completions`-shaped JSON body — enough for `okf-rs generate
+/// --enrich` to point its `--enrich-base-url` at, without a real network
+/// call or a real LLM in the test environment.
+fn start_mock_enrich_server() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&request_count);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line.trim_end().is_empty() {
+                    break;
+                }
+                if let Some(value) = line.trim_end().strip_prefix("Content-Length: ") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+
+            let payload = r#"{"choices":[{"message":{"content":"a generated description"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    (format!("http://127.0.0.1:{port}/v1"), request_count)
+}
+
+/// `okf-rs generate --enrich` fills in missing function/module
+/// descriptions via an OpenAI-compatible endpoint, and a second run
+/// against the same output reuses them from the bundle already on disk
+/// instead of re-querying the (mock) endpoint.
+#[test]
+fn standalone_binary_generate_enrich_fills_descriptions_and_a_second_run_reuses_them() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn undocumented() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
+
+    let (base_url, request_count) = start_mock_enrich_server();
+    let enrich_args = [
+        "generate",
+        ".",
+        "--enrich",
+        "--enrich-base-url",
+        &base_url,
+        "--enrich-model",
+        "test-model",
+    ];
+
+    // The tiny fixture above has two enrichable concepts: the `src/lib.rs`
+    // Module, and the `undocumented` Function (no manifest, so no Package).
+    let first = run(&project, &enrich_args);
+    assert_success(&first, &["generate --enrich"]);
+    let first_out = stdout_of(&first);
+    assert!(first_out.contains("Enriched 2 concepts (2 generated, 0 reused"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let bundle_file = project.join("knowledge/functions/src/undocumented.md");
+    let content = fs::read_to_string(&bundle_file).unwrap();
+    assert!(content.contains("description: a generated description"));
+
+    // A second run: the concepts still have no doc comment in source, but
+    // the bundle written above already carries a description for both,
+    // so they must be reused rather than triggering another mock-server
+    // call.
+    let second = run(&project, &enrich_args);
+    assert_success(&second, &["generate --enrich (second run)"]);
+    let second_out = stdout_of(&second);
+    assert!(second_out.contains("Enriched 2 concepts (0 generated, 2 reused"));
+    assert_eq!(
+        request_count.load(Ordering::SeqCst),
+        2,
+        "the second run should not have queried the enrichment endpoint again"
+    );
+
+    let validate = run(&project, &["validate", "--project", "."]);
+    assert_success(&validate, &["validate"]);
+    assert!(stdout_of(&validate).contains("no issues found"));
+}
+
+/// `--enrich` without an endpoint configured (no `--enrich-base-url`/
+/// `--enrich-model`, no matching env var) is a clear, non-zero-exit
+/// error naming both the flag and its env var fallback — not a panic or
+/// an opaque network error from a client that was never configured.
+#[test]
+fn standalone_binary_generate_enrich_without_an_endpoint_is_a_clear_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path();
+    fs::write(project.join("lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let result = Command::new(bin_path())
+        .args(["generate", ".", "--enrich"])
+        .current_dir(project)
+        .env_remove("OKF_ENRICH_BASE_URL")
+        .env_remove("OKF_ENRICH_MODEL")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let stderr = stderr_of(&result);
+    assert!(stderr.contains("--enrich-base-url"));
+    assert!(stderr.contains("OKF_ENRICH_BASE_URL"));
 }
 
 /// Commands that read an existing bundle fail with a clear, non-zero-exit

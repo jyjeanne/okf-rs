@@ -59,6 +59,29 @@ enum Command {
         /// than a plain `generate`.
         #[arg(long)]
         lsp: bool,
+        /// Fill in missing function/method/module/package descriptions
+        /// via an OpenAI-compatible chat completions endpoint (Ollama, LM
+        /// Studio, LocalAI, Crustly, or a cloud provider). A concept that
+        /// already has a description — including one from a previous
+        /// `--enrich` run, carried forward from the existing bundle at
+        /// `--output` — is never re-queried or overwritten. Requires
+        /// `--enrich-base-url`/`--enrich-model` (or the
+        /// `OKF_ENRICH_BASE_URL`/`OKF_ENRICH_MODEL` environment variables).
+        #[arg(long)]
+        enrich: bool,
+        /// Enrichment endpoint base URL, e.g. `http://localhost:11434/v1`
+        /// for Ollama. Falls back to `OKF_ENRICH_BASE_URL` if unset.
+        #[arg(long)]
+        enrich_base_url: Option<String>,
+        /// Enrichment model name, e.g. `llama3.1`. Falls back to
+        /// `OKF_ENRICH_MODEL` if unset.
+        #[arg(long)]
+        enrich_model: Option<String>,
+        /// Enrichment endpoint API key, sent as `Authorization: Bearer
+        /// <key>`. Omit for a local server that doesn't need one. Falls
+        /// back to `OKF_ENRICH_API_KEY` if unset.
+        #[arg(long)]
+        enrich_api_key: Option<String>,
     },
     /// Watch a project and keep its OKF bundle up to date as files change.
     /// Runs until interrupted (Ctrl+C). Regenerates once immediately, then
@@ -252,7 +275,22 @@ fn run(command: Command) -> Result<ExitCode> {
             output,
             no_cache,
             lsp,
-        } => cmd_generate(&path, output, no_cache, lsp),
+            enrich,
+            enrich_base_url,
+            enrich_model,
+            enrich_api_key,
+        } => cmd_generate(
+            &path,
+            output,
+            no_cache,
+            lsp,
+            EnrichArgs {
+                enrich,
+                base_url: enrich_base_url,
+                model: enrich_model,
+                api_key: enrich_api_key,
+            },
+        ),
         Command::Watch {
             path,
             output,
@@ -363,11 +401,21 @@ fn cmd_scan(path: &std::path::Path) -> Result<ExitCode> {
 /// `.gitignore` like `target/`.
 const CACHE_FILE: &str = ".okf-cache.json";
 
+/// The `--enrich*` flags bundled together, so `cmd_generate` takes one
+/// parameter for them instead of four.
+struct EnrichArgs {
+    enrich: bool,
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+}
+
 fn cmd_generate(
     path: &std::path::Path,
     output: Option<PathBuf>,
     no_cache: bool,
     lsp: bool,
+    enrich: EnrichArgs,
 ) -> Result<ExitCode> {
     let project = Project::load(path)?;
     let output = resolve_bundle_arg(&project.root, output);
@@ -378,7 +426,30 @@ fn cmd_generate(
     } else {
         okf_analyzer::AnalysisCache::load(&cache_path)
     };
-    let (result, stats) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache, lsp)?;
+    let (mut result, stats) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache, lsp)?;
+
+    let enrich_stats = if enrich.enrich {
+        let config = resolve_enrich_config(enrich.base_url, enrich.model, enrich.api_key)?;
+        let client = okf_enrich::EnrichClient::new(config);
+        // The bundle previously written to `output` (if any), read before
+        // `write_bundle` below overwrites it — a concept whose id already
+        // carries a description there (human-written, or from an earlier
+        // `--enrich` run) is reused instead of re-queried, since a fresh
+        // `analyze` never carries descriptions forward on its own.
+        let previous = if output.is_dir() {
+            okf_parser::read_bundle(&output)?
+        } else {
+            Vec::new()
+        };
+        Some(okf_enrich::enrich_missing_descriptions(
+            &client,
+            &mut result.concepts,
+            &previous,
+        )?)
+    } else {
+        None
+    };
+
     okf_generator::write_bundle(&result.concepts, &output)?;
     if !no_cache {
         cache.save(&cache_path)?;
@@ -395,10 +466,50 @@ fn cmd_generate(
         stats.reparsed,
         stats.reused
     );
+    if let Some(enrich_stats) = enrich_stats {
+        println!(
+            "Enriched {} concepts ({} generated, {} reused from the previous bundle)",
+            enrich_stats.generated + enrich_stats.reused,
+            enrich_stats.generated,
+            enrich_stats.reused
+        );
+    }
     for (kind, count) in by_kind {
         println!("  {:<12} {count}", kind.as_str());
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Resolves `--enrich-*` flags, falling back to the matching
+/// `OKF_ENRICH_*` environment variable, then erroring clearly (naming
+/// both the flag and the env var) if neither supplies a required value.
+/// `api_key` alone has no required fallback — a local server (Ollama, LM
+/// Studio, LocalAI) typically doesn't need one.
+fn resolve_enrich_config(
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+) -> Result<okf_enrich::EnrichConfig> {
+    let base_url = base_url
+        .or_else(|| std::env::var("OKF_ENRICH_BASE_URL").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--enrich requires --enrich-base-url (or the OKF_ENRICH_BASE_URL environment variable)"
+            )
+        })?;
+    let model = model
+        .or_else(|| std::env::var("OKF_ENRICH_MODEL").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--enrich requires --enrich-model (or the OKF_ENRICH_MODEL environment variable)"
+            )
+        })?;
+    let api_key = api_key.or_else(|| std::env::var("OKF_ENRICH_API_KEY").ok());
+    Ok(okf_enrich::EnrichConfig {
+        base_url,
+        model,
+        api_key,
+    })
 }
 
 fn cmd_watch(
