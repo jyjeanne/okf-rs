@@ -185,15 +185,14 @@ impl<'a> Graph<'a> {
     }
 
     /// Every concept marked public (see [`Concept::is_public`]), sorted
-    /// by id for deterministic output. `Module`/`Package` concepts are
-    /// excluded — they're structural containers, not API surface.
+    /// by id for deterministic output. `Module`/`Package`/`Document`
+    /// concepts are excluded — they're structural containers or
+    /// documentation, not API surface.
     pub fn public_api(&self) -> Vec<&'a Concept> {
         let mut public: Vec<&Concept> = self
             .concepts
             .iter()
-            .filter(|c| {
-                c.is_public && !matches!(c.kind, ConceptKind::Module | ConceptKind::Package)
-            })
+            .filter(|c| c.is_public && !is_structural(c.kind))
             .collect();
         public.sort_by(|a, b| a.id.cmp(&b.id));
         public
@@ -227,11 +226,11 @@ impl<'a> Graph<'a> {
 
     /// Concepts with no `Calls`/`CalledBy` edge in either direction:
     /// never observed calling anything, and never observed being called.
-    /// `Module`/`Package` concepts are excluded — they're structural
-    /// containers, not call-graph participants, so having no `Calls`
-    /// edge of their own is expected rather than a quality signal (see
-    /// `public_api`, which excludes them for the same reason). Sorted by
-    /// id for deterministic output.
+    /// `Module`/`Package`/`Document` concepts are excluded — they're
+    /// structural containers or documentation, not call-graph
+    /// participants, so having no `Calls` edge of their own is expected
+    /// rather than a quality signal (see `public_api`, which excludes
+    /// them for the same reason). Sorted by id for deterministic output.
     ///
     /// This is a different notion of "orphan" than `okf-validator`'s
     /// index-reachability check: that one asks whether a concept is
@@ -246,7 +245,7 @@ impl<'a> Graph<'a> {
         let mut isolated: Vec<&Concept> = self
             .concepts
             .iter()
-            .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package))
+            .filter(|c| !is_structural(c.kind))
             .filter(|c| {
                 !c.relationships
                     .iter()
@@ -402,6 +401,17 @@ impl<'a> Graph<'a> {
         }
         None
     }
+}
+
+/// A structural concept: a container (`Module`/`Package`) or
+/// documentation (`Document`), never itself a call-graph participant or
+/// API surface — see [`Graph::public_api`]/[`Graph::isolated_concepts`],
+/// which both exclude these kinds for the same reason.
+fn is_structural(kind: ConceptKind) -> bool {
+    matches!(
+        kind,
+        ConceptKind::Module | ConceptKind::Package | ConceptKind::Document
+    )
 }
 
 /// Standard recursive Tarjan's SCC algorithm, scoped to the `Calls` graph.
@@ -574,6 +584,19 @@ mod tests {
         let api = graph.public_api();
         assert_eq!(api.len(), 1);
         assert_eq!(api[0].id, "functions/a/pub_fn");
+    }
+
+    #[test]
+    fn document_concepts_are_excluded_from_public_api_and_isolated_concepts() {
+        // A Document (e.g. an okf-dita-imported DITA topic) is
+        // structural the same way Module/Package are: never expected to
+        // carry a Calls/CalledBy edge, and not API surface.
+        let doc = concept("documents/readme", ConceptKind::Document, "readme.dita", true);
+        let concepts = vec![doc];
+        let graph = Graph::build(&concepts);
+
+        assert!(graph.public_api().is_empty());
+        assert!(graph.isolated_concepts().is_empty());
     }
 
     #[test]

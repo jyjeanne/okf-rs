@@ -289,6 +289,83 @@ fn standalone_binary_runs_the_full_command_surface_against_this_project() {
         "expected a well-formed PDF header"
     );
     assert!(pdf_bytes.len() > 1000, "suspiciously small PDF output");
+
+    // docs --format dita: one DITA topic per concept plus a root map.
+    let docs_dita = run(
+        &project,
+        &[
+            "docs",
+            "--project",
+            ".",
+            "--format",
+            "dita",
+            "--output",
+            "docs-dita",
+        ],
+    );
+    assert_success(&docs_dita, &["docs dita"]);
+    assert!(project.join("docs-dita/root.ditamap").exists());
+}
+
+/// `okf-rs generate --dita` imports a DITA corpus as `Document` concepts,
+/// merged into the same bundle as concepts extracted from source — and,
+/// since export and import are the two halves of one converter, this
+/// exercises them together: export a tiny bundle to DITA, then import
+/// that exact output back into a second project's `generate --dita` run.
+#[test]
+fn standalone_binary_generate_dita_imports_topics_as_document_concepts() {
+    let workspace = tempfile::tempdir().unwrap();
+
+    let source_project = workspace.path().join("source");
+    fs::create_dir_all(source_project.join("src")).unwrap();
+    fs::write(
+        source_project.join("src/lib.rs"),
+        "pub fn hello() -> &'static str {\n    \"hello\"\n}\n",
+    )
+    .unwrap();
+    let generate = run(&source_project, &["generate", "."]);
+    assert_success(&generate, &["generate (source project)"]);
+
+    let dita_dir = workspace.path().join("dita-export");
+    let export = run(
+        &source_project,
+        &[
+            "docs",
+            "--project",
+            ".",
+            "--format",
+            "dita",
+            "--output",
+            dita_dir.to_str().unwrap(),
+        ],
+    );
+    assert_success(&export, &["docs --format dita"]);
+
+    let target_project = workspace.path().join("target");
+    fs::create_dir_all(target_project.join("src")).unwrap();
+    fs::write(
+        target_project.join("src/lib.rs"),
+        "pub fn world() -> &'static str {\n    \"world\"\n}\n",
+    )
+    .unwrap();
+    let import = run(
+        &target_project,
+        &["generate", ".", "--dita", dita_dir.to_str().unwrap()],
+    );
+    assert_success(&import, &["generate --dita"]);
+    let import_out = stdout_of(&import);
+    assert!(import_out.contains("Imported 2 DITA topics as Document concepts"));
+    assert!(import_out.contains("Document     2"));
+
+    let validate = run(&target_project, &["validate", "--project", "."]);
+    assert_success(&validate, &["validate"]);
+    assert!(stdout_of(&validate).contains("no issues found"));
+
+    // The imported Document concept is searchable alongside the target
+    // project's own extracted code, not living in a separate system.
+    let search = run(&target_project, &["search", "hello", "--project", "."]);
+    assert_success(&search, &["search"]);
+    assert!(stdout_of(&search).contains("DITA Document"));
 }
 
 /// `okf-rs diff` compares two git refs' OKF concepts via disposable

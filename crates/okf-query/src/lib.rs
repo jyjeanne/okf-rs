@@ -206,12 +206,13 @@ pub fn graph_isolated(bundle: &Path) -> Result<String> {
 /// handed straight to `serde_json`/an HTTP response without another
 /// conversion step.
 ///
-/// The call-graph-participation metric excludes `Module`/`Package`
-/// concepts from its denominator, matching `Graph::isolated_concepts`'s
-/// own exclusion: they're structural containers that are never expected
-/// to carry a `Calls`/`CalledBy` edge, so counting them would understate
-/// coverage for reasons that have nothing to do with documentation or
-/// analysis quality.
+/// The call-graph-participation metric excludes `Module`/`Package`/
+/// `Document` concepts from its denominator, matching
+/// `Graph::isolated_concepts`'s own exclusion: they're structural
+/// containers or documentation that are never expected to carry a
+/// `Calls`/`CalledBy` edge, so counting them would understate coverage
+/// for reasons that have nothing to do with documentation or analysis
+/// quality.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CoverageReport {
     /// Total number of concepts in the bundle.
@@ -221,20 +222,22 @@ pub struct CoverageReport {
     /// How many concepts have at least one tag.
     pub with_tags: usize,
     /// Call-graph participation, or `None` when there are no non-
-    /// `Module`/`Package` concepts to measure it against (the "N/A" case
-    /// in [`coverage`]'s rendered text) — a bundle made only of
-    /// structural containers has nothing this metric could report on.
+    /// `Module`/`Package`/`Document` concepts to measure it against (the
+    /// "N/A" case in [`coverage`]'s rendered text) — a bundle made only
+    /// of structural containers/documentation has nothing this metric
+    /// could report on.
     pub graph_participation: Option<GraphParticipation>,
 }
 
 /// How much of a bundle's call-graph-eligible concepts (everything
-/// except `Module`/`Package`) actually participate in the `Calls`/
-/// `CalledBy` graph — see [`CoverageReport::graph_participation`].
+/// except `Module`/`Package`/`Document`) actually participate in the
+/// `Calls`/`CalledBy` graph — see [`CoverageReport::graph_participation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct GraphParticipation {
     /// Concepts with at least one `Calls`/`CalledBy` edge.
     pub connected: usize,
-    /// Concepts eligible to participate at all (excludes `Module`/`Package`).
+    /// Concepts eligible to participate at all (excludes
+    /// `Module`/`Package`/`Document`).
     pub eligible: usize,
 }
 
@@ -244,10 +247,10 @@ impl fmt::Display for CoverageReport {
             return write!(f, "Bundle has no concepts");
         }
         let graph_line = match self.graph_participation {
-            None => "  N/A (no non-Module/Package concepts to measure) participate in the call graph"
+            None => "  N/A (no non-Module/Package/Document concepts to measure) participate in the call graph"
                 .to_string(),
             Some(GraphParticipation { connected, eligible }) => format!(
-                "  {}% ({connected}/{eligible}) participate in the call graph (excludes Module/Package; see `graph isolated` for the rest)",
+                "  {}% ({connected}/{eligible}) participate in the call graph (excludes Module/Package/Document; see `graph isolated` for the rest)",
                 percent(connected, eligible)
             ),
         };
@@ -298,11 +301,11 @@ pub fn coverage_report(bundle: &Path) -> Result<CoverageReport> {
         .collect();
     let eligible = concepts
         .iter()
-        .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package))
+        .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package | ConceptKind::Document))
         .count();
     let connected = concepts
         .iter()
-        .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package))
+        .filter(|c| !matches!(c.kind, ConceptKind::Module | ConceptKind::Package | ConceptKind::Document))
         .filter(|c| !isolated.contains(c.id.as_str()))
         .count();
 
@@ -748,7 +751,7 @@ mod tests {
         let text = coverage(dir.path()).unwrap();
         assert!(text.starts_with("2 concepts"));
         assert!(
-            text.contains("N/A (no non-Module/Package concepts to measure) participate in the call graph"),
+            text.contains("N/A (no non-Module/Package/Document concepts to measure) participate in the call graph"),
             "a bundle with nothing but Module/Package concepts should report N/A, not a misleading 0%: {text}"
         );
         assert!(!text.contains("0% (0/0)"));

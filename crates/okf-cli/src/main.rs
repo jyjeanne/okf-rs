@@ -82,6 +82,13 @@ enum Command {
         /// back to `OKF_ENRICH_API_KEY` if unset.
         #[arg(long)]
         enrich_api_key: Option<String>,
+        /// Also import an existing DITA XML corpus (a directory of
+        /// `.dita`/`.xml` topic files, or a single file) as `Document`
+        /// concepts, merged into the same bundle alongside the concepts
+        /// extracted from source code. A topic that fails to parse is
+        /// skipped with a warning rather than failing the whole command.
+        #[arg(long)]
+        dita: Option<PathBuf>,
     },
     /// Watch a project and keep its OKF bundle up to date as files change.
     /// Runs until interrupted (Ctrl+C). Regenerates once immediately, then
@@ -187,16 +194,16 @@ enum Command {
     },
     /// Generate human-readable documentation from a previously generated OKF
     /// bundle: a browsable static HTML site, a single consolidated Markdown
-    /// document, or a single paginated PDF.
+    /// document, a single paginated PDF, or a DITA topic set.
     Docs {
         /// Defaults to the value in `okf.toml`, or `knowledge`.
         bundle: Option<PathBuf>,
         /// Project directory to look up `okf.toml` in (not the bundle itself).
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
-        /// Output path: a directory for `--format html`, a file for
-        /// `--format markdown`/`--format pdf`. Defaults to `docs/`,
-        /// `docs.md`, or `docs.pdf` respectively.
+        /// Output path: a directory for `--format html`/`--format dita`,
+        /// a file for `--format markdown`/`--format pdf`. Defaults to
+        /// `docs/`, `docs.md`, `docs.pdf`, or `docs-dita/` respectively.
         #[arg(short, long)]
         output: Option<PathBuf>,
         #[arg(short, long, value_enum, default_value_t = DocsFormat::Html)]
@@ -209,6 +216,7 @@ enum DocsFormat {
     Html,
     Markdown,
     Pdf,
+    Dita,
 }
 
 #[derive(Subcommand)]
@@ -353,6 +361,7 @@ fn run(command: Command) -> Result<ExitCode> {
             enrich_base_url,
             enrich_model,
             enrich_api_key,
+            dita,
         } => cmd_generate(
             &path,
             output,
@@ -364,6 +373,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 model: enrich_model,
                 api_key: enrich_api_key,
             },
+            dita,
         ),
         Command::Watch {
             path,
@@ -505,6 +515,7 @@ fn cmd_generate(
     no_cache: bool,
     lsp: bool,
     enrich: EnrichArgs,
+    dita: Option<PathBuf>,
 ) -> Result<ExitCode> {
     let project = Project::load(path)?;
     let output = resolve_bundle_arg(&project.root, output);
@@ -516,6 +527,19 @@ fn cmd_generate(
         okf_analyzer::AnalysisCache::load(&cache_path)
     };
     let (mut result, stats) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache, lsp)?;
+
+    let dita_imported = if let Some(dita_path) = &dita {
+        let (concepts, skipped) = okf_dita::import_dita(dita_path)
+            .with_context(|| format!("failed to import DITA corpus at {}", dita_path.display()))?;
+        for skip in &skipped {
+            eprintln!("warning: skipped DITA topic {skip}");
+        }
+        let imported = concepts.len();
+        result.concepts.extend(concepts);
+        Some(imported)
+    } else {
+        None
+    };
 
     let enrich_stats = if enrich.enrich {
         let config = resolve_enrich_config(enrich.base_url, enrich.model, enrich.api_key)?;
@@ -562,6 +586,9 @@ fn cmd_generate(
             enrich_stats.generated,
             enrich_stats.reused
         );
+    }
+    if let Some(imported) = dita_imported {
+        println!("Imported {imported} DITA topics as Document concepts");
     }
     for (kind, count) in by_kind {
         println!("  {:<12} {count}", kind.as_str());
@@ -837,6 +864,15 @@ fn cmd_docs(
                 .with_context(|| format!("failed to write {}", output.display()))?;
             println!(
                 "Generated PDF documentation for {} concepts into {}",
+                concepts.len(),
+                output.display()
+            );
+        }
+        DocsFormat::Dita => {
+            let output = output.unwrap_or_else(|| PathBuf::from("docs-dita"));
+            okf_dita::export_dita(&concepts, &output)?;
+            println!(
+                "Generated DITA documentation for {} concepts into {}",
                 concepts.len(),
                 output.display()
             );

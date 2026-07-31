@@ -170,6 +170,14 @@ Once descriptions exist, `okf-rs suggest-links` (same `--enrich-*` flags) looks 
 okf-rs suggest-links --enrich-base-url http://localhost:11434/v1 --enrich-model llama3.1
 ```
 
+#### Optional: bring in an existing DITA corpus
+
+```sh
+okf-rs generate --dita path/to/dita-topics/
+```
+
+A technical-writing team's existing DITA XML topics import as `Document` concepts, merged into the same bundle alongside everything extracted from source — so `search`, `graph`, and every other command work over docs and code together. A topic that fails to parse is skipped with a warning rather than failing the whole command. Going the other way, `okf-rs docs --format dita` exports a bundle (code, imported docs, or both) back out as a DITA topic set.
+
 ### 4. Explore it
 
 ```sh
@@ -183,6 +191,7 @@ okf-rs graph patterns                                    # Builder/Singleton/Fac
 okf-rs graph features                                    # REST endpoints, database models, event-flow participants, by naming heuristic
 okf-rs docs --format html                                # a browsable static site, into docs/
 okf-rs docs --format pdf                                 # a single paginated PDF, into docs.pdf
+okf-rs docs --format dita                                # a DITA topic set + ditamap, into docs-dita/
 ```
 
 Concept ids (like `functions/src/auth/verify_token` above) come from `search`'s output — copy one from there rather than guessing the path convention.

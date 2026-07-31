@@ -20,6 +20,7 @@ okf-watch.workspace = true
 okf-docs.workspace = true
 okf-query.workspace = true
 okf-enrich.workspace = true
+okf-dita.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 
