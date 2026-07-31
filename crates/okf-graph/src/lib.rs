@@ -9,10 +9,74 @@
 //! uses the latter — it queries an existing bundle on disk rather than
 //! re-analyzing the project from source, the same way `okf-search` and
 //! `okf-validator` do.
+//!
+//! # Stability
+//!
+//! This is a public, documented library crate — not just an internal
+//! implementation detail of `okf-cli`/`okf-mcp` — versioned together with
+//! the rest of the `okf-rs` workspace (a single `Cargo.toml`-wide semver
+//! number, bumped by the same release process for every crate). A
+//! breaking change to `Graph`'s public API is a breaking change for the
+//! whole workspace, not something that can land silently. Every public
+//! item is documented (enforced by `#![deny(missing_docs)]` below), so a
+//! consumer other than `okf-cli`/`okf-mcp` — e.g. `okf-server` in Phase 4
+//! — can embed this crate directly against concepts it already has in
+//! memory, without shelling out to the `okf-rs` binary and parsing its
+//! text output.
+//!
+//! # Example
+//!
+//! ```
+//! # use okf_parser::{Concept, ConceptKind, Language, Location, RelationKind, Relationship};
+//! # fn concept(id: &str) -> Concept {
+//! #     Concept {
+//! #         id: id.to_string(),
+//! #         kind: ConceptKind::Function,
+//! #         language: Language::Rust,
+//! #         name: id.to_string(),
+//! #         qualified_name: id.to_string(),
+//! #         description: None,
+//! #         location: Location { file: "src/lib.rs".to_string(), start_line: 1, end_line: 1 },
+//! #         signature: None,
+//! #         tags: Vec::new(),
+//! #         is_public: true,
+//! #         generated_at: None,
+//! #         relationships: Vec::new(),
+//! #     }
+//! # }
+//! # fn edge(concept: &mut Concept, kind: RelationKind, target: &str) {
+//! #     concept.relationships.push(Relationship {
+//! #         kind,
+//! #         target: target.to_string(),
+//! #         target_display: target.to_string(),
+//! #     });
+//! # }
+//! use okf_graph::Graph;
+//!
+//! // A real bundle carries both sides of a resolved call edge (`Calls`
+//! // on the caller, `CalledBy` on the callee) — `okf_parser::read_bundle`
+//! // hands back concepts already shaped this way.
+//! let (mut a, mut b) = (concept("a"), concept("b"));
+//! edge(&mut a, RelationKind::Calls, "b");
+//! edge(&mut b, RelationKind::CalledBy, "a");
+//!
+//! let concepts = vec![a, b];
+//! let graph = Graph::build(&concepts);
+//!
+//! assert_eq!(graph.callees("a")[0].id, "b");
+//! assert_eq!(graph.callers("b")[0].id, "a");
+//! assert!(graph.cycles().is_empty());
+//! ```
+
+#![deny(missing_docs)]
 
 use okf_parser::{Concept, ConceptKind, RelationKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// A queryable graph over a set of [`Concept`]s: cross-module links,
+/// ownership, public API surface, and cycle/dependency analysis. Borrows
+/// its concepts rather than owning them, so building one is cheap and
+/// doesn't duplicate the underlying data.
 pub struct Graph<'a> {
     concepts: &'a [Concept],
     by_id: HashMap<&'a str, usize>,
@@ -23,6 +87,9 @@ pub struct Graph<'a> {
 }
 
 impl<'a> Graph<'a> {
+    /// Indexes `concepts` by id (and, for `Module` concepts, by owning
+    /// source file) so every query below runs in roughly constant time
+    /// per lookup rather than rescanning the slice.
     pub fn build(concepts: &'a [Concept]) -> Self {
         let by_id = concepts
             .iter()
@@ -43,6 +110,7 @@ impl<'a> Graph<'a> {
         }
     }
 
+    /// Looks up a concept by its exact id, if it's in the graph.
     pub fn get(&self, id: &str) -> Option<&'a Concept> {
         self.by_id.get(id).map(|&i| &self.concepts[i])
     }
