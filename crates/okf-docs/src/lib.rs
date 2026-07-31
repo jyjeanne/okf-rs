@@ -16,8 +16,12 @@
 //!   doesn't give you — useful for pasting into a wiki/README, or
 //!   feeding to a single-file-oriented tool.
 
+mod graphml;
+mod obsidian;
 mod pdf;
 
+pub use graphml::generate_graphml;
+pub use obsidian::generate_obsidian;
 pub use pdf::generate_pdf;
 
 use anyhow::Result;
@@ -64,24 +68,38 @@ pub fn generate_html(concepts: &[Concept], output_dir: &Path) -> Result<()> {
     let bundle_ids: HashSet<&str> = concepts.iter().map(|c| c.id.as_str()).collect();
     let by_dir = group_by_kind_dir(concepts);
 
-    fs::create_dir_all(output_dir)?;
-
-    for concept in concepts {
-        let file_path = output_dir.join(format!("{}.html", concept.id));
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(
-            file_path,
-            render_concept_html(concept, concepts, &bundle_ids),
-        )?;
-    }
+    write_one_file_per_concept(concepts, output_dir, "html", |concept| {
+        render_concept_html(concept, concepts, &bundle_ids)
+    })?;
 
     for (dir, entries) in &by_dir {
         write_dir_index_html(output_dir, dir, entries)?;
     }
     write_root_index_html(output_dir, &by_dir)?;
 
+    Ok(())
+}
+
+/// Writes one file per concept, at `<output_dir>/<id>.<extension>`
+/// (mirroring the OKF bundle's own per-kind directory layout), creating
+/// nested parent directories as needed — the "one file per concept id"
+/// shape every per-concept renderer in this crate shares ([`generate_html`]
+/// and [`generate_obsidian`]); only the per-concept content and file
+/// extension differ between them, both supplied by the caller.
+pub(crate) fn write_one_file_per_concept(
+    concepts: &[Concept],
+    output_dir: &Path,
+    extension: &str,
+    render: impl Fn(&Concept) -> String,
+) -> Result<()> {
+    fs::create_dir_all(output_dir)?;
+    for concept in concepts {
+        let file_path = output_dir.join(format!("{}.{extension}", concept.id));
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(file_path, render(concept))?;
+    }
     Ok(())
 }
 

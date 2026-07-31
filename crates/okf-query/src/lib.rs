@@ -128,6 +128,105 @@ pub fn search_ranked(bundle: &Path, query: &str) -> Result<String> {
         .join("\n"))
 }
 
+/// Resolves `query` to a concept via a ranked full-text search fallback
+/// (the same index [`search_ranked`] uses), for when it isn't an exact
+/// concept id — see [`explore`], which checks that cheap exact-id path
+/// first and only builds the index this needs when it's actually
+/// required, rather than paying for it on every call regardless.
+fn resolve_explore_target_by_search<'a>(
+    graph: &okf_graph::Graph<'a>,
+    concepts: &[Concept],
+    query: &str,
+) -> Result<&'a Concept> {
+    let index = okf_search::FullTextIndex::build_from_concepts(concepts)?;
+    let hit = index
+        .search(query, 1)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no concept found matching `{query}`"))?;
+    graph
+        .get(&hit.id)
+        .ok_or_else(|| anyhow!("internal error: search hit `{}` not in the bundle", hit.id))
+}
+
+fn id_list(ids: &[&Concept]) -> String {
+    if ids.is_empty() {
+        "none".to_string()
+    } else {
+        ids.iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// One-call context for a concept: signature, description, direct
+/// callers/callees, blast radius (every concept transitively affected if
+/// this one changes — see [`okf_graph::Graph::transitive_callers`]),
+/// public-API membership, and call-cycle membership — everything an
+/// agent asking "what does this do, and what does touching it put at
+/// risk" would otherwise need several separate `search`/`graph_*` calls
+/// to assemble, in one response.
+///
+/// `query` is resolved the same way [`resolve_explore_target`] does: an
+/// exact concept id wins; otherwise the top hit of a ranked full-text
+/// search (so a natural-language or approximate query still resolves to
+/// something, the same as `search --ranked`).
+pub fn explore(bundle: &Path, query: &str) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let graph = okf_graph::Graph::build(&concepts);
+    // The common case -- an agent chaining `search`/a previous `explore`
+    // call, which already has a concept id in hand -- never needs the
+    // full-text index at all, so it's only built on the free-text
+    // fallback path below, not unconditionally on every call.
+    let concept = match graph.get(query) {
+        Some(concept) => concept,
+        None => resolve_explore_target_by_search(&graph, &concepts, query)?,
+    };
+
+    let is_public_api = okf_graph::is_public_api(concept);
+    let in_cycle = graph
+        .cycles()
+        .into_iter()
+        .flatten()
+        .any(|id| id == concept.id);
+    let callers = graph.callers(&concept.id);
+    let callees = graph.callees(&concept.id);
+    let blast_radius = graph.transitive_callers(&concept.id, None);
+
+    let mut out = format!("{} — {}\n", concept.id, concept.frontmatter_type());
+    if let Some(signature) = &concept.signature {
+        out.push_str(&format!("\n{signature}\n"));
+    }
+    if let Some(description) = &concept.description {
+        out.push_str(&format!("\n{description}\n"));
+    }
+    out.push_str(&format!(
+        "\nCallers ({}): {}\n",
+        callers.len(),
+        id_list(&callers)
+    ));
+    out.push_str(&format!(
+        "Callees ({}): {}\n",
+        callees.len(),
+        id_list(&callees)
+    ));
+    out.push_str(&format!(
+        "Blast radius ({} concept(s) transitively depend on this): {}\n",
+        blast_radius.len(),
+        id_list(&blast_radius)
+    ));
+    out.push_str(&format!(
+        "Public API: {}\n",
+        if is_public_api { "yes" } else { "no" }
+    ));
+    out.push_str(&format!(
+        "In a call cycle: {}",
+        if in_cycle { "yes" } else { "no" }
+    ));
+    Ok(out)
+}
+
 /// Concepts that directly call `id`.
 pub fn graph_callers(bundle: &Path, id: &str) -> Result<String> {
     let concepts = load_concepts(bundle)?;
@@ -330,6 +429,37 @@ fn percent(part: usize, total: usize) -> usize {
     (part * 100).checked_div(total).unwrap_or(0)
 }
 
+/// Ranks concepts by embedding-cosine similarity to `query` — "find by
+/// meaning," layered on top of (not replacing) [`search`]/[`search_ranked`],
+/// via any OpenAI-compatible `/embeddings` endpoint. Like [`suggest_links`],
+/// this needs an already-configured [`okf_enrich::EnrichClient`] rather
+/// than just a bundle path, since it makes network calls — one per
+/// described concept in the bundle, plus one for `query`.
+pub fn search_semantic(
+    bundle: &Path,
+    client: &okf_enrich::EnrichClient,
+    query: &str,
+    limit: usize,
+) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let hits = okf_enrich::semantic_search(client, &concepts, query, limit)?;
+    if hits.is_empty() {
+        return Ok(format!(
+            "No semantic matches for `{query}` (no concept in the bundle has a description to embed and compare against — run `generate --enrich` first, or add descriptions by hand)"
+        ));
+    }
+    Ok(hits
+        .iter()
+        .map(|hit| {
+            format!(
+                "{:>6.3}  {:<24} {:<20} {}",
+                hit.score, hit.title, hit.concept_type, hit.id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 /// Cross-module call dependency edges: which modules call into which.
 pub fn graph_modules(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
@@ -492,6 +622,27 @@ pub fn graph_domains(bundle: &Path) -> Result<String> {
         .iter()
         .enumerate()
         .map(|(i, d)| format!("[{}] {}", i + 1, d.package_ids.join(", ")))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Clusters of packages found by modularity-optimization community
+/// detection (`okf_arch::communities`) — a finer-grained signal than
+/// [`graph_domains`]'s plain connected components: two packages that are
+/// technically reachable from each other can still land in different
+/// communities here if the connection between them is weak relative to
+/// how strongly each already collaborates within its own cluster.
+pub fn graph_communities(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let graph = okf_graph::Graph::build(&concepts);
+    let communities = okf_arch::communities(&graph);
+    if communities.is_empty() {
+        return Ok("No packages found (no Package concepts in the bundle)".to_string());
+    }
+    Ok(communities
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("[{}] {}", i + 1, c.package_ids.join(", ")))
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -670,6 +821,101 @@ mod tests {
     fn missing_bundle_points_at_generate() {
         let err = search(Path::new("/nonexistent"), "x").unwrap_err();
         assert!(err.to_string().contains("okf-rs generate"));
+    }
+
+    #[test]
+    fn explore_resolves_an_exact_id_and_reports_callers_callees_and_blast_radius() {
+        let dir = sample_bundle();
+        let text = explore(dir.path(), "functions/auth/decode_jwt").unwrap();
+        assert!(text.starts_with("functions/auth/decode_jwt — Rust Function"));
+        assert!(text.contains("Callers (1): functions/auth/verify_token"));
+        assert!(text.contains("Callees (0): none"));
+        assert!(text.contains(
+            "Blast radius (1 concept(s) transitively depend on this): functions/auth/verify_token"
+        ));
+        assert!(text.contains("Public API: yes"));
+        assert!(text.contains("In a call cycle: no"));
+    }
+
+    #[test]
+    fn explore_resolves_a_natural_language_query_via_ranked_search() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/format/currency.md",
+            "---\ntype: Rust Function\ntitle: format_currency\ndescription: Formats a currency amount for locale-aware display.\nresource: src/format.rs#L1\n---\n\nbody\n",
+        );
+        let text = explore(dir.path(), "currency amount for display").unwrap();
+        assert!(text.starts_with("functions/format/currency — Rust Function"));
+    }
+
+    #[test]
+    fn explore_errors_clearly_when_nothing_matches() {
+        let dir = sample_bundle();
+        let err = explore(dir.path(), "no such thing anywhere").unwrap_err();
+        assert!(err.to_string().contains("no concept found matching"));
+    }
+
+    #[test]
+    fn search_semantic_ranks_the_closer_embedding_first() {
+        use okf_enrich::test_support::{embedding_client_for, start_embedding_mock_server};
+        use std::collections::HashMap;
+
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/format/currency.md",
+            "---\ntype: Rust Function\ntitle: format_currency\ndescription: Formats a currency amount for display.\nresource: src/format.rs#L1\n---\n\nbody\n",
+        );
+        // Overwrite verify_token's own file so it carries a description
+        // (sample_bundle's copy has none, and an undescribed concept is
+        // never embedded).
+        write(
+            dir.path(),
+            "functions/auth/verify_token.md",
+            "---\ntype: Rust Function\ntitle: verify_token\ndescription: Verifies a signed authentication token.\nresource: src/auth.rs#L1\nrelationships:\n  calls:\n    - functions/auth/decode_jwt\n---\n\nbody\n",
+        );
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            "auth::verify_token (Rust Function): Verifies a signed authentication token."
+                .to_string(),
+            vec![1.0, 0.0],
+        );
+        responses.insert(
+            "format::currency (Rust Function): Formats a currency amount for display.".to_string(),
+            vec![0.0, 1.0],
+        );
+        responses.insert("authentication".to_string(), vec![1.0, 0.0]);
+
+        let server = start_embedding_mock_server(responses);
+        let client = embedding_client_for(&server);
+
+        let text = search_semantic(dir.path(), &client, "authentication", 10).unwrap();
+        let first_line = text.lines().next().unwrap();
+        assert!(
+            first_line.contains("functions/auth/verify_token"),
+            "expected the closer embedding first: {text}"
+        );
+    }
+
+    #[test]
+    fn search_semantic_reports_no_matches_without_any_described_concept() {
+        use okf_enrich::test_support::{embedding_client_for, start_embedding_mock_server};
+        use std::collections::HashMap;
+
+        let dir = sample_bundle();
+        let server = start_embedding_mock_server(HashMap::new());
+        let client = embedding_client_for(&server);
+
+        let text = search_semantic(dir.path(), &client, "anything", 10).unwrap();
+        assert!(text.starts_with("No semantic matches for `anything`"));
+        assert_eq!(
+            server
+                .request_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[test]
@@ -900,6 +1146,18 @@ mod tests {
 
         let domains = graph_domains(dir.path()).unwrap();
         assert!(domains.contains("packages/app, packages/core"));
+
+        let communities = graph_communities(dir.path()).unwrap();
+        assert!(communities.contains("packages/app, packages/core"));
+    }
+
+    #[test]
+    fn graph_communities_reports_none_found_without_any_package() {
+        let dir = sample_bundle();
+        assert_eq!(
+            graph_communities(dir.path()).unwrap(),
+            "No packages found (no Package concepts in the bundle)"
+        );
     }
 
     #[test]

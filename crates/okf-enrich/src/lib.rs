@@ -15,8 +15,10 @@
 //! is never re-queried or overwritten.
 
 mod links;
+mod semantic;
 
 pub use links::{suggest_missing_links, SuggestedLink};
+pub use semantic::{semantic_search, SemanticHit};
 
 use anyhow::{anyhow, bail, Context, Result};
 use okf_parser::{Concept, ConceptKind};
@@ -74,6 +76,22 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatResponseMessage {
     content: String,
+}
+
+#[derive(Serialize)]
+struct EmbeddingRequest<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<EmbeddingDatum>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingDatum {
+    embedding: Vec<f32>,
 }
 
 impl EnrichClient {
@@ -140,6 +158,47 @@ impl EnrichClient {
             bail!("enrichment endpoint {url} returned an empty completion");
         }
         Ok(content.to_string())
+    }
+
+    /// Requests an embedding vector for `text` from the OpenAI-compatible
+    /// `/embeddings` endpoint (`{model, input}` -> `{data: [{embedding}]}`,
+    /// the same request/response shape every one of the endpoints this
+    /// crate already targets — Ollama, LM Studio, LocalAI, or a cloud
+    /// provider — implements for its embedding models). Used by
+    /// [`crate::semantic_search`] to rank concepts by meaning rather than
+    /// exact wording, layered on top of (not replacing) `okf-search`'s
+    /// existing exact/ranked full-text search.
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let url = format!("{}/embeddings", self.config.base_url.trim_end_matches('/'));
+        let request = EmbeddingRequest {
+            model: &self.config.model,
+            input: text,
+        };
+
+        let mut req = self.agent.post(&url);
+        if let Some(key) = &self.config.api_key {
+            req = req.set("Authorization", &format!("Bearer {key}"));
+        }
+
+        let response = req.send_json(&request).map_err(|e| match e {
+            ureq::Error::Status(code, response) => {
+                let body = response.into_string().unwrap_or_default();
+                anyhow!("embedding endpoint {url} returned HTTP {code}: {body}")
+            }
+            ureq::Error::Transport(t) => {
+                anyhow!("failed to reach embedding endpoint {url}: {t}")
+            }
+        })?;
+
+        let parsed: EmbeddingResponse = response
+            .into_json()
+            .with_context(|| format!("malformed response from embedding endpoint {url}"))?;
+        parsed
+            .data
+            .into_iter()
+            .next()
+            .map(|d| d.embedding)
+            .ok_or_else(|| anyhow!("embedding endpoint {url} returned no embeddings"))
     }
 }
 
@@ -361,6 +420,7 @@ pub fn enrich_missing_descriptions(
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use crate::{EnrichClient, EnrichConfig};
+    use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -423,6 +483,77 @@ pub mod test_support {
             api_key: None,
         })
     }
+
+    /// A mock `/embeddings` endpoint: `responses` maps an exact expected
+    /// `input` string to the embedding vector to reply with; an input not
+    /// present in the map gets an empty vector back, rather than the
+    /// server erroring — a test can then assert on that concept's low/zero
+    /// similarity score instead of the request failing outright.
+    pub struct EmbeddingMockServer {
+        pub base_url: String,
+        pub request_count: Arc<AtomicUsize>,
+    }
+
+    pub fn start_embedding_mock_server(
+        responses: HashMap<String, Vec<f32>>,
+    ) -> EmbeddingMockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&request_count);
+        let responses = Arc::new(responses);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = trimmed.strip_prefix("Content-Length: ") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+
+                let input = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("input").and_then(|i| i.as_str()).map(str::to_string))
+                    .unwrap_or_default();
+                let embedding = responses.get(&input).cloned().unwrap_or_default();
+                let embedding_json = serde_json::to_string(&embedding).unwrap();
+                let payload = format!(r#"{{"data":[{{"embedding":{embedding_json}}}]}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        EmbeddingMockServer {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            request_count,
+        }
+    }
+
+    pub fn embedding_client_for(server: &EmbeddingMockServer) -> EnrichClient {
+        EnrichClient::new(EnrichConfig {
+            base_url: server.base_url.clone(),
+            model: "test-embedding-model".to_string(),
+            api_key: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +591,32 @@ mod tests {
         let text = client.complete("system", "user").unwrap();
         assert_eq!(text, "a concise summary");
         assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn embed_parses_a_canned_embedding_response() {
+        use crate::test_support::{embedding_client_for, start_embedding_mock_server};
+        use std::collections::HashMap;
+
+        let mut responses = HashMap::new();
+        responses.insert("hello".to_string(), vec![0.1, 0.2, 0.3]);
+        let server = start_embedding_mock_server(responses);
+        let client = embedding_client_for(&server);
+
+        let embedding = client.embed("hello").unwrap();
+        assert_eq!(embedding, vec![0.1, 0.2, 0.3]);
+        assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn embed_errors_clearly_when_the_endpoint_is_unreachable() {
+        let client = EnrichClient::new(EnrichConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: "m".to_string(),
+            api_key: None,
+        });
+        let err = client.embed("text").unwrap_err();
+        assert!(err.to_string().contains("failed to reach"));
     }
 
     #[test]

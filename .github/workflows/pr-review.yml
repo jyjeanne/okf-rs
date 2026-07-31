@@ -1,0 +1,86 @@
+name: okf-rs Review
+
+# Posts (and updates in place) a pull-request comment summarizing the
+# structural blast radius of the PR's changes, via `okf-rs review` --
+# deterministic, git-diff-based change-impact analysis (which concepts
+# changed, and which other concepts transitively depend on them), not an
+# AI judgment call and not a hard requirement of this project's own
+# tooling to use elsewhere.
+#
+# Optional merge gating: set the `OKF_FAIL_ON_RISK` repository or
+# organization variable to a blast-radius threshold (e.g. `10`) to fail
+# this check when a changed concept's blast radius reaches it; leave it
+# unset and this workflow only ever informs, never blocks a merge.
+
+on:
+  pull_request:
+
+concurrency:
+  group: okf-rs-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `okf-rs review` diffs two refs via disposable `git worktree`
+          # checkouts, which need both commits to actually exist in the
+          # local clone -- a shallow checkout would make the base ref
+          # unreachable.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build okf-rs
+        run: cargo build --release --locked -p okf-cli
+
+      - name: Run okf-rs review
+        id: review
+        env:
+          FAIL_ON_RISK: ${{ vars.OKF_FAIL_ON_RISK }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # Not `github.sha`: for `pull_request` events that resolves to
+          # GitHub's ephemeral test-merge commit (`refs/pull/<n>/merge`,
+          # the PR branch merged onto whatever the base tip is *at
+          # workflow-run time*), not the PR's actual last commit -- using
+          # it here would review a moving target instead of what the PR
+          # author actually pushed.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -n "$FAIL_ON_RISK" ]; then
+            ./target/release/okf-rs review "$BASE_SHA" "$HEAD_SHA" . --fail-on-risk "$FAIL_ON_RISK" > review.md
+          else
+            ./target/release/okf-rs review "$BASE_SHA" "$HEAD_SHA" . > review.md
+          fi
+        # The report must still be posted even if `--fail-on-risk` made
+        # this step exit non-zero -- the risk gate itself is enforced by
+        # the separate step below, after the comment is already posted.
+        continue-on-error: true
+
+      - name: Post or update PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: okf-rs-review
+          path: review.md
+
+      - name: Enforce risk gate
+        if: steps.review.outcome == 'failure'
+        run: |
+          echo "okf-rs review reported a change at or above the configured OKF_FAIL_ON_RISK blast-radius threshold; see the PR comment for details." >&2
+          exit 1
