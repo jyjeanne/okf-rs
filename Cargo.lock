@@ -985,9 +985,11 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "okf-core",
+ "okf-graph",
  "okf-lsp",
  "okf-parser",
  "okf-tree-sitter",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

@@ -16,8 +16,12 @@
 //!   doesn't give you — useful for pasting into a wiki/README, or
 //!   feeding to a single-file-oriented tool.
 
+mod graphml;
+mod obsidian;
 mod pdf;
 
+pub use graphml::generate_graphml;
+pub use obsidian::generate_obsidian;
 pub use pdf::generate_pdf;
 
 use anyhow::Result;

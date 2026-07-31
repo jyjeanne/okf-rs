@@ -55,6 +55,7 @@ walkdir = "2"
 ignore = "0.4"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
+rayon = "1"
 
 # Tuned for distributing `okf-rs` as a single standalone release binary:
 # strip debug info, and optimize aggressively since this is a build users

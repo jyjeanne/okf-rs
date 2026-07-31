@@ -130,6 +130,46 @@ enum Command {
         /// for a natural-language query than an exact symbol name.
         #[arg(long)]
         ranked: bool,
+        /// Rank by embedding-cosine similarity ("find by meaning")
+        /// instead of exact/substring or lexical-relevance matching, via
+        /// an OpenAI-compatible `/embeddings` endpoint. Only concepts
+        /// with a description are considered (run `generate --enrich`
+        /// first if the bundle has none). Requires
+        /// `--enrich-base-url`/`--enrich-model` (or the
+        /// `OKF_ENRICH_BASE_URL`/`OKF_ENRICH_MODEL` environment
+        /// variables) pointed at an embeddings-capable model. Mutually
+        /// exclusive with `--ranked`.
+        #[arg(long, conflicts_with = "ranked")]
+        semantic: bool,
+        /// Embedding endpoint base URL, e.g. `http://localhost:11434/v1`
+        /// for Ollama. Falls back to `OKF_ENRICH_BASE_URL` if unset.
+        /// Only used with `--semantic`.
+        #[arg(long)]
+        enrich_base_url: Option<String>,
+        /// Embedding model name, e.g. `nomic-embed-text`. Falls back to
+        /// `OKF_ENRICH_MODEL` if unset. Only used with `--semantic`.
+        #[arg(long)]
+        enrich_model: Option<String>,
+        /// Embedding endpoint API key. Falls back to `OKF_ENRICH_API_KEY`
+        /// if unset. Only used with `--semantic`.
+        #[arg(long)]
+        enrich_api_key: Option<String>,
+    },
+    /// One-call context for a concept: signature, description, direct
+    /// callers, direct callees, blast radius (every concept transitively
+    /// affected if this one changes), public-API membership, and
+    /// call-cycle membership — everything `search`/`graph callers`/`graph
+    /// callees` would otherwise take several separate calls to assemble,
+    /// in one command.
+    Explore {
+        /// A concept id, or free text to resolve via ranked search (the
+        /// top hit is used).
+        query: String,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
     /// Report content-completeness metrics for a bundle: description/tag
     /// coverage, and how much of the bundle participates in the call
@@ -192,18 +232,35 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Change-impact ("blast radius") analysis between two git refs: for
+    /// every added/removed/changed concept, which other concepts
+    /// transitively depend on it, whether it's public API, and whether
+    /// it sits in a call-graph cycle — a deterministic, structural risk
+    /// signal for what a change actually puts at risk downstream, beyond
+    /// what `diff`'s concept-level added/removed/changed list shows on
+    /// its own.
+    Impact {
+        from_ref: String,
+        to_ref: String,
+        /// Project directory to analyze, relative to the git repository root.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Generate human-readable documentation from a previously generated OKF
     /// bundle: a browsable static HTML site, a single consolidated Markdown
-    /// document, a single paginated PDF, or a DITA topic set.
+    /// document, a single paginated PDF, a DITA topic set, a GraphML graph
+    /// (for Gephi/yEd/any other GraphML-reading tool), or an Obsidian vault.
     Docs {
         /// Defaults to the value in `okf.toml`, or `knowledge`.
         bundle: Option<PathBuf>,
         /// Project directory to look up `okf.toml` in (not the bundle itself).
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
-        /// Output path: a directory for `--format html`/`--format dita`,
-        /// a file for `--format markdown`/`--format pdf`. Defaults to
-        /// `docs/`, `docs.md`, `docs.pdf`, or `docs-dita/` respectively.
+        /// Output path: a directory for `--format html`/`--format
+        /// dita`/`--format obsidian`, a file for `--format
+        /// markdown`/`--format pdf`/`--format graphml`. Defaults to
+        /// `docs/`, `docs.md`, `docs.pdf`, `docs-dita/`, `docs.graphml`,
+        /// or `docs-obsidian/` respectively.
         #[arg(short, long)]
         output: Option<PathBuf>,
         #[arg(short, long, value_enum, default_value_t = DocsFormat::Html)]
@@ -217,6 +274,8 @@ enum DocsFormat {
     Markdown,
     Pdf,
     Dita,
+    Graphml,
+    Obsidian,
 }
 
 #[derive(Subcommand)]
@@ -390,7 +449,28 @@ fn run(command: Command) -> Result<ExitCode> {
             bundle,
             project,
             ranked,
-        } => cmd_search(&query, bundle, &project, ranked),
+            semantic,
+            enrich_base_url,
+            enrich_model,
+            enrich_api_key,
+        } => cmd_search(
+            &query,
+            bundle,
+            &project,
+            ranked,
+            semantic,
+            enrich_base_url,
+            enrich_model,
+            enrich_api_key,
+        ),
+        Command::Explore {
+            query,
+            bundle,
+            project,
+        } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::explore(&bundle, &query))
+        }
         Command::Coverage { bundle, project } => {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::coverage(&bundle))
@@ -416,6 +496,11 @@ fn run(command: Command) -> Result<ExitCode> {
             to_ref,
             path,
         } => cmd_diff(&from_ref, &to_ref, &path),
+        Command::Impact {
+            from_ref,
+            to_ref,
+            path,
+        } => cmd_impact(&from_ref, &to_ref, &path),
         Command::Docs {
             bundle,
             project,
@@ -771,14 +856,23 @@ fn print_query_result(result: Result<String>) -> Result<ExitCode> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_search(
     query: &str,
     bundle: Option<PathBuf>,
     project: &std::path::Path,
     ranked: bool,
+    semantic: bool,
+    enrich_base_url: Option<String>,
+    enrich_model: Option<String>,
+    enrich_api_key: Option<String>,
 ) -> Result<ExitCode> {
     let bundle = resolve_query_bundle(bundle, project);
-    if ranked {
+    if semantic {
+        let config = resolve_enrich_config(enrich_base_url, enrich_model, enrich_api_key)?;
+        let client = okf_enrich::EnrichClient::new(config);
+        print_query_result(okf_query::search_semantic(&bundle, &client, query, 25))
+    } else if ranked {
         print_query_result(okf_query::search_ranked(&bundle, query))
     } else {
         print_query_result(okf_query::search(&bundle, query))
@@ -901,6 +995,26 @@ fn cmd_docs(
             okf_dita::export_dita(&concepts, &output)?;
             println!(
                 "Generated DITA documentation for {} concepts into {}",
+                concepts.len(),
+                output.display()
+            );
+        }
+        DocsFormat::Graphml => {
+            let output = output.unwrap_or_else(|| PathBuf::from("docs.graphml"));
+            let graphml = okf_docs::generate_graphml(&concepts);
+            std::fs::write(&output, graphml)
+                .with_context(|| format!("failed to write {}", output.display()))?;
+            println!(
+                "Generated GraphML graph for {} concepts into {}",
+                concepts.len(),
+                output.display()
+            );
+        }
+        DocsFormat::Obsidian => {
+            let output = output.unwrap_or_else(|| PathBuf::from("docs-obsidian"));
+            okf_docs::generate_obsidian(&concepts, &output)?;
+            println!(
+                "Generated Obsidian vault for {} concepts into {}",
                 concepts.len(),
                 output.display()
             );
@@ -1030,6 +1144,71 @@ fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<Exit
                     println!("      + {after}");
                 }
             }
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_impact(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<ExitCode> {
+    let repo_root = git_repo_root(path)?;
+    let canonical_path = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let relative_project = canonical_path
+        .strip_prefix(&repo_root)
+        .unwrap_or(std::path::Path::new("."));
+
+    let from_checkout = WorktreeCheckout::new(&repo_root, from_ref)?;
+    let from_result = analyze_path(&from_checkout.path().join(relative_project))?;
+
+    let to_checkout = WorktreeCheckout::new(&repo_root, to_ref)?;
+    let to_result = analyze_path(&to_checkout.path().join(relative_project))?;
+
+    let report = okf_analyzer::impact(&from_result.concepts, &to_result.concepts);
+
+    if report.impacted.is_empty() {
+        println!("No concept-level changes between {from_ref} and {to_ref}");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!(
+        "{} concept(s) changed between {from_ref} and {to_ref}, ordered by blast radius (most affected first):\n",
+        report.impacted.len()
+    );
+    for impacted in &report.impacted {
+        let change_label = match impacted.change {
+            okf_analyzer::ChangeKind::Added => "+",
+            okf_analyzer::ChangeKind::Removed => "-",
+            okf_analyzer::ChangeKind::Changed => "~",
+        };
+        let mut flags = Vec::new();
+        if impacted.is_public_api {
+            flags.push("public API");
+        }
+        if impacted.in_cycle {
+            flags.push("in a call cycle");
+        }
+        let flags_suffix = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", flags.join(", "))
+        };
+        println!(
+            "  {change_label} {} — {}{flags_suffix}",
+            impacted.id,
+            impacted.kind.as_str()
+        );
+        if impacted.blast_radius.is_empty() {
+            println!(
+                "      blast radius: none (nothing else calls this, directly or transitively)"
+            );
+        } else {
+            println!(
+                "      blast radius: {} concept(s): {}",
+                impacted.blast_radius.len(),
+                impacted.blast_radius.join(", ")
+            );
         }
     }
 

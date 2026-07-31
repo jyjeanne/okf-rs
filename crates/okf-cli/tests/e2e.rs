@@ -220,6 +220,15 @@ fn standalone_binary_runs_the_full_command_surface_against_this_project() {
     assert_success(&path, &["graph path"]);
     assert_eq!(stdout_of(&path).trim(), id);
 
+    // explore: one-call context (signature/callers/callees/blast radius)
+    // for a real concept id from this project's own bundle.
+    let explore = run(&project, &["explore", &id, "--project", "."]);
+    assert_success(&explore, &["explore"]);
+    let explore_out = stdout_of(&explore);
+    assert!(explore_out.starts_with(&id));
+    assert!(explore_out.contains("Callers ("));
+    assert!(explore_out.contains("Blast radius ("));
+
     // graph queries reject unknown ids with a clear, non-zero-exit error.
     let unknown = run(
         &project,
@@ -305,6 +314,41 @@ fn standalone_binary_runs_the_full_command_surface_against_this_project() {
     );
     assert_success(&docs_dita, &["docs dita"]);
     assert!(project.join("docs-dita/root.ditamap").exists());
+
+    // docs --format graphml: a single GraphML graph for Gephi/yEd/etc.
+    let docs_graphml = run(
+        &project,
+        &[
+            "docs",
+            "--project",
+            ".",
+            "--format",
+            "graphml",
+            "--output",
+            "docs.graphml",
+        ],
+    );
+    assert_success(&docs_graphml, &["docs graphml"]);
+    let docs_graphml_path = project.join("docs.graphml");
+    let graphml_content = fs::read_to_string(&docs_graphml_path).unwrap();
+    assert!(graphml_content.starts_with("<?xml version=\"1.0\""));
+    assert!(graphml_content.contains("<node id="));
+
+    // docs --format obsidian: one note per concept plus a root index.
+    let docs_obsidian = run(
+        &project,
+        &[
+            "docs",
+            "--project",
+            ".",
+            "--format",
+            "obsidian",
+            "--output",
+            "docs-obsidian",
+        ],
+    );
+    assert_success(&docs_obsidian, &["docs obsidian"]);
+    assert!(project.join("docs-obsidian/index.md").exists());
 }
 
 /// `okf-rs generate --dita` imports a DITA corpus as `Document` concepts,
@@ -442,6 +486,83 @@ fn standalone_binary_diff_reports_added_and_removed_concepts() {
     let no_diff = run(&repo, &["diff", &c2, &c2, "."]);
     assert_success(&no_diff, &["diff (no-op)"]);
     assert!(stdout_of(&no_diff).contains("No concept-level changes"));
+}
+
+/// `okf-rs impact` extends `diff`'s concept-level added/removed/changed
+/// list with blast radius (transitive callers) and structural
+/// criticality. Two commits where only `callee`'s signature changes
+/// (adding a parameter) — `caller`'s own signature and relationship set
+/// stay identical, so `diff` (and therefore `impact`) must report
+/// exactly one changed concept, with `caller` showing up in its blast
+/// radius rather than as a change of its own.
+#[test]
+fn standalone_binary_impact_reports_the_blast_radius_between_two_refs() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("impact-repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "okf-rs e2e tests"]);
+    git(&["config", "user.email", "e2e@example.invalid"]);
+    git(&["config", "commit.gpgsign", "false"]);
+
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn callee() -> i32 {\n    1\n}\n\npub fn caller() -> i32 {\n    callee()\n}\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c1"]);
+    let c1 = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn callee(x: i32) -> i32 {\n    x + 1\n}\n\npub fn caller() -> i32 {\n    callee(0)\n}\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c2"]);
+    let c2 = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let impact = run(&repo, &["impact", &c1, &c2, "."]);
+    assert_success(&impact, &["impact"]);
+    let impact_out = stdout_of(&impact);
+    assert!(impact_out.contains("~ functions/src/callee"));
+    assert!(impact_out.contains("blast radius: 1 concept(s): functions/src/caller"));
+
+    // No changes between a ref and itself.
+    let no_impact = run(&repo, &["impact", &c2, &c2, "."]);
+    assert_success(&no_impact, &["impact (no-op)"]);
+    assert!(stdout_of(&no_impact).contains("No concept-level changes"));
 }
 
 /// `okf-rs generate --lsp` asks a real language server
@@ -612,6 +733,51 @@ fn start_mock_enrich_server(reply_content: &'static str) -> (String, Arc<AtomicU
 
             let payload =
                 format!(r#"{{"choices":[{{"message":{{"content":"{reply_content}"}}}}]}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    (format!("http://127.0.0.1:{port}/v1"), request_count)
+}
+
+/// A mock `/embeddings` endpoint replying with the same fixed vector for
+/// every request, regardless of `input` — enough for an end-to-end smoke
+/// test of the CLI's `search --semantic` wiring (real ranking behavior
+/// against varying inputs is already covered by `okf-enrich`/`okf-query`'s
+/// own unit tests, which use a keyed mock).
+fn start_mock_embedding_server() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&request_count);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line.trim_end().is_empty() {
+                    break;
+                }
+                if let Some(value) = line.trim_end().strip_prefix("Content-Length: ") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+
+            let payload = r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#.to_string();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 payload.len(),
@@ -805,6 +971,72 @@ fn standalone_binary_suggest_links_reports_a_suggestion_from_the_endpoint() {
         suggest_requests.load(Ordering::SeqCst) > 0,
         "expected at least one candidate to be judged"
     );
+}
+
+/// `okf-rs search --semantic` ranks concepts by embedding-cosine
+/// similarity instead of lexical/exact matching. End-to-end smoke test
+/// against a mock `/embeddings` endpoint: only a described concept is
+/// ever embedded and returned, and an undescribed concept never shows up
+/// (real ranking-order behavior is covered by `okf-enrich`/`okf-query`'s
+/// own unit tests against a keyed mock). Descriptions are hand-written
+/// directly into the generated bundle (rather than via `--enrich`)
+/// specifically so only one of the two concepts ends up described.
+#[test]
+fn standalone_binary_search_semantic_ranks_by_embedding_similarity() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn verify_token() -> bool {\n    true\n}\n\npub fn undescribed() -> i32 {\n    0\n}\n",
+    )
+    .unwrap();
+
+    let generate = run(&project, &["generate", "."]);
+    assert_success(&generate, &["generate"]);
+
+    let verify_token_path = project.join("knowledge/functions/src/verify_token.md");
+    let content = fs::read_to_string(&verify_token_path).unwrap();
+    let with_description = content.replacen(
+        "---\n",
+        "---\ndescription: Verifies a signed authentication token.\n",
+        1,
+    );
+    fs::write(&verify_token_path, with_description).unwrap();
+
+    let (embed_url, embed_requests) = start_mock_embedding_server();
+    let search = run(
+        &project,
+        &[
+            "search",
+            "authentication",
+            "--project",
+            ".",
+            "--semantic",
+            "--enrich-base-url",
+            &embed_url,
+            "--enrich-model",
+            "test-embedding-model",
+        ],
+    );
+    assert_success(&search, &["search --semantic"]);
+    let out = stdout_of(&search);
+    assert!(out.contains("verify_token"));
+    assert!(
+        !out.contains("undescribed"),
+        "an undescribed concept must never be embedded or returned: {out}"
+    );
+    assert!(
+        embed_requests.load(Ordering::SeqCst) > 0,
+        "expected at least one embedding request"
+    );
+
+    // `--ranked` and `--semantic` are mutually exclusive.
+    let conflict = run(
+        &project,
+        &["search", "x", "--project", ".", "--ranked", "--semantic"],
+    );
+    assert!(!conflict.status.success());
 }
 
 /// Commands that read an existing bundle fail with a clear, non-zero-exit

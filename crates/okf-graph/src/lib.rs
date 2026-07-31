@@ -362,6 +362,43 @@ impl<'a> Graph<'a> {
         cycles
     }
 
+    /// Every concept transitively affected if `id` changes: `id`'s direct
+    /// and indirect callers, found by breadth-first search over
+    /// `CalledBy` edges. This is the "blast radius" primitive — who
+    /// depends on `id`, directly or through a chain of callers — used by
+    /// both `okf-rs impact` (change-impact analysis between two git
+    /// refs) and the `explore` composite query (blast radius of a single
+    /// concept in the current bundle).
+    ///
+    /// `max_depth` bounds how many hops to follow (`Some(1)` is exactly
+    /// [`Graph::callers`]; `None` is unbounded). Excludes `id` itself,
+    /// even if it's part of a call cycle back to itself. Sorted by id,
+    /// deduplicated, for deterministic output.
+    pub fn transitive_callers(&self, id: &str, max_depth: Option<usize>) -> Vec<&'a Concept> {
+        let mut visited: HashSet<&str> = HashSet::new();
+        visited.insert(id);
+        let mut frontier: Vec<&str> = vec![id];
+        let mut depth = 0;
+
+        while !frontier.is_empty() && max_depth.is_none_or(|max| depth < max) {
+            let mut next_frontier = Vec::new();
+            for &current in &frontier {
+                for caller in self.callers(current) {
+                    if visited.insert(caller.id.as_str()) {
+                        next_frontier.push(caller.id.as_str());
+                    }
+                }
+            }
+            frontier = next_frontier;
+            depth += 1;
+        }
+
+        visited.remove(id);
+        let mut result: Vec<&Concept> = visited.into_iter().filter_map(|i| self.get(i)).collect();
+        result.sort_by(|a, b| a.id.cmp(&b.id));
+        result
+    }
+
     /// Shortest directed path from `from` to `to` following `Calls`
     /// edges (breadth-first), or `None` if unreachable. Includes both
     /// endpoints.
@@ -744,6 +781,86 @@ mod tests {
         let concepts = vec![a, b];
         let graph = Graph::build(&concepts);
         assert!(graph.cycles().is_empty());
+    }
+
+    #[test]
+    fn transitive_callers_follows_the_whole_caller_chain() {
+        // c -> b -> a (c calls b, b calls a): changing `a` transitively
+        // affects both b (direct caller) and c (indirect, through b).
+        let mut a = concept("functions/a", ConceptKind::Function, "x.rs", true);
+        let mut b = concept("functions/b", ConceptKind::Function, "x.rs", true);
+        let c = concept("functions/c", ConceptKind::Function, "x.rs", true);
+        add_edge(&mut a, RelationKind::CalledBy, "functions/b");
+        add_edge(&mut b, RelationKind::Calls, "functions/a");
+        add_edge(&mut b, RelationKind::CalledBy, "functions/c");
+
+        let concepts = vec![a, b, c];
+        let graph = Graph::build(&concepts);
+
+        let affected = graph.transitive_callers("functions/a", None);
+        assert_eq!(
+            affected.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["functions/b", "functions/c"]
+        );
+    }
+
+    #[test]
+    fn transitive_callers_respects_max_depth() {
+        let mut a = concept("functions/a", ConceptKind::Function, "x.rs", true);
+        let mut b = concept("functions/b", ConceptKind::Function, "x.rs", true);
+        let c = concept("functions/c", ConceptKind::Function, "x.rs", true);
+        add_edge(&mut a, RelationKind::CalledBy, "functions/b");
+        add_edge(&mut b, RelationKind::CalledBy, "functions/c");
+
+        let concepts = vec![a, b, c];
+        let graph = Graph::build(&concepts);
+
+        assert_eq!(
+            graph
+                .transitive_callers("functions/a", Some(1))
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["functions/b"],
+            "depth 1 should match direct callers() exactly"
+        );
+        assert_eq!(
+            graph
+                .transitive_callers("functions/a", Some(2))
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["functions/b", "functions/c"]
+        );
+    }
+
+    #[test]
+    fn transitive_callers_handles_cycles_without_including_the_start_or_looping_forever() {
+        let mut a = concept("functions/a", ConceptKind::Function, "x.rs", true);
+        let mut b = concept("functions/b", ConceptKind::Function, "x.rs", true);
+        add_edge(&mut a, RelationKind::CalledBy, "functions/b");
+        add_edge(&mut b, RelationKind::CalledBy, "functions/a");
+
+        let concepts = vec![a, b];
+        let graph = Graph::build(&concepts);
+
+        assert_eq!(
+            graph
+                .transitive_callers("functions/a", None)
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["functions/b"],
+            "the start concept itself must never appear in its own blast radius"
+        );
+    }
+
+    #[test]
+    fn transitive_callers_is_empty_for_a_concept_with_no_callers() {
+        let a = concept("functions/a", ConceptKind::Function, "x.rs", true);
+        let concepts = vec![a];
+        let graph = Graph::build(&concepts);
+        assert!(graph.transitive_callers("functions/a", None).is_empty());
     }
 
     #[test]

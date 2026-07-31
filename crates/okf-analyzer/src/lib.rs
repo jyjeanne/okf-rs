@@ -28,7 +28,8 @@ use anyhow::{Context, Result};
 use okf_core::{ManifestKind, Project};
 use okf_parser::{Concept, ConceptKind, Language, Location, RelationKind, Relationship};
 use okf_tree_sitter::CallCandidate;
-use std::collections::HashMap;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -110,29 +111,60 @@ pub fn analyze_with_cache_lsp(
     // of reading each file a second time itself.
     let mut file_sources: HashMap<String, String> = HashMap::new();
 
-    for file in &project.files {
-        let source = fs::read_to_string(&file.absolute_path)
-            .with_context(|| format!("failed to read {}", file.relative_path))?;
-        let hash = cache::hash_content(&source);
+    // The expensive part -- reading and (on a cache miss) tree-sitter
+    // parsing each file -- is independent per file, so it runs across a
+    // rayon thread pool; only the cache lookup (`AnalysisCache::get`,
+    // `&self`, safe to call concurrently) happens inside the parallel
+    // step. Everything that must stay sequential for deterministic output
+    // (populating `fresh_cache`, appending to `calls`/`concepts` in file
+    // order) happens in the merge loop below, over `.collect()`'s
+    // input-order-preserving `Vec`, so output is byte-identical to the
+    // sequential version regardless of which thread finished first.
+    let file_results: Vec<Result<FileParseResult>> = project
+        .files
+        .par_iter()
+        .map(|file| -> Result<FileParseResult> {
+            let source = fs::read_to_string(&file.absolute_path)
+                .with_context(|| format!("failed to read {}", file.relative_path))?;
+            let hash = cache::hash_content(&source);
 
-        let extraction = match cache.get(&file.relative_path, hash) {
-            Some(extraction) => {
-                stats.reused += 1;
-                extraction
-            }
-            None => {
-                stats.reparsed += 1;
-                okf_tree_sitter::extract_source(&source, file)
-                    .with_context(|| format!("failed to analyze {}", file.relative_path))?
-            }
-        };
-        fresh_cache.insert(&file.relative_path, hash, extraction.clone());
-        for call in extraction.calls {
-            calls.push((call, file.language, file.relative_path.clone()));
+            let (extraction, reused) = match cache.get(&file.relative_path, hash) {
+                Some(extraction) => (extraction, true),
+                None => {
+                    let extraction = okf_tree_sitter::extract_source(&source, file)
+                        .with_context(|| format!("failed to analyze {}", file.relative_path))?;
+                    (extraction, false)
+                }
+            };
+            Ok(FileParseResult {
+                relative_path: file.relative_path.clone(),
+                language: file.language,
+                hash,
+                extraction,
+                reused,
+                source: if use_lsp { Some(source) } else { None },
+            })
+        })
+        .collect();
+
+    for result in file_results {
+        let result = result?;
+        if result.reused {
+            stats.reused += 1;
+        } else {
+            stats.reparsed += 1;
         }
-        concepts.extend(extraction.concepts);
-        if use_lsp {
-            file_sources.insert(file.relative_path.clone(), source);
+        fresh_cache.insert(
+            &result.relative_path,
+            result.hash,
+            result.extraction.clone(),
+        );
+        for call in result.extraction.calls {
+            calls.push((call, result.language, result.relative_path.clone()));
+        }
+        concepts.extend(result.extraction.concepts);
+        if let Some(source) = result.source {
+            file_sources.insert(result.relative_path, source);
         }
     }
     *cache = fresh_cache;
@@ -228,6 +260,18 @@ pub fn analyze_with_cache_lsp(
     ))
 }
 
+/// One file's read+extract outcome, produced in parallel by
+/// [`analyze_with_cache_lsp`]'s per-file rayon step and merged back
+/// sequentially afterward.
+struct FileParseResult {
+    relative_path: String,
+    language: Language,
+    hash: u64,
+    extraction: okf_tree_sitter::FileExtraction,
+    reused: bool,
+    source: Option<String>,
+}
+
 /// A concept present in both snapshots being diffed, but whose signature
 /// or relationships changed between them.
 #[derive(Debug, Clone)]
@@ -306,6 +350,152 @@ fn relationship_set(concept: &Concept) -> std::collections::BTreeSet<(RelationKi
         .iter()
         .map(|r| (r.kind, r.target.as_str()))
         .collect()
+}
+
+/// How a concept changed between two analyzed snapshots — see [`impact`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Changed,
+}
+
+/// One concept affected by a change between two snapshots (see
+/// [`impact`]), plus the deterministic, structural signals it's scored
+/// by: how much of the bundle transitively depends on it, whether it's
+/// public API, and whether it participates in a call-graph cycle.
+#[derive(Debug, Clone)]
+pub struct ImpactedConcept {
+    pub id: String,
+    pub kind: ConceptKind,
+    pub change: ChangeKind,
+    /// Ids of every concept transitively affected if this one changes —
+    /// its transitive callers (see
+    /// [`okf_graph::Graph::transitive_callers`]), sorted for
+    /// deterministic output. This is the "blast radius": the bigger it
+    /// is, the more of the bundle a reviewer should check before trusting
+    /// this change.
+    pub blast_radius: Vec<String>,
+    pub is_public_api: bool,
+    pub in_cycle: bool,
+}
+
+/// The result of [`impact`]: the underlying concept-level [`DiffReport`]
+/// plus every added/removed/changed concept's blast radius and
+/// structural criticality.
+#[derive(Debug, Clone, Default)]
+pub struct ImpactReport {
+    pub diff: DiffReport,
+    /// Sorted by blast radius size, descending (ties broken by id), so
+    /// the highest-risk change — the one the most other code transitively
+    /// depends on — is first, the same "what's most worth reviewing
+    /// first" question a PR review would ask.
+    pub impacted: Vec<ImpactedConcept>,
+}
+
+/// Change-impact ("blast radius") analysis between two analyzed
+/// snapshots of the same project (typically two git refs — the same
+/// `before`/`after` shape [`diff`] takes): for every added, removed, or
+/// changed concept, who transitively depends on it, whether it's public
+/// API, and whether it sits in a call-graph cycle.
+///
+/// Deliberately scored by structural signals already present in the
+/// graph — caller-reachability, public-API membership, cycle membership
+/// — rather than a model-inferred risk judgment: this stays inside
+/// okf-rs's "deterministic core, AI layered on top only as an optional,
+/// separate step" design (the same posture `okf-enrich`'s optional `--enrich`
+/// already has relative to plain `generate`), so `impact` needs no
+/// network access and produces the same report for the same two refs
+/// every time.
+///
+/// A removed concept's blast radius/criticality is computed against
+/// `before` — the only snapshot that still has it, and the graph its
+/// former callers actually lived in; an added or changed concept's is
+/// computed against `after`, the snapshot it currently exists in.
+pub fn impact(before: &[Concept], after: &[Concept]) -> ImpactReport {
+    let diff_report = diff(before, after);
+    let before_graph = okf_graph::Graph::build(before);
+    let after_graph = okf_graph::Graph::build(after);
+
+    let before_public: HashSet<&str> = before_graph
+        .public_api()
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    let after_public: HashSet<&str> = after_graph
+        .public_api()
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    let before_cyclic: HashSet<&str> = before_graph.cycles().into_iter().flatten().collect();
+    let after_cyclic: HashSet<&str> = after_graph.cycles().into_iter().flatten().collect();
+
+    let mut impacted = Vec::new();
+    for concept in &diff_report.added {
+        impacted.push(score_impact(
+            &concept.id,
+            concept.kind,
+            ChangeKind::Added,
+            &after_graph,
+            &after_public,
+            &after_cyclic,
+        ));
+    }
+    for concept in &diff_report.removed {
+        impacted.push(score_impact(
+            &concept.id,
+            concept.kind,
+            ChangeKind::Removed,
+            &before_graph,
+            &before_public,
+            &before_cyclic,
+        ));
+    }
+    for changed in &diff_report.changed {
+        impacted.push(score_impact(
+            &changed.id,
+            changed.kind,
+            ChangeKind::Changed,
+            &after_graph,
+            &after_public,
+            &after_cyclic,
+        ));
+    }
+
+    impacted.sort_by(|a, b| {
+        b.blast_radius
+            .len()
+            .cmp(&a.blast_radius.len())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    ImpactReport {
+        diff: diff_report,
+        impacted,
+    }
+}
+
+fn score_impact(
+    id: &str,
+    kind: ConceptKind,
+    change: ChangeKind,
+    graph: &okf_graph::Graph<'_>,
+    public: &HashSet<&str>,
+    cyclic: &HashSet<&str>,
+) -> ImpactedConcept {
+    let blast_radius: Vec<String> = graph
+        .transitive_callers(id, None)
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+    ImpactedConcept {
+        id: id.to_string(),
+        kind,
+        change,
+        blast_radius,
+        is_public_api: public.contains(id),
+        in_cycle: cyclic.contains(id),
+    }
 }
 
 /// Derives one `Package` concept per manifest discovered in the project
@@ -782,6 +972,119 @@ mod tests {
         );
     }
 
+    fn concept_with_edges(
+        id: &str,
+        calls: &[&str],
+        called_by: &[&str],
+        is_public: bool,
+    ) -> Concept {
+        let mut c = make_concept(id, &format!("fn {id}()"));
+        c.is_public = is_public;
+        for target in calls {
+            c.relationships.push(Relationship {
+                kind: RelationKind::Calls,
+                target: target.to_string(),
+                target_display: target.to_string(),
+            });
+        }
+        for source in called_by {
+            c.relationships.push(Relationship {
+                kind: RelationKind::CalledBy,
+                target: source.to_string(),
+                target_display: source.to_string(),
+            });
+        }
+        c
+    }
+
+    #[test]
+    fn impact_reports_the_blast_radius_of_a_changed_concept() {
+        // c -> b -> a: changing `a` transitively affects b and c.
+        let a = concept_with_edges("functions/a", &[], &["functions/b"], true);
+        let b = concept_with_edges("functions/b", &["functions/a"], &["functions/c"], true);
+        let c = concept_with_edges("functions/c", &["functions/b"], &[], true);
+        let before = vec![a.clone(), b.clone(), c.clone()];
+
+        let mut a_changed = a.clone();
+        a_changed.signature = Some("fn a(x: i32)".to_string());
+        let after = vec![a_changed, b, c];
+
+        let report = impact(&before, &after);
+        assert_eq!(report.diff.changed.len(), 1);
+        assert_eq!(report.impacted.len(), 1);
+        let impacted = &report.impacted[0];
+        assert_eq!(impacted.id, "functions/a");
+        assert_eq!(impacted.change, ChangeKind::Changed);
+        assert_eq!(impacted.blast_radius, vec!["functions/b", "functions/c"]);
+        assert!(impacted.is_public_api);
+    }
+
+    #[test]
+    fn impact_scores_a_removed_concept_against_the_before_graph() {
+        let removed = concept_with_edges("functions/removed", &[], &["functions/caller"], true);
+        let caller = concept_with_edges("functions/caller", &["functions/removed"], &[], true);
+        let before = vec![removed, caller.clone()];
+        let after = vec![caller];
+
+        let report = impact(&before, &after);
+        assert_eq!(report.impacted.len(), 1);
+        assert_eq!(report.impacted[0].id, "functions/removed");
+        assert_eq!(report.impacted[0].change, ChangeKind::Removed);
+        assert_eq!(
+            report.impacted[0].blast_radius,
+            vec!["functions/caller"],
+            "a removed concept's blast radius must come from the graph it actually had callers in"
+        );
+    }
+
+    #[test]
+    fn impact_flags_public_api_and_cycle_membership() {
+        let mut public_fn = concept_with_edges("functions/public", &[], &[], true);
+        public_fn.is_public = true;
+        let private_fn = concept_with_edges("functions/private", &[], &[], false);
+        let mut recursive = concept_with_edges("functions/recursive", &[], &[], true);
+        recursive.relationships.push(Relationship {
+            kind: RelationKind::Calls,
+            target: "functions/recursive".to_string(),
+            target_display: "recursive".to_string(),
+        });
+
+        let before: Vec<Concept> = Vec::new();
+        let after = vec![public_fn, private_fn, recursive];
+
+        let report = impact(&before, &after);
+        let by_id = |id: &str| report.impacted.iter().find(|c| c.id == id).unwrap();
+
+        assert!(by_id("functions/public").is_public_api);
+        assert!(!by_id("functions/private").is_public_api);
+        assert!(by_id("functions/recursive").in_cycle);
+        assert!(!by_id("functions/public").in_cycle);
+    }
+
+    #[test]
+    fn impact_sorts_by_blast_radius_size_descending() {
+        // `hub` has two callers, `leaf` has none -- `hub` must sort first.
+        let hub = concept_with_edges("functions/hub", &[], &["functions/x", "functions/y"], true);
+        let x = concept_with_edges("functions/x", &["functions/hub"], &[], true);
+        let y = concept_with_edges("functions/y", &["functions/hub"], &[], true);
+        let leaf = concept_with_edges("functions/leaf", &[], &[], true);
+
+        let before: Vec<Concept> = Vec::new();
+        let after = vec![hub, x, y, leaf];
+
+        let report = impact(&before, &after);
+        assert_eq!(report.impacted[0].id, "functions/hub");
+        assert_eq!(report.impacted[0].blast_radius.len(), 2);
+    }
+
+    #[test]
+    fn impact_is_empty_for_identical_snapshots() {
+        let concepts = vec![make_concept("functions/a", "fn a()")];
+        let report = impact(&concepts, &concepts.clone());
+        assert!(report.diff.is_empty());
+        assert!(report.impacted.is_empty());
+    }
+
     /// Sorts by id so cache-hit and cache-miss runs (which may extract
     /// files in a different order relative to each other) compare equal.
     fn sorted_ids(concepts: &[Concept]) -> Vec<&str> {
@@ -796,6 +1099,46 @@ mod tests {
         fs::write(dir.path().join("src/a.rs"), "pub fn caller() { callee() }").unwrap();
         fs::write(dir.path().join("src/b.rs"), "pub fn callee() {}").unwrap();
         dir
+    }
+
+    /// With extraction now parallelized across a rayon thread pool (see
+    /// the `par_iter` step in `analyze_with_cache_lsp`), the one thing
+    /// that must never change is output order: `concepts`/`calls` must
+    /// still be merged in `project.files`'s own (sorted-by-path)
+    /// order, regardless of which file's parse thread happens to finish
+    /// first. A handful of files is enough concurrency to make a
+    /// nondeterministic merge order likely to show up across repeated
+    /// runs if one were introduced.
+    #[test]
+    fn parallel_extraction_produces_the_same_concept_order_on_every_run() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        for letter in ['a', 'b', 'c', 'd', 'e', 'f'] {
+            fs::write(
+                dir.path().join(format!("src/{letter}.rs")),
+                format!("pub fn fn_{letter}() {{}}"),
+            )
+            .unwrap();
+        }
+        let project = Project::load(dir.path()).unwrap();
+
+        let first = analyze(&project).unwrap();
+        for _ in 0..5 {
+            let repeat = analyze(&project).unwrap();
+            assert_eq!(
+                first
+                    .concepts
+                    .iter()
+                    .map(|c| c.id.clone())
+                    .collect::<Vec<_>>(),
+                repeat
+                    .concepts
+                    .iter()
+                    .map(|c| c.id.clone())
+                    .collect::<Vec<_>>(),
+                "concept order must be identical across runs, not just the same set"
+            );
+        }
     }
 
     #[test]

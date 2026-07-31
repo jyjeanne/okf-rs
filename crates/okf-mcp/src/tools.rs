@@ -22,6 +22,17 @@ pub fn list() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "explore",
+            "description": "One-call context for a concept: signature, description, direct callers, direct callees, blast radius (every concept transitively affected if this one changes), public-API membership, and call-cycle membership. Prefer this over separate search/graph_callers/graph_callees calls when you need more than one of these facts about the same concept — it's the same total information in one round trip instead of several.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "A concept id, or free text to resolve via ranked search (the top hit is used)" },
+                },
+                "required": ["query"],
+            },
+        }),
+        json!({
             "name": "search_ranked",
             "description": "Ranked, relevance-scored full-text search over the knowledge bundle (title, type, description, signature, and tags), via Tantivy/BM25. Unlike the search tool's exact/substring matching, this also searches description and signature prose and orders results by relevance — better for a natural-language query (e.g. \"parses a jwt\") than an exact symbol name.",
             "inputSchema": {
@@ -128,6 +139,7 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
     match name {
         "search" => okf_query::search(bundle, &arg_str(arguments, "query")?),
         "search_ranked" => okf_query::search_ranked(bundle, &arg_str(arguments, "query")?),
+        "explore" => okf_query::explore(bundle, &arg_str(arguments, "query")?),
         "coverage" => okf_query::coverage(bundle),
         "graph_callers" => okf_query::graph_callers(bundle, &arg_str(arguments, "id")?),
         "graph_callees" => okf_query::graph_callees(bundle, &arg_str(arguments, "id")?),
@@ -219,6 +231,20 @@ mod tests {
             features,
             "No REST endpoints, database models, or event-flow participants detected"
         );
+    }
+
+    #[test]
+    fn explore_bundles_signature_callers_callees_and_blast_radius_in_one_call() {
+        let dir = sample_bundle();
+        let text = call(
+            "explore",
+            &json!({ "query": "functions/auth/decode_jwt" }),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(text.starts_with("functions/auth/decode_jwt — Rust Function"));
+        assert!(text.contains("Callers (1): functions/auth/verify_token"));
+        assert!(text.contains("Blast radius"));
     }
 
     #[test]
