@@ -153,8 +153,8 @@ enum Command {
         path: PathBuf,
     },
     /// Generate human-readable documentation from a previously generated OKF
-    /// bundle: either a browsable static HTML site, or a single consolidated
-    /// Markdown document.
+    /// bundle: a browsable static HTML site, a single consolidated Markdown
+    /// document, or a single paginated PDF.
     Docs {
         /// Defaults to the value in `okf.toml`, or `knowledge`.
         bundle: Option<PathBuf>,
@@ -162,7 +162,8 @@ enum Command {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
         /// Output path: a directory for `--format html`, a file for
-        /// `--format markdown`. Defaults to `docs/` or `docs.md` respectively.
+        /// `--format markdown`/`--format pdf`. Defaults to `docs/`,
+        /// `docs.md`, or `docs.pdf` respectively.
         #[arg(short, long)]
         output: Option<PathBuf>,
         #[arg(short, long, value_enum, default_value_t = DocsFormat::Html)]
@@ -174,6 +175,7 @@ enum Command {
 enum DocsFormat {
     Html,
     Markdown,
+    Pdf,
 }
 
 #[derive(Subcommand)]
@@ -760,6 +762,17 @@ fn cmd_docs(
                 .with_context(|| format!("failed to write {}", output.display()))?;
             println!(
                 "Generated Markdown documentation for {} concepts into {}",
+                concepts.len(),
+                output.display()
+            );
+        }
+        DocsFormat::Pdf => {
+            let output = output.unwrap_or_else(|| PathBuf::from("docs.pdf"));
+            let pdf = okf_docs::generate_pdf(&concepts)?;
+            std::fs::write(&output, pdf)
+                .with_context(|| format!("failed to write {}", output.display()))?;
+            println!(
+                "Generated PDF documentation for {} concepts into {}",
                 concepts.len(),
                 output.display()
             );

@@ -10,6 +10,7 @@ description = "Static HTML and consolidated Markdown documentation generation fo
 okf-parser.workspace = true
 okf-render.workspace = true
 anyhow.workspace = true
+printpdf = "0.7"
 
 [dev-dependencies]
 tempfile = "3"

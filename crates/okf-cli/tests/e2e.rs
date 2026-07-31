@@ -267,6 +267,28 @@ fn standalone_binary_runs_the_full_command_surface_against_this_project() {
     );
     assert_success(&docs_html, &["docs html"]);
     assert!(project.join("docs-site/index.html").exists());
+
+    // docs --format pdf: a single paginated PDF.
+    let docs_pdf = run(
+        &project,
+        &[
+            "docs",
+            "--project",
+            ".",
+            "--format",
+            "pdf",
+            "--output",
+            "docs.pdf",
+        ],
+    );
+    assert_success(&docs_pdf, &["docs pdf"]);
+    let docs_pdf_path = project.join("docs.pdf");
+    let pdf_bytes = fs::read(&docs_pdf_path).unwrap();
+    assert!(
+        pdf_bytes.starts_with(b"%PDF-"),
+        "expected a well-formed PDF header"
+    );
+    assert!(pdf_bytes.len() > 1000, "suspiciously small PDF output");
 }
 
 /// `okf-rs diff` compares two git refs' OKF concepts via disposable

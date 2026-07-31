@@ -16,6 +16,10 @@
 //!   doesn't give you — useful for pasting into a wiki/README, or
 //!   feeding to a single-file-oriented tool.
 
+mod pdf;
+
+pub use pdf::generate_pdf;
+
 use anyhow::Result;
 use okf_parser::{Concept, RelationKind};
 use okf_render::{capitalize, contains_members, group_by_kind_dir};
