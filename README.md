@@ -164,6 +164,12 @@ okf-rs generate --enrich --enrich-base-url http://localhost:11434/v1 --enrich-mo
 
 Entirely optional, and never a hard dependency on one vendor: `--enrich` speaks the same `chat/completions` shape every OpenAI-compatible endpoint implements, so it works unmodified against [Ollama](https://ollama.com), LM Studio, LocalAI, [Crustly](https://github.com/jyjeanne/crustly), or a cloud provider (pass `--enrich-api-key`, or set `OKF_ENRICH_API_KEY`) — a local server generally doesn't need one. Only concepts with no description are ever queried or overwritten: a hand-written one is left alone, and a previous `--enrich` run's output is reused straight from the bundle on disk rather than re-querying the endpoint on every `generate`.
 
+Once descriptions exist, `okf-rs suggest-links` (same `--enrich-*` flags) looks for concepts that are semantically close by full-text search but have no relationship edge yet, and asks the endpoint whether each candidate looks like a genuinely missing link — advisory only, nothing is written back into the bundle:
+
+```sh
+okf-rs suggest-links --enrich-base-url http://localhost:11434/v1 --enrich-model llama3.1
+```
+
 ### 4. Explore it
 
 ```sh

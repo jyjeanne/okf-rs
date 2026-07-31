@@ -43,7 +43,15 @@ impl FullTextIndex {
     pub fn build(bundle_dir: &Path) -> Result<Self> {
         let concepts = okf_parser::read_bundle(bundle_dir)
             .with_context(|| format!("failed to read bundle at {}", bundle_dir.display()))?;
+        Self::build_from_concepts(&concepts)
+    }
 
+    /// Builds the same in-memory Tantivy index as [`FullTextIndex::build`],
+    /// but from concepts already in memory rather than reading a bundle
+    /// off disk — for a caller (like `okf-enrich`'s missing-link
+    /// suggestions) that already has the concept set loaded and would
+    /// otherwise have to read the same bundle a second time.
+    pub fn build_from_concepts(concepts: &[Concept]) -> Result<Self> {
         let mut schema_builder = Schema::builder();
         let field_id = schema_builder.add_text_field("id", STRING | STORED);
         let field_title = schema_builder.add_text_field("title", TEXT | STORED);
@@ -57,7 +65,7 @@ impl FullTextIndex {
             // comfortably more than any bundle this tool is realistically
             // pointed at needs before the first (and only) commit.
             let mut writer = index.writer(15_000_000)?;
-            for concept in &concepts {
+            for concept in concepts {
                 writer.add_document(doc!(
                     field_id => concept.id.as_str(),
                     field_title => split_identifier_words(&concept.name),
@@ -221,6 +229,23 @@ mod tests {
         let index = FullTextIndex::build(dir.path()).unwrap();
         assert_eq!(index.len(), 1);
         let hits = index.search("verifyToken", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "functions/auth/verify_token");
+    }
+
+    #[test]
+    fn build_from_concepts_matches_build_from_a_bundle_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/auth/verify_token.md",
+            "---\ntype: Rust Function\ntitle: verify_token\nresource: src/auth.rs#L1\n---\n\nbody\n",
+        );
+        let concepts = okf_parser::read_bundle(dir.path()).unwrap();
+
+        let index = FullTextIndex::build_from_concepts(&concepts).unwrap();
+        assert_eq!(index.len(), 1);
+        let hits = index.search("verify_token", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "functions/auth/verify_token");
     }

@@ -1048,7 +1048,9 @@ name = "okf-enrich"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "okf-graph",
  "okf-parser",
+ "okf-search",
  "serde",
  "serde_json",
  "tempfile",
@@ -1114,6 +1116,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "okf-arch",
+ "okf-enrich",
  "okf-graph",
  "okf-parser",
  "okf-search",

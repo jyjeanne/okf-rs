@@ -1,16 +1,22 @@
 //! Optional AI enrichment: fills in a concept's missing `description`
-//! (function/method summaries, module/package descriptions) via any
-//! OpenAI-compatible chat completions endpoint — [Ollama](https://ollama.com),
-//! LM Studio, LocalAI, [Crustly](https://github.com/jyjeanne/crustly), or a
-//! cloud provider. Never a hard dependency on one vendor: this crate only
-//! ever speaks the one `POST {base_url}/chat/completions` shape every one
-//! of those already implements.
+//! (function/method summaries, module/package descriptions), and
+//! suggests missing relationship links between semantically close
+//! concepts (see [`links`]) — via any OpenAI-compatible chat completions
+//! endpoint: [Ollama](https://ollama.com), LM Studio, LocalAI,
+//! [Crustly](https://github.com/jyjeanne/crustly), or a cloud provider.
+//! Never a hard dependency on one vendor: this crate only ever speaks
+//! the one `POST {base_url}/chat/completions` shape every one of those
+//! already implements.
 //!
 //! Entirely optional and additive, the same way `--lsp` is in
 //! `okf-analyzer`: nothing in `okf-rs generate` requires this crate, and
 //! a concept that already has a description (human-written, or carried
 //! forward from a previous `--enrich` run — see [`enrich_missing_descriptions`])
 //! is never re-queried or overwritten.
+
+mod links;
+
+pub use links::{suggest_missing_links, SuggestedLink};
 
 use anyhow::{anyhow, bail, Context, Result};
 use okf_parser::{Concept, ConceptKind};
@@ -251,27 +257,26 @@ pub fn enrich_missing_descriptions(
     Ok(stats)
 }
 
+/// A minimal, single-endpoint OpenAI-compatible mock server for tests
+/// (this crate's own, and `links`'s): reads one HTTP/1.1 request,
+/// ignores everything about it except that it arrived, and replies with
+/// a canned `chat.completions`-shaped JSON body. Runs on a background
+/// thread per accepted connection so a test can make several requests
+/// against one client without needing to know how many in advance.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use okf_parser::{Language, Location};
+pub(crate) mod test_support {
+    use crate::{EnrichClient, EnrichConfig};
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    /// A minimal, single-endpoint OpenAI-compatible mock server: reads
-    /// one HTTP/1.1 request, ignores everything about it except that it
-    /// arrived, and replies with a canned `chat.completions`-shaped JSON
-    /// body. Runs on a background thread per accepted connection so the
-    /// test itself can make several requests against one client without
-    /// needing to know how many in advance.
-    struct MockServer {
-        base_url: String,
-        request_count: Arc<AtomicUsize>,
+    pub(crate) struct MockServer {
+        pub(crate) base_url: String,
+        pub(crate) request_count: Arc<AtomicUsize>,
     }
 
-    fn start_mock_server(reply_content: &'static str) -> MockServer {
+    pub(crate) fn start_mock_server(reply_content: &'static str) -> MockServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -317,13 +322,21 @@ mod tests {
         }
     }
 
-    fn client_for(server: &MockServer) -> EnrichClient {
+    pub(crate) fn client_for(server: &MockServer) -> EnrichClient {
         EnrichClient::new(EnrichConfig {
             base_url: server.base_url.clone(),
             model: "test-model".to_string(),
             api_key: None,
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{client_for, start_mock_server};
+    use okf_parser::{Language, Location};
+    use std::sync::atomic::Ordering;
 
     fn function_concept(id: &str) -> Concept {
         Concept {

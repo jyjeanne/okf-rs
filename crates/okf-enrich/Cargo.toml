@@ -4,10 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Optional AI enrichment (function summaries, module/package descriptions) via any OpenAI-compatible chat completions endpoint"
+description = "Optional AI enrichment (function summaries, module/package descriptions, suggested missing links) via any OpenAI-compatible chat completions endpoint"
 
 [dependencies]
 okf-parser.workspace = true
+okf-graph.workspace = true
+okf-search.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

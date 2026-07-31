@@ -524,6 +524,32 @@ pub fn graph_features(bundle: &Path) -> Result<String> {
         .join("\n"))
 }
 
+/// AI-suggested missing links between semantically close concepts —
+/// `okf_enrich::suggest_missing_links`, the one query-layer operation
+/// that needs an already-configured [`okf_enrich::EnrichClient`] rather
+/// than just a bundle path, since (unlike every other function here) it
+/// makes network calls to an OpenAI-compatible endpoint. Building that
+/// client (resolving `--enrich-*`/`OKF_ENRICH_*` config) is the caller's
+/// job, the same way `okf-cli`'s `generate --enrich` already does it —
+/// this function's role is only to load the bundle and format the
+/// result, matching every other function here.
+pub fn suggest_links(
+    bundle: &Path,
+    client: &okf_enrich::EnrichClient,
+    max_candidates: usize,
+) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let suggestions = okf_enrich::suggest_missing_links(client, &concepts, max_candidates)?;
+    if suggestions.is_empty() {
+        return Ok("No missing links suggested".to_string());
+    }
+    Ok(suggestions
+        .iter()
+        .map(|s| format!("{} <-> {}: {}", s.from_id, s.to_id, s.reason))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 fn concept_lines(concepts: &[&Concept]) -> String {
     concepts
         .iter()
@@ -917,6 +943,93 @@ mod tests {
         assert_eq!(
             graph_features(dir.path()).unwrap(),
             "No REST endpoints, database models, or event-flow participants detected"
+        );
+    }
+
+    /// A minimal, single-endpoint OpenAI-compatible mock server — see
+    /// `okf-enrich`'s own `test_support` module for the twin of this
+    /// helper; not reused directly since it's `pub(crate)` there.
+    fn start_mock_server(reply_content: &'static str) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = trimmed.strip_prefix("Content-Length: ") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+
+                let payload =
+                    format!(r#"{{"choices":[{{"message":{{"content":"{reply_content}"}}}}]}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    #[test]
+    fn suggest_links_reports_a_suggestion_from_the_endpoint() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/other.md",
+            "---\ntype: Rust Function\ntitle: other\ndescription: Reads an auth token from the request header.\nresource: src/auth.rs#L20\n---\n\nbody\n",
+        );
+
+        let base_url = start_mock_server("looks related");
+        let client = okf_enrich::EnrichClient::new(okf_enrich::EnrichConfig {
+            base_url,
+            model: "test-model".to_string(),
+            api_key: None,
+        });
+
+        let text = suggest_links(dir.path(), &client, 5).unwrap();
+        assert!(text.contains("looks related"));
+    }
+
+    #[test]
+    fn suggest_links_reports_none_found_when_the_model_says_no() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/other.md",
+            "---\ntype: Rust Function\ntitle: other\ndescription: Reads an auth token from the request header.\nresource: src/auth.rs#L20\n---\n\nbody\n",
+        );
+
+        let base_url = start_mock_server("NO");
+        let client = okf_enrich::EnrichClient::new(okf_enrich::EnrichConfig {
+            base_url,
+            model: "test-model".to_string(),
+            api_key: None,
+        });
+
+        assert_eq!(
+            suggest_links(dir.path(), &client, 5).unwrap(),
+            "No missing links suggested"
         );
     }
 }

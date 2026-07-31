@@ -135,6 +135,39 @@ enum Command {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+    /// AI-suggested missing relationship links between semantically close
+    /// concepts that aren't already connected — advisory only, nothing is
+    /// written back into the bundle. Builds on the same OpenAI-compatible
+    /// endpoint `generate --enrich` uses: candidates are generated for
+    /// free via full-text search (`search --ranked`'s own index), and
+    /// only those candidates are sent to the endpoint for a yes/no
+    /// judgment, so this is bounded by the bundle's described-concept
+    /// count, not every possible pair.
+    SuggestLinks {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+        /// Enrichment endpoint base URL, e.g. `http://localhost:11434/v1`
+        /// for Ollama. Falls back to `OKF_ENRICH_BASE_URL` if unset.
+        #[arg(long)]
+        enrich_base_url: Option<String>,
+        /// Enrichment model name, e.g. `llama3.1`. Falls back to
+        /// `OKF_ENRICH_MODEL` if unset.
+        #[arg(long)]
+        enrich_model: Option<String>,
+        /// Enrichment endpoint API key, sent as `Authorization: Bearer
+        /// <key>`. Falls back to `OKF_ENRICH_API_KEY` if unset.
+        #[arg(long)]
+        enrich_api_key: Option<String>,
+        /// Maximum full-text-search candidates considered per described
+        /// concept (and therefore the upper bound on endpoint calls per
+        /// concept). Kept small by default since this is O(described
+        /// concepts × candidates) network calls, not a one-off.
+        #[arg(long, default_value_t = 3)]
+        candidates: usize,
+    },
     /// Query the concept graph: callers, callees, cycles, public API, and
     /// cross-module dependencies. Reads relationships directly from a
     /// previously generated OKF bundle on disk — run `okf-rs generate`
@@ -352,6 +385,21 @@ fn run(command: Command) -> Result<ExitCode> {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::coverage(&bundle))
         }
+        Command::SuggestLinks {
+            bundle,
+            project,
+            enrich_base_url,
+            enrich_model,
+            enrich_api_key,
+            candidates,
+        } => cmd_suggest_links(
+            bundle,
+            &project,
+            enrich_base_url,
+            enrich_model,
+            enrich_api_key,
+            candidates,
+        ),
         Command::Graph { query } => cmd_graph(query),
         Command::Diff {
             from_ref,
@@ -525,7 +573,9 @@ fn cmd_generate(
 /// `OKF_ENRICH_*` environment variable, then erroring clearly (naming
 /// both the flag and the env var) if neither supplies a required value.
 /// `api_key` alone has no required fallback — a local server (Ollama, LM
-/// Studio, LocalAI) typically doesn't need one.
+/// Studio, LocalAI) typically doesn't need one. Shared by `generate
+/// --enrich` and `suggest-links`, the two commands that talk to an
+/// enrichment endpoint.
 fn resolve_enrich_config(
     base_url: Option<String>,
     model: Option<String>,
@@ -535,14 +585,14 @@ fn resolve_enrich_config(
         .or_else(|| std::env::var("OKF_ENRICH_BASE_URL").ok())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "--enrich requires --enrich-base-url (or the OKF_ENRICH_BASE_URL environment variable)"
+                "this command requires --enrich-base-url (or the OKF_ENRICH_BASE_URL environment variable)"
             )
         })?;
     let model = model
         .or_else(|| std::env::var("OKF_ENRICH_MODEL").ok())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "--enrich requires --enrich-model (or the OKF_ENRICH_MODEL environment variable)"
+                "this command requires --enrich-model (or the OKF_ENRICH_MODEL environment variable)"
             )
         })?;
     let api_key = api_key.or_else(|| std::env::var("OKF_ENRICH_API_KEY").ok());
@@ -551,6 +601,20 @@ fn resolve_enrich_config(
         model,
         api_key,
     })
+}
+
+fn cmd_suggest_links(
+    bundle: Option<PathBuf>,
+    project: &std::path::Path,
+    enrich_base_url: Option<String>,
+    enrich_model: Option<String>,
+    enrich_api_key: Option<String>,
+    candidates: usize,
+) -> Result<ExitCode> {
+    let bundle = resolve_query_bundle(bundle, project);
+    let config = resolve_enrich_config(enrich_base_url, enrich_model, enrich_api_key)?;
+    let client = okf_enrich::EnrichClient::new(config);
+    print_query_result(okf_query::suggest_links(&bundle, &client, candidates))
 }
 
 fn cmd_watch(

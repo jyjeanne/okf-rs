@@ -506,7 +506,7 @@ fn standalone_binary_watch_regenerates_the_bundle_on_startup() {
 /// `chat.completions`-shaped JSON body — enough for `okf-rs generate
 /// --enrich` to point its `--enrich-base-url` at, without a real network
 /// call or a real LLM in the test environment.
-fn start_mock_enrich_server() -> (String, Arc<AtomicUsize>) {
+fn start_mock_enrich_server(reply_content: &'static str) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let request_count = Arc::new(AtomicUsize::new(0));
@@ -533,7 +533,7 @@ fn start_mock_enrich_server() -> (String, Arc<AtomicUsize>) {
             let mut body = vec![0u8; content_length];
             let _ = reader.read_exact(&mut body);
 
-            let payload = r#"{"choices":[{"message":{"content":"a generated description"}}]}"#;
+            let payload = format!(r#"{{"choices":[{{"message":{{"content":"{reply_content}"}}}}]}}"#);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 payload.len(),
@@ -561,7 +561,7 @@ fn standalone_binary_generate_enrich_fills_descriptions_and_a_second_run_reuses_
     )
     .unwrap();
 
-    let (base_url, request_count) = start_mock_enrich_server();
+    let (base_url, request_count) = start_mock_enrich_server("a generated description");
     let enrich_args = [
         "generate",
         ".",
@@ -624,6 +624,62 @@ fn standalone_binary_generate_enrich_without_an_endpoint_is_a_clear_error() {
     let stderr = stderr_of(&result);
     assert!(stderr.contains("--enrich-base-url"));
     assert!(stderr.contains("OKF_ENRICH_BASE_URL"));
+}
+
+/// `okf-rs suggest-links` builds on `--enrich`: after descriptions exist
+/// (via `generate --enrich`), it finds full-text-search candidates with
+/// no existing relationship and asks the (mock) endpoint whether each
+/// looks like a genuinely missing link.
+#[test]
+fn standalone_binary_suggest_links_reports_a_suggestion_from_the_endpoint() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn verify_token() -> bool {\n    true\n}\n\npub fn decode_jwt() -> i32 {\n    0\n}\n",
+    )
+    .unwrap();
+
+    // Step 1: populate descriptions so there's something for full-text
+    // search to match candidates on.
+    let (describe_url, _) = start_mock_enrich_server("handles authentication tokens");
+    let generate = run(
+        &project,
+        &[
+            "generate",
+            ".",
+            "--enrich",
+            "--enrich-base-url",
+            &describe_url,
+            "--enrich-model",
+            "test-model",
+        ],
+    );
+    assert_success(&generate, &["generate --enrich"]);
+
+    // Step 2: suggest-links, against a second mock endpoint that always
+    // says the candidate pair looks related.
+    let (suggest_url, suggest_requests) = start_mock_enrich_server("these likely belong together");
+    let suggest = run(
+        &project,
+        &[
+            "suggest-links",
+            "--project",
+            ".",
+            "--enrich-base-url",
+            &suggest_url,
+            "--enrich-model",
+            "test-model",
+        ],
+    );
+    assert_success(&suggest, &["suggest-links"]);
+    let out = stdout_of(&suggest);
+    assert!(out.contains("these likely belong together"));
+    assert!(
+        suggest_requests.load(Ordering::SeqCst) > 0,
+        "expected at least one candidate to be judged"
+    );
 }
 
 /// Commands that read an existing bundle fail with a clear, non-zero-exit
