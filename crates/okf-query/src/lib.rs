@@ -452,6 +452,60 @@ pub fn graph_path(bundle: &Path, from: &str, to: &str) -> Result<String> {
     }
 }
 
+/// Each package's position in the layered architecture derived from the
+/// package dependency graph (`okf_arch::layers`) — layer 0 is a package
+/// with no dependency on any other package in the bundle. Unlike
+/// [`coverage`]/[`graph_stats`], `okf-arch`'s own [`okf_arch::PackageLayer`]
+/// is already the structured form; there's no separate `*_report`
+/// function here to duplicate it.
+pub fn graph_layers(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let graph = okf_graph::Graph::build(&concepts);
+    let layers = okf_arch::layers(&graph);
+    if layers.is_empty() {
+        return Ok("No packages found to layer (no Package concepts in the bundle)".to_string());
+    }
+    Ok(layers
+        .iter()
+        .map(|l| format!("{:<3} {}", l.layer, l.package_id))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Clusters of packages that depend on each other, directly or
+/// transitively (`okf_arch::domains`) — a package with no cross-package
+/// dependency in or out is still its own singleton domain.
+pub fn graph_domains(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let graph = okf_graph::Graph::build(&concepts);
+    let domains = okf_arch::domains(&graph);
+    if domains.is_empty() {
+        return Ok("No packages found (no Package concepts in the bundle)".to_string());
+    }
+    Ok(domains
+        .iter()
+        .enumerate()
+        .map(|(i, d)| format!("[{}] {}", i + 1, d.package_ids.join(", ")))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Design patterns detected via structural/naming heuristics
+/// (`okf_arch::detect_patterns`) — see that function's own docs for what
+/// this does and doesn't claim to detect.
+pub fn graph_patterns(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let found = okf_arch::detect_patterns(&concepts);
+    if found.is_empty() {
+        return Ok("No design patterns detected".to_string());
+    }
+    Ok(found
+        .iter()
+        .map(|p| format!("{:<10} {} — {}", p.kind.as_str(), p.concept_id, p.evidence))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 fn concept_lines(concepts: &[&Concept]) -> String {
     concepts
         .iter()
@@ -739,6 +793,89 @@ mod tests {
         assert_eq!(
             graph_isolated(dir.path()).unwrap(),
             "No isolated concepts found"
+        );
+    }
+
+    #[test]
+    fn graph_layers_and_domains_report_none_found_without_any_package() {
+        let dir = sample_bundle();
+        assert_eq!(
+            graph_layers(dir.path()).unwrap(),
+            "No packages found to layer (no Package concepts in the bundle)"
+        );
+        assert_eq!(
+            graph_domains(dir.path()).unwrap(),
+            "No packages found (no Package concepts in the bundle)"
+        );
+    }
+
+    #[test]
+    fn graph_layers_and_domains_report_a_two_package_dependency() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "packages/core.md",
+            "---\ntype: Rust Package\ntitle: core\nresource: core/Cargo.toml\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "packages/app.md",
+            "---\ntype: Rust Package\ntitle: app\nresource: app/Cargo.toml\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "modules/core.md",
+            "---\ntype: Rust Module\ntitle: core\nresource: core/src/lib.rs#L1\nrelationships:\n  member_of:\n    - packages/core\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "modules/app.md",
+            "---\ntype: Rust Module\ntitle: app\nresource: app/src/lib.rs#L1\nrelationships:\n  member_of:\n    - packages/app\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/app_fn.md",
+            "---\ntype: Rust Function\ntitle: app_fn\nresource: app/src/lib.rs#L1\nrelationships:\n  calls:\n    - functions/core_fn\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/core_fn.md",
+            "---\ntype: Rust Function\ntitle: core_fn\nresource: core/src/lib.rs#L1\n---\n\nbody\n",
+        );
+
+        let layers = graph_layers(dir.path()).unwrap();
+        assert!(layers.contains("0   packages/core"));
+        assert!(layers.contains("1   packages/app"));
+
+        let domains = graph_domains(dir.path()).unwrap();
+        assert!(domains.contains("packages/app, packages/core"));
+    }
+
+    #[test]
+    fn graph_patterns_finds_a_builder() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "classes/RequestBuilder.md",
+            "---\ntype: Rust Class\ntitle: RequestBuilder\nresource: src/req.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/RequestBuilder/build.md",
+            "---\ntype: Rust Method\ntitle: build\nresource: src/req.rs#L5\n---\n\nbody\n",
+        );
+
+        let text = graph_patterns(dir.path()).unwrap();
+        assert!(text.contains("Builder"));
+        assert!(text.contains("classes/RequestBuilder"));
+    }
+
+    #[test]
+    fn graph_patterns_reports_none_found_when_there_are_no_matches() {
+        let dir = sample_bundle();
+        assert_eq!(
+            graph_patterns(dir.path()).unwrap(),
+            "No design patterns detected"
         );
     }
 }

@@ -171,6 +171,9 @@ okf-rs search verify_token                              # find a symbol by name
 okf-rs search "parses a jwt" --ranked                    # ranked, relevance-scored full-text search (title/type/description/signature/tags)
 okf-rs graph callers functions/src/auth/verify_token     # who calls it
 okf-rs graph api                                         # the whole public API surface
+okf-rs graph layers                                      # each package's layer in the dependency graph (0 = foundational)
+okf-rs graph domains                                     # clusters of packages that depend on each other
+okf-rs graph patterns                                    # Builder/Singleton/Factory/Visitor matches, by structural heuristic
 okf-rs docs --format html                                # a browsable static site, into docs/
 ```
 

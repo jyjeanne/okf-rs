@@ -10,6 +10,7 @@ description = "Shared search/graph query layer used by both okf-cli and okf-mcp"
 okf-parser.workspace = true
 okf-search.workspace = true
 okf-graph.workspace = true
+okf-arch.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 

@@ -174,6 +174,16 @@ impl<'a> Graph<'a> {
             .collect()
     }
 
+    /// Every concept of a given kind, sorted by id for deterministic
+    /// output — e.g. `of_kind(ConceptKind::Package)` to enumerate every
+    /// package in the bundle, the way `okf-arch`'s architecture-layer and
+    /// domain-boundary analysis does.
+    pub fn of_kind(&self, kind: ConceptKind) -> Vec<&'a Concept> {
+        let mut matches: Vec<&Concept> = self.concepts.iter().filter(|c| c.kind == kind).collect();
+        matches.sort_by(|a, b| a.id.cmp(&b.id));
+        matches
+    }
+
     /// Every concept marked public (see [`Concept::is_public`]), sorted
     /// by id for deterministic output. `Module`/`Package` concepts are
     /// excluded — they're structural containers, not API surface.
@@ -564,6 +574,23 @@ mod tests {
         let api = graph.public_api();
         assert_eq!(api.len(), 1);
         assert_eq!(api[0].id, "functions/a/pub_fn");
+    }
+
+    #[test]
+    fn of_kind_filters_and_sorts_by_id() {
+        let module = concept("modules/a", ConceptKind::Module, "a.rs", true);
+        let fn_b = concept("functions/b", ConceptKind::Function, "a.rs", true);
+        let fn_a = concept("functions/a", ConceptKind::Function, "a.rs", true);
+
+        let concepts = vec![module, fn_b, fn_a];
+        let graph = Graph::build(&concepts);
+
+        let functions = graph.of_kind(ConceptKind::Function);
+        assert_eq!(
+            functions.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["functions/a", "functions/b"]
+        );
+        assert_eq!(graph.of_kind(ConceptKind::Package), Vec::<&Concept>::new());
     }
 
     #[test]

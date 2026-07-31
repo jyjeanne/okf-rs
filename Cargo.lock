@@ -956,6 +956,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "okf-arch"
+version = "0.2.0"
+dependencies = [
+ "okf-graph",
+ "okf-parser",
+ "serde",
+]
+
+[[package]]
 name = "okf-cli"
 version = "0.2.0"
 dependencies = [
@@ -1064,6 +1073,7 @@ name = "okf-query"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "okf-arch",
  "okf-graph",
  "okf-parser",
  "okf-search",

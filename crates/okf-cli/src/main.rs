@@ -249,6 +249,34 @@ enum GraphQuery {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+    /// Report each package's layer in the layered architecture derived
+    /// from the package dependency graph (layer 0 = depends on nothing
+    /// else in the bundle).
+    Layers {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// List domain boundaries: clusters of packages that depend on each
+    /// other, directly or transitively.
+    Domains {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// List design patterns detected via structural/naming heuristics
+    /// (Builder, Singleton, Factory, Visitor).
+    Patterns {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -676,6 +704,18 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
         } => {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::graph_path(&bundle, &from, &to))
+        }
+        GraphQuery::Layers { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_layers(&bundle))
+        }
+        GraphQuery::Domains { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_domains(&bundle))
+        }
+        GraphQuery::Patterns { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_patterns(&bundle))
         }
     }
 }
