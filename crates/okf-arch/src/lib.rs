@@ -25,7 +25,7 @@ pub use patterns::{detect_patterns, DetectedPattern, PatternKind};
 use okf_graph::Graph;
 use okf_parser::ConceptKind;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// One package's position in the layered architecture derived from the
 /// package-level dependency graph (packages aggregated from
@@ -224,6 +224,214 @@ pub fn domains(graph: &Graph<'_>) -> Vec<Domain> {
         .collect()
 }
 
+/// A cluster of packages found by [`communities`]'s modularity
+/// optimization, as opposed to [`domains`]'s plain connected components:
+/// two packages that are technically reachable from each other can still
+/// land in different communities here if their connection is weak
+/// relative to how strongly each already collaborates within its own
+/// cluster — the distinction [`domains`] alone can't draw, since
+/// "reachable at all" and "how strongly connected" are different
+/// questions. Like [`Domain`], a package with no edges to any other
+/// package is still its own singleton community.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Community {
+    /// Every package in this community, sorted by id.
+    pub package_ids: Vec<String>,
+}
+
+/// Package-level dependency edges, weighted by how many distinct
+/// module-to-module dependency pairs (`graph.module_dependencies()`)
+/// contribute to it — a proxy for "how strongly do these two packages
+/// actually collaborate," not just "is there at least one edge," which
+/// is all [`package_dependencies`]'s deduplicated pairs can say. Directed
+/// module edges collapse into one undirected package-pair weight (a
+/// dependency in either direction is still evidence the two packages are
+/// linked), keyed by the lexicographically smaller package id first so
+/// the same pair always hashes to the same key regardless of which
+/// direction was observed.
+fn weighted_package_edges(graph: &Graph<'_>) -> HashMap<(String, String), usize> {
+    let mut weights: HashMap<(String, String), usize> = HashMap::new();
+    for (from_module, to_module) in graph.module_dependencies() {
+        let (Some(from_pkg), Some(to_pkg)) = (
+            graph.owning_package(from_module),
+            graph.owning_package(to_module),
+        ) else {
+            continue;
+        };
+        if from_pkg.id == to_pkg.id {
+            continue;
+        }
+        let key = if from_pkg.id <= to_pkg.id {
+            (from_pkg.id.clone(), to_pkg.id.clone())
+        } else {
+            (to_pkg.id.clone(), from_pkg.id.clone())
+        };
+        *weights.entry(key).or_default() += 1;
+    }
+    weights
+}
+
+/// See [`Community`]: modularity-based community detection over the
+/// package dependency graph, layered onto [`weighted_package_edges`] the
+/// same way [`layers`]/[`domains`] are layered onto
+/// [`package_dependencies`]. Sorted by each community's own sorted
+/// package ids.
+pub fn communities(graph: &Graph<'_>) -> Vec<Community> {
+    let packages: Vec<String> = graph
+        .of_kind(ConceptKind::Package)
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+    if packages.is_empty() {
+        return Vec::new();
+    }
+    let edges = weighted_package_edges(graph);
+    greedy_modularity_communities(&packages, &edges)
+}
+
+/// Greedy modularity-optimization community detection (the
+/// Clauset-Newman-Moore agglomerative algorithm): starting with every
+/// package as its own community, repeatedly merges whichever pair of
+/// communities currently connected by an edge would increase modularity
+/// the most, stopping once no remaining merge would improve it.
+///
+/// Deliberately this single-level agglomerative variant rather than full
+/// multi-level Louvain (which additionally aggregates communities into
+/// super-nodes and repeats the whole process): a package-dependency graph
+/// is small enough in practice that a second aggregation level buys
+/// nothing a careful single pass doesn't already find, and skipping it
+/// keeps the one property that actually matters here non-negotiable —
+/// determinism. Every tie (an equal modularity gain from two different
+/// candidate merges) is broken by the lexicographically smaller
+/// community-id pair, and nothing here iterates a `HashMap` when order
+/// matters, so identical input always produces identical output — see
+/// `communities_is_deterministic_across_repeated_runs`.
+///
+/// Pure and graph-agnostic (only [`communities`] wires this to a real
+/// [`Graph`]), so it's directly testable against a hand-built weighted
+/// edge map — including the textbook case this whole analysis exists
+/// for: two densely-interconnected clusters joined by one thin bridge
+/// edge, which [`domains`]'s connected-components approach can't tell
+/// apart from one real domain, but a real modularity signal can (see
+/// `greedy_modularity_communities_splits_two_dense_clusters_joined_by_a_thin_bridge`).
+fn greedy_modularity_communities(
+    package_ids: &[String],
+    edge_weights: &HashMap<(String, String), usize>,
+) -> Vec<Community> {
+    let total_weight: f64 = edge_weights.values().map(|&w| w as f64).sum();
+
+    // No cross-package edges at all: every package is its own community
+    // (mirrors `domains()`'s singleton behavior for an edgeless graph),
+    // and there's nothing to divide by below.
+    if total_weight == 0.0 {
+        let mut ids: Vec<String> = package_ids.to_vec();
+        ids.sort();
+        return ids
+            .into_iter()
+            .map(|id| Community {
+                package_ids: vec![id],
+            })
+            .collect();
+    }
+
+    // Community state, keyed by one representative member package id
+    // (arbitrary but stable — the id of whichever package started the
+    // community, since packages only ever merge into an existing key,
+    // never rename one): member package ids, and total edge-weight
+    // degree (sum of every edge weight touching any member).
+    let mut members: BTreeMap<String, Vec<String>> = package_ids
+        .iter()
+        .map(|p| (p.clone(), vec![p.clone()]))
+        .collect();
+    let mut degree: BTreeMap<String, f64> = package_ids.iter().map(|p| (p.clone(), 0.0)).collect();
+    for ((a, b), &w) in edge_weights {
+        *degree
+            .get_mut(a)
+            .expect("edge endpoint must be a known package") += w as f64;
+        *degree
+            .get_mut(b)
+            .expect("edge endpoint must be a known package") += w as f64;
+    }
+
+    // Community-to-community edge weight, keyed the same
+    // smaller-id-first way `edge_weights` already is.
+    let mut comm_edges: BTreeMap<(String, String), f64> = edge_weights
+        .iter()
+        .map(|((a, b), &w)| ((a.clone(), b.clone()), w as f64))
+        .collect();
+
+    loop {
+        // Modularity gain from merging communities a and b:
+        // ΔQ = 2 * (w_ab/m - deg(a)*deg(b) / (2*m^2)).
+        let mut best: Option<((String, String), f64)> = None;
+        for ((a, b), &w) in &comm_edges {
+            let delta = 2.0
+                * (w / total_weight
+                    - (degree[a] * degree[b]) / (2.0 * total_weight * total_weight));
+            let candidate = ((a.clone(), b.clone()), delta);
+            best = Some(match best {
+                None => candidate,
+                Some((best_pair, best_delta)) => {
+                    if delta > best_delta || (delta == best_delta && candidate.0 < best_pair) {
+                        candidate
+                    } else {
+                        (best_pair, best_delta)
+                    }
+                }
+            });
+        }
+
+        let Some(((a, b), delta)) = best else {
+            break;
+        };
+        if delta <= 0.0 {
+            break;
+        }
+
+        // Merge b into a (comm_edges keys always have a <= b, by
+        // construction above and by how re-keying below preserves it).
+        let b_members = members.remove(&b).expect("b must be a live community");
+        members
+            .get_mut(&a)
+            .expect("a must be a live community")
+            .extend(b_members);
+
+        let b_degree = degree.remove(&b).expect("b must have a degree entry");
+        *degree.get_mut(&a).expect("a must have a degree entry") += b_degree;
+
+        // Re-key every edge touching b onto a, summing weights if a
+        // already had its own edge to that third community.
+        let touching_b: Vec<((String, String), f64)> = comm_edges
+            .iter()
+            .filter(|((x, y), _)| x == &b || y == &b)
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for ((x, y), w) in touching_b {
+            comm_edges.remove(&(x.clone(), y.clone()));
+            let other = if x == b { y } else { x };
+            if other == a {
+                continue; // the a-b edge itself; already folded into the merge above
+            }
+            let key = if a <= other {
+                (a.clone(), other.clone())
+            } else {
+                (other.clone(), a.clone())
+            };
+            *comm_edges.entry(key).or_insert(0.0) += w;
+        }
+    }
+
+    let mut result: Vec<Community> = members
+        .into_values()
+        .map(|mut ids| {
+            ids.sort();
+            Community { package_ids: ids }
+        })
+        .collect();
+    result.sort_by(|a, b| a.package_ids.cmp(&b.package_ids));
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +602,145 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn edge(weights: &mut HashMap<(String, String), usize>, a: &str, b: &str, weight: usize) {
+        let key = if a <= b {
+            (a.to_string(), b.to_string())
+        } else {
+            (b.to_string(), a.to_string())
+        };
+        *weights.entry(key).or_default() += weight;
+    }
+
+    #[test]
+    fn greedy_modularity_communities_returns_all_singletons_when_there_are_no_edges() {
+        let packages = vec!["packages/a".to_string(), "packages/b".to_string()];
+        let result = greedy_modularity_communities(&packages, &HashMap::new());
+        assert_eq!(
+            result,
+            vec![
+                Community {
+                    package_ids: vec!["packages/a".to_string()]
+                },
+                Community {
+                    package_ids: vec!["packages/b".to_string()]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn greedy_modularity_communities_merges_a_single_connected_pair() {
+        let packages = vec!["packages/app".to_string(), "packages/core".to_string()];
+        let mut weights = HashMap::new();
+        edge(&mut weights, "packages/app", "packages/core", 1);
+
+        let result = greedy_modularity_communities(&packages, &weights);
+        assert_eq!(
+            result,
+            vec![Community {
+                package_ids: vec!["packages/app".to_string(), "packages/core".to_string()]
+            }]
+        );
+    }
+
+    /// The textbook case this whole analysis exists for: two triangles
+    /// (`a1`/`a2`/`a3` and `b1`/`b2`/`b3`), each densely interconnected,
+    /// joined by exactly one thin bridge edge (`a1`-`b1`). `domains()`
+    /// (plain connected components) can only report this as one domain
+    /// of six packages — every package really is reachable from every
+    /// other. A modularity signal can tell the difference: splitting
+    /// into the two triangles increases modularity despite losing the
+    /// one bridge edge, because each triangle is so much more densely
+    /// connected internally than the bridge is externally.
+    #[test]
+    fn greedy_modularity_communities_splits_two_dense_clusters_joined_by_a_thin_bridge() {
+        let packages: Vec<String> = ["a1", "a2", "a3", "b1", "b2", "b3"]
+            .iter()
+            .map(|s| format!("packages/{s}"))
+            .collect();
+        let mut weights = HashMap::new();
+        for (x, y) in [("a1", "a2"), ("a1", "a3"), ("a2", "a3")] {
+            edge(
+                &mut weights,
+                &format!("packages/{x}"),
+                &format!("packages/{y}"),
+                10,
+            );
+        }
+        for (x, y) in [("b1", "b2"), ("b1", "b3"), ("b2", "b3")] {
+            edge(
+                &mut weights,
+                &format!("packages/{x}"),
+                &format!("packages/{y}"),
+                10,
+            );
+        }
+        edge(&mut weights, "packages/a1", "packages/b1", 1);
+
+        let result = greedy_modularity_communities(&packages, &weights);
+        assert_eq!(
+            result,
+            vec![
+                Community {
+                    package_ids: vec![
+                        "packages/a1".to_string(),
+                        "packages/a2".to_string(),
+                        "packages/a3".to_string(),
+                    ]
+                },
+                Community {
+                    package_ids: vec![
+                        "packages/b1".to_string(),
+                        "packages/b2".to_string(),
+                        "packages/b3".to_string(),
+                    ]
+                },
+            ],
+            "the two dense triangles must stay separate communities despite the bridge edge"
+        );
+    }
+
+    #[test]
+    fn communities_reports_all_singletons_without_any_package_dependency() {
+        let a_pkg = concept("packages/a", ConceptKind::Package, "a/Cargo.toml");
+        let b_pkg = concept("packages/b", ConceptKind::Package, "b/Cargo.toml");
+        let concepts = vec![a_pkg, b_pkg];
+        let graph = Graph::build(&concepts);
+
+        assert_eq!(
+            communities(&graph),
+            vec![
+                Community {
+                    package_ids: vec!["packages/a".to_string()]
+                },
+                Community {
+                    package_ids: vec!["packages/b".to_string()]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn communities_is_empty_without_any_package() {
+        let no_packages: Vec<Concept> = Vec::new();
+        let graph = Graph::build(&no_packages);
+        assert!(communities(&graph).is_empty());
+    }
+
+    /// The determinism condition this whole feature is gated on: running
+    /// community detection repeatedly against the exact same graph must
+    /// produce byte-identical output every time, not just an
+    /// equivalent-up-to-reordering result.
+    #[test]
+    fn communities_is_deterministic_across_repeated_runs() {
+        let concepts = two_layer_project();
+        let graph = Graph::build(&concepts);
+
+        let first = communities(&graph);
+        for _ in 0..10 {
+            assert_eq!(communities(&graph), first);
+        }
     }
 }

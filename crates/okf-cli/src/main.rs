@@ -232,6 +232,24 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Renders the same change-impact analysis as `impact`, but as a
+    /// Markdown report meant to be posted as a pull-request comment (a
+    /// leading HTML marker comment lets a bot find and update its own
+    /// prior comment instead of piling up a new one on every push).
+    Review {
+        from_ref: String,
+        to_ref: String,
+        /// Project directory to analyze, relative to the git repository root.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Exit non-zero (in addition to printing the report) if any
+        /// changed concept's blast radius has at least this many
+        /// concepts — for CI merge gating on risky changes. Unset (the
+        /// default) never fails regardless of blast radius size; the
+        /// report itself is identical either way.
+        #[arg(long)]
+        fail_on_risk: Option<usize>,
+    },
     /// Change-impact ("blast radius") analysis between two git refs: for
     /// every added/removed/changed concept, which other concepts
     /// transitively depend on it, whether it's public API, and whether
@@ -370,6 +388,19 @@ enum GraphQuery {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+    /// List package communities found by modularity-optimization
+    /// community detection — a finer-grained signal than `domains`'
+    /// plain connected components: two packages technically reachable
+    /// from each other can still land in different communities if their
+    /// connection is weak relative to how strongly each already
+    /// collaborates within its own cluster.
+    Communities {
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
     /// List design patterns detected via structural/naming heuristics
     /// (Builder, Singleton, Factory, Visitor).
     Patterns {
@@ -501,6 +532,12 @@ fn run(command: Command) -> Result<ExitCode> {
             to_ref,
             path,
         } => cmd_impact(&from_ref, &to_ref, &path),
+        Command::Review {
+            from_ref,
+            to_ref,
+            path,
+            fail_on_risk,
+        } => cmd_review(&from_ref, &to_ref, &path, fail_on_risk),
         Command::Docs {
             bundle,
             project,
@@ -939,6 +976,10 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::graph_domains(&bundle))
         }
+        GraphQuery::Communities { bundle, project } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::graph_communities(&bundle))
+        }
         GraphQuery::Patterns { bundle, project } => {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::graph_patterns(&bundle))
@@ -1213,4 +1254,159 @@ fn cmd_impact(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<Ex
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// A stable marker at the top of every `okf-rs review` report, so a bot
+/// posting it as a pull-request comment can find its own prior comment
+/// (e.g. by searching for this exact string) and update it in place
+/// instead of piling up a new comment on every push.
+const REVIEW_MARKER: &str = "<!-- okf-rs-review -->";
+
+fn cmd_review(
+    from_ref: &str,
+    to_ref: &str,
+    path: &std::path::Path,
+    fail_on_risk: Option<usize>,
+) -> Result<ExitCode> {
+    let repo_root = git_repo_root(path)?;
+    let canonical_path = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let relative_project = canonical_path
+        .strip_prefix(&repo_root)
+        .unwrap_or(std::path::Path::new("."));
+
+    let from_checkout = WorktreeCheckout::new(&repo_root, from_ref)?;
+    let from_result = analyze_path(&from_checkout.path().join(relative_project))?;
+
+    let to_checkout = WorktreeCheckout::new(&repo_root, to_ref)?;
+    let to_result = analyze_path(&to_checkout.path().join(relative_project))?;
+
+    let report = okf_analyzer::impact(&from_result.concepts, &to_result.concepts);
+    println!("{}", render_review_markdown(&report, from_ref, to_ref));
+
+    let risky = fail_on_risk.is_some_and(|threshold| {
+        report
+            .impacted
+            .iter()
+            .any(|c| c.blast_radius.len() >= threshold)
+    });
+    if risky {
+        Ok(ExitCode::FAILURE)
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Renders an [`okf_analyzer::ImpactReport`] as a pull-request-comment-ready
+/// Markdown report — pure text formatting over data `cmd_review` already
+/// computed, so it's directly unit-testable without a real git repository.
+fn render_review_markdown(
+    report: &okf_analyzer::ImpactReport,
+    from_ref: &str,
+    to_ref: &str,
+) -> String {
+    let mut out =
+        format!("{REVIEW_MARKER}\n## okf-rs impact report: `{from_ref}` → `{to_ref}`\n\n");
+
+    if report.impacted.is_empty() {
+        out.push_str("No concept-level changes between these two refs.\n");
+        return out;
+    }
+
+    let total_blast_radius: std::collections::HashSet<&str> = report
+        .impacted
+        .iter()
+        .flat_map(|c| c.blast_radius.iter().map(String::as_str))
+        .collect();
+    out.push_str(&format!(
+        "{} concept(s) changed, affecting {} other concept(s) transitively (ordered by blast radius, most affected first).\n\n",
+        report.impacted.len(),
+        total_blast_radius.len()
+    ));
+
+    out.push_str("| Change | Concept | Kind | Blast radius | Public API | In cycle |\n");
+    out.push_str("|---|---|---|---|---|---|\n");
+    for impacted in &report.impacted {
+        let change = match impacted.change {
+            okf_analyzer::ChangeKind::Added => "➕ added",
+            okf_analyzer::ChangeKind::Removed => "➖ removed",
+            okf_analyzer::ChangeKind::Changed => "✏️ changed",
+        };
+        out.push_str(&format!(
+            "| {change} | `{}` | {} | {} | {} | {} |\n",
+            impacted.id,
+            impacted.kind.as_str(),
+            impacted.blast_radius.len(),
+            if impacted.is_public_api { "✅" } else { "" },
+            if impacted.in_cycle { "⚠️" } else { "" },
+        ));
+    }
+
+    out.push_str(
+        "\n_Deterministic, structural blast-radius analysis (`okf-rs impact`) — not a substitute for human review._\n",
+    );
+    out
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use okf_analyzer::{ChangeKind, ImpactReport, ImpactedConcept};
+    use okf_parser::ConceptKind;
+
+    fn impacted(id: &str, change: ChangeKind, blast_radius: &[&str]) -> ImpactedConcept {
+        ImpactedConcept {
+            id: id.to_string(),
+            kind: ConceptKind::Function,
+            change,
+            blast_radius: blast_radius.iter().map(|s| s.to_string()).collect(),
+            is_public_api: true,
+            in_cycle: false,
+        }
+    }
+
+    #[test]
+    fn renders_no_changes_as_a_clear_one_liner() {
+        let report = ImpactReport::default();
+        let markdown = render_review_markdown(&report, "main", "HEAD");
+        assert!(markdown.starts_with(REVIEW_MARKER));
+        assert!(markdown.contains("No concept-level changes"));
+    }
+
+    #[test]
+    fn renders_a_table_row_per_changed_concept_with_blast_radius_and_flags() {
+        let report = ImpactReport {
+            diff: Default::default(),
+            impacted: vec![impacted(
+                "functions/callee",
+                ChangeKind::Changed,
+                &["functions/caller"],
+            )],
+        };
+        let markdown = render_review_markdown(&report, "main", "feature");
+        assert!(markdown.starts_with(REVIEW_MARKER));
+        assert!(markdown.contains("okf-rs impact report: `main` → `feature`"));
+        assert!(markdown.contains("1 concept(s) changed, affecting 1 other concept(s)"));
+        assert!(markdown.contains("✏️ changed"));
+        assert!(markdown.contains("`functions/callee`"));
+        assert!(markdown.contains("| 1 |"));
+        assert!(markdown.contains("✅"));
+    }
+
+    #[test]
+    fn counts_the_union_of_blast_radii_not_a_sum_with_double_counting() {
+        // Two changed concepts that share one common downstream caller:
+        // the report's overall "N other concepts affected" figure must
+        // count that shared concept once, not twice.
+        let report = ImpactReport {
+            diff: Default::default(),
+            impacted: vec![
+                impacted("functions/a", ChangeKind::Changed, &["functions/shared"]),
+                impacted("functions/b", ChangeKind::Changed, &["functions/shared"]),
+            ],
+        };
+        let markdown = render_review_markdown(&report, "main", "feature");
+        assert!(markdown.contains("2 concept(s) changed, affecting 1 other concept(s)"));
+    }
 }

@@ -118,6 +118,11 @@ pub fn list() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {} },
         }),
         json!({
+            "name": "graph_communities",
+            "description": "List package communities found by modularity-optimization community detection — a finer-grained signal than graph_domains' plain connected components: two packages technically reachable from each other can still land in different communities if their connection is weak relative to how strongly each already collaborates within its own cluster.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
+        json!({
             "name": "graph_patterns",
             "description": "List design patterns (Builder, Singleton, Factory, Visitor) detected via structural/naming heuristics — a structural signal to review, not a semantic guarantee the pattern is really implemented as intended.",
             "inputSchema": { "type": "object", "properties": {} },
@@ -155,6 +160,7 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
         ),
         "graph_layers" => okf_query::graph_layers(bundle),
         "graph_domains" => okf_query::graph_domains(bundle),
+        "graph_communities" => okf_query::graph_communities(bundle),
         "graph_patterns" => okf_query::graph_patterns(bundle),
         "graph_features" => okf_query::graph_features(bundle),
         other => Err(anyhow!("unknown tool `{other}`")),

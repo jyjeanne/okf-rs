@@ -565,6 +565,94 @@ fn standalone_binary_impact_reports_the_blast_radius_between_two_refs() {
     assert!(stdout_of(&no_impact).contains("No concept-level changes"));
 }
 
+/// `okf-rs review` renders the same underlying impact analysis as
+/// `impact`, but as a Markdown, PR-comment-ready report with a leading
+/// sticky-comment marker, and supports `--fail-on-risk` for CI gating.
+#[test]
+fn standalone_binary_review_renders_markdown_and_supports_fail_on_risk_gating() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("review-repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "okf-rs e2e tests"]);
+    git(&["config", "user.email", "e2e@example.invalid"]);
+    git(&["config", "commit.gpgsign", "false"]);
+
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn callee() -> i32 {\n    1\n}\n\npub fn caller() -> i32 {\n    callee()\n}\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c1"]);
+    let c1 = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn callee(x: i32) -> i32 {\n    x + 1\n}\n\npub fn caller() -> i32 {\n    callee(0)\n}\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c2"]);
+    let c2 = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let review = run(&repo, &["review", &c1, &c2, "."]);
+    assert_success(&review, &["review"]);
+    let review_out = stdout_of(&review);
+    assert!(review_out.starts_with("<!-- okf-rs-review -->"));
+    assert!(review_out.contains("okf-rs impact report:"));
+    assert!(review_out.contains("| ✏️ changed | `functions/src/callee` |"));
+    assert!(review_out.contains("Deterministic, structural blast-radius analysis"));
+
+    // `--fail-on-risk 1` must fail: `callee`'s blast radius is exactly 1
+    // (`caller`).
+    let gated_fail = run(&repo, &["review", &c1, &c2, ".", "--fail-on-risk", "1"]);
+    assert!(
+        !gated_fail.status.success(),
+        "expected --fail-on-risk 1 to fail the command"
+    );
+    assert!(stdout_of(&gated_fail).contains("okf-rs impact report:"));
+
+    // `--fail-on-risk 2` must not fail: nothing has a blast radius that big.
+    let gated_pass = run(&repo, &["review", &c1, &c2, ".", "--fail-on-risk", "2"]);
+    assert_success(&gated_pass, &["review --fail-on-risk 2"]);
+
+    // No changes between a ref and itself.
+    let no_review = run(&repo, &["review", &c2, &c2, "."]);
+    assert_success(&no_review, &["review (no-op)"]);
+    assert!(stdout_of(&no_review).contains("No concept-level changes"));
+}
+
 /// `okf-rs generate --lsp` asks a real language server
 /// (`textDocument/definition`) to disambiguate call edges Tree-sitter's
 /// own name-only matching can't: two `run` functions in different

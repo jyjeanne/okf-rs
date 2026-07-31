@@ -620,6 +620,27 @@ pub fn graph_domains(bundle: &Path) -> Result<String> {
         .join("\n"))
 }
 
+/// Clusters of packages found by modularity-optimization community
+/// detection (`okf_arch::communities`) — a finer-grained signal than
+/// [`graph_domains`]'s plain connected components: two packages that are
+/// technically reachable from each other can still land in different
+/// communities here if the connection between them is weak relative to
+/// how strongly each already collaborates within its own cluster.
+pub fn graph_communities(bundle: &Path) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let graph = okf_graph::Graph::build(&concepts);
+    let communities = okf_arch::communities(&graph);
+    if communities.is_empty() {
+        return Ok("No packages found (no Package concepts in the bundle)".to_string());
+    }
+    Ok(communities
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("[{}] {}", i + 1, c.package_ids.join(", ")))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 /// Design patterns detected via structural/naming heuristics
 /// (`okf_arch::detect_patterns`) — see that function's own docs for what
 /// this does and doesn't claim to detect.
@@ -1119,6 +1140,18 @@ mod tests {
 
         let domains = graph_domains(dir.path()).unwrap();
         assert!(domains.contains("packages/app, packages/core"));
+
+        let communities = graph_communities(dir.path()).unwrap();
+        assert!(communities.contains("packages/app, packages/core"));
+    }
+
+    #[test]
+    fn graph_communities_reports_none_found_without_any_package() {
+        let dir = sample_bundle();
+        assert_eq!(
+            graph_communities(dir.path()).unwrap(),
+            "No packages found (no Package concepts in the bundle)"
+        );
     }
 
     #[test]
