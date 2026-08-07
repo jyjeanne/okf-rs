@@ -45,11 +45,7 @@
 //! #     }
 //! # }
 //! # fn edge(concept: &mut Concept, kind: RelationKind, target: &str) {
-//! #     concept.relationships.push(Relationship {
-//! #         kind,
-//! #         target: target.to_string(),
-//! #         target_display: target.to_string(),
-//! #     });
+//! #     concept.relationships.push(Relationship::new(kind, target, target));
 //! # }
 //! use okf_graph::Graph;
 //!
@@ -565,11 +561,9 @@ mod tests {
     /// way — calling this once per concept per edge, including twice on
     /// the same concept for a self-call.
     fn add_edge(concept: &mut Concept, kind: RelationKind, target_id: &str) {
-        concept.relationships.push(Relationship {
-            kind,
-            target: target_id.to_string(),
-            target_display: target_id.to_string(),
-        });
+        concept
+            .relationships
+            .push(Relationship::new(kind, target_id, target_id));
     }
 
     #[test]

@@ -267,16 +267,16 @@ mod tests {
             ConceptKind::Function,
             Some("Decodes a JSON Web Token's claims."),
         );
-        a.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: b.id.clone(),
-            target_display: b.name.clone(),
-        });
-        b.relationships.push(Relationship {
-            kind: RelationKind::CalledBy,
-            target: a.id.clone(),
-            target_display: a.name.clone(),
-        });
+        a.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            b.id.clone(),
+            b.name.clone(),
+        ));
+        b.relationships.push(Relationship::new(
+            RelationKind::CalledBy,
+            a.id.clone(),
+            a.name.clone(),
+        ));
 
         let suggestions = suggest_missing_links(&client, &[a, b], 5).unwrap();
         assert!(suggestions.is_empty());

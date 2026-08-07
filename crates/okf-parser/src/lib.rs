@@ -238,6 +238,53 @@ impl RelationKind {
     }
 }
 
+/// How confidently a relationship's target was determined — lets a
+/// consumer (an AI agent, a CI check) prioritize or filter edges by how
+/// much to trust them, instead of treating every edge as equally certain.
+///
+/// Only two variants are populated by anything in this workspace today:
+/// [`Confidence::Exact`] (Tree-sitter's unambiguous, project-wide name
+/// match — deterministic, syntax-only) and [`Confidence::Semantic`]
+/// (`--lsp`: a real language server confirmed which definition an
+/// ambiguous call site resolves to). The roadmap's other two named
+/// values, `inferred` (an AI-suggested edge, not yet written back into a
+/// bundle — see `okf_enrich::suggest_missing_links`) and `unresolved`
+/// (a call site that couldn't be resolved to *any* target isn't
+/// represented as an edge at all today, so there's nothing for a
+/// `Relationship` — which by definition already has a target — to carry
+/// that confidence on) aren't modeled yet: adding an enum variant nothing
+/// produces would be exactly the kind of unpopulated field this project
+/// avoids elsewhere (see `okf-enrich`'s own documented scope limits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    Exact,
+    Semantic,
+}
+
+impl Confidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Confidence::Exact => "exact",
+            Confidence::Semantic => "semantic",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "exact" => Some(Confidence::Exact),
+            "semantic" => Some(Confidence::Semantic),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Confidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A directed edge from the owning concept to `target`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relationship {
@@ -246,6 +293,34 @@ pub struct Relationship {
     pub target: String,
     /// Human-readable label for the target, used when rendering links.
     pub target_display: String,
+    /// What produced this edge: `tree-sitter`, or the binary name of the
+    /// language server that resolved it (`rust-analyzer`,
+    /// `pyright-langserver`, ...). Always populated — every relationship
+    /// has *some* resolver, even the plain structural ones.
+    pub resolved_by: String,
+    pub confidence: Confidence,
+}
+
+impl Relationship {
+    /// The common case: an edge produced directly by Tree-sitter's
+    /// structural/syntax extraction, with no ambiguity to resolve —
+    /// `tree-sitter`/[`Confidence::Exact`]. Every relationship kind besides
+    /// `okf-analyzer`'s own LSP-backed ambiguous-call resolution goes
+    /// through this constructor; that one path builds a `Relationship`
+    /// with a real resolver name and [`Confidence::Semantic`] directly.
+    pub fn new(
+        kind: RelationKind,
+        target: impl Into<String>,
+        target_display: impl Into<String>,
+    ) -> Self {
+        Relationship {
+            kind,
+            target: target.into(),
+            target_display: target_display.into(),
+            resolved_by: "tree-sitter".to_string(),
+            confidence: Confidence::Exact,
+        }
+    }
 }
 
 /// The location of a concept in the source tree.
@@ -398,5 +473,39 @@ impl Concept {
                 concepts[idx].id = format!("{}-{}", concepts[idx].id, count);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod relationship_tests {
+    use super::*;
+
+    #[test]
+    fn confidence_as_str_and_parse_round_trip() {
+        for c in [Confidence::Exact, Confidence::Semantic] {
+            assert_eq!(Confidence::parse(c.as_str()), Some(c));
+        }
+    }
+
+    #[test]
+    fn confidence_parse_rejects_an_unrecognized_value() {
+        assert_eq!(Confidence::parse("inferred"), None);
+        assert_eq!(Confidence::parse(""), None);
+    }
+
+    #[test]
+    fn confidence_display_matches_as_str() {
+        assert_eq!(Confidence::Exact.to_string(), "exact");
+        assert_eq!(Confidence::Semantic.to_string(), "semantic");
+    }
+
+    #[test]
+    fn relationship_new_defaults_to_tree_sitter_exact() {
+        let rel = Relationship::new(RelationKind::Calls, "functions/b", "b");
+        assert_eq!(rel.kind, RelationKind::Calls);
+        assert_eq!(rel.target, "functions/b");
+        assert_eq!(rel.target_display, "b");
+        assert_eq!(rel.resolved_by, "tree-sitter");
+        assert_eq!(rel.confidence, Confidence::Exact);
     }
 }

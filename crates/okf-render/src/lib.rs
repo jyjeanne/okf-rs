@@ -169,11 +169,11 @@ mod tests {
     fn package_contains_is_every_module_with_a_matching_member_of() {
         let package = concept(ConceptKind::Package, "demo", "demo", "Cargo.toml");
         let mut module = concept(ConceptKind::Module, "lib", "lib", "src/lib.rs");
-        module.relationships.push(Relationship {
-            kind: RelationKind::MemberOf,
-            target: package.id.clone(),
-            target_display: "demo".to_string(),
-        });
+        module.relationships.push(Relationship::new(
+            RelationKind::MemberOf,
+            package.id.clone(),
+            "demo",
+        ));
         let all = vec![package.clone(), module.clone()];
 
         let members = contains_members(&package, &all);

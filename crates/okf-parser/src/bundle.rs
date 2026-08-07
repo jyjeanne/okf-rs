@@ -3,7 +3,7 @@
 //! relationship-rich concept model (like `okf-graph`) work directly off a
 //! bundle on disk instead of re-analyzing the project from source.
 
-use crate::{Concept, Location, RelationKind, Relationship};
+use crate::{Concept, Confidence, Location, RelationKind, Relationship};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
@@ -147,16 +147,19 @@ fn parse_concept(id: String, content: &str) -> Option<Concept> {
                 let Some(kind) = key.as_str().and_then(RelationKind::from_frontmatter_key) else {
                     continue;
                 };
-                for target in targets.as_sequence().into_iter().flatten() {
-                    let Some(target) = target.as_str() else {
+                for entry in targets.as_sequence().into_iter().flatten() {
+                    let Some((target, resolved_by, confidence)) = parse_relationship_entry(entry)
+                    else {
                         continue;
                     };
                     rels.push(Relationship {
                         kind,
-                        target: target.to_string(),
                         // Patched below, once every concept in the bundle
                         // has been loaded and can be looked up by id.
-                        target_display: target.to_string(),
+                        target_display: target.clone(),
+                        target,
+                        resolved_by,
+                        confidence,
                     });
                 }
             }
@@ -185,6 +188,39 @@ fn parse_concept(id: String, content: &str) -> Option<Concept> {
         generated_at,
         relationships,
     })
+}
+
+/// Parses one entry of a `relationships.<kind>` sequence, accepting both
+/// shapes `okf-generator` has ever written: a bare target-id string (every
+/// bundle generated before edge provenance/confidence existed, or a
+/// hand-edited entry someone kept simple), and the current
+/// `{target, resolved_by, confidence}` mapping. Backward-compatible on
+/// purpose — an old bundle doesn't need regenerating just to stay
+/// readable by a newer `okf-rs`, and a missing/unrecognized
+/// `resolved_by`/`confidence` on an otherwise-valid mapping falls back to
+/// the same "produced by Tree-sitter, exact" default a bare string gets,
+/// rather than failing to parse the entry at all.
+fn parse_relationship_entry(entry: &serde_yaml::Value) -> Option<(String, String, Confidence)> {
+    if let Some(target) = entry.as_str() {
+        return Some((
+            target.to_string(),
+            "tree-sitter".to_string(),
+            Confidence::Exact,
+        ));
+    }
+    let mapping = entry.as_mapping()?;
+    let target = mapping.get("target")?.as_str()?.to_string();
+    let resolved_by = mapping
+        .get("resolved_by")
+        .and_then(|v| v.as_str())
+        .unwrap_or("tree-sitter")
+        .to_string();
+    let confidence = mapping
+        .get("confidence")
+        .and_then(|v| v.as_str())
+        .and_then(Confidence::parse)
+        .unwrap_or(Confidence::Exact);
+    Some((target, resolved_by, confidence))
 }
 
 fn parse_signature(body: &str) -> Option<String> {
@@ -242,11 +278,67 @@ mod tests {
         assert_eq!(verify.relationships[0].kind, RelationKind::Calls);
         assert_eq!(verify.relationships[0].target, "functions/auth/decode_jwt");
         assert_eq!(verify.relationships[0].target_display, "decode_jwt");
+        // A bare target-id string (the format every bundle used before
+        // provenance/confidence existed) falls back to the same
+        // "produced by Tree-sitter, exact" default a fresh `okf-rs
+        // generate` gives an ordinary edge.
+        assert_eq!(verify.relationships[0].resolved_by, "tree-sitter");
+        assert_eq!(verify.relationships[0].confidence, Confidence::Exact);
 
         let decode = &concepts[0];
         assert!(!decode.is_public);
         assert_eq!(decode.relationships[0].kind, RelationKind::CalledBy);
         assert_eq!(decode.relationships[0].target_display, "verify_token");
+    }
+
+    #[test]
+    fn reads_the_object_shaped_relationship_entry_with_real_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - target: functions/b\n      resolved_by: rust-analyzer\n      confidence: semantic\n---\n\nbody\n",
+        );
+
+        let concepts = read_bundle(dir.path()).unwrap();
+        assert_eq!(concepts.len(), 1);
+        assert_eq!(concepts[0].relationships[0].target, "functions/b");
+        assert_eq!(concepts[0].relationships[0].resolved_by, "rust-analyzer");
+        assert_eq!(
+            concepts[0].relationships[0].confidence,
+            Confidence::Semantic
+        );
+    }
+
+    #[test]
+    fn an_object_shaped_entry_missing_or_invalid_provenance_falls_back_to_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - target: functions/b\n      confidence: not-a-real-value\n---\n\nbody\n",
+        );
+
+        let concepts = read_bundle(dir.path()).unwrap();
+        // Neither `resolved_by` (absent) nor `confidence` (present but
+        // unrecognized) should fail parsing the entry entirely -- both
+        // fall back to the same default a bare string gets.
+        assert_eq!(concepts[0].relationships[0].target, "functions/b");
+        assert_eq!(concepts[0].relationships[0].resolved_by, "tree-sitter");
+        assert_eq!(concepts[0].relationships[0].confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn an_object_shaped_entry_with_no_target_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - resolved_by: tree-sitter\n      confidence: exact\n---\n\nbody\n",
+        );
+
+        let concepts = read_bundle(dir.path()).unwrap();
+        assert!(concepts[0].relationships.is_empty());
     }
 
     #[test]

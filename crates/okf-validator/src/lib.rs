@@ -110,6 +110,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> Result<ValidationReport> {
     check_duplicate_resources(&files, &mut report);
     check_relationship_targets(&files, &known_paths, &mut report);
     check_relationship_symmetry(&files, &known_paths, &mut report);
+    check_relationship_provenance(&files, &mut report);
     let links = check_links_and_collect(&files, &known_paths, &mut report);
     check_reachability(&files, &links, &mut report);
 
@@ -653,6 +654,19 @@ fn check_duplicate_resources(files: &[ScannedFile], report: &mut ValidationRepor
     }
 }
 
+/// Extracts a `relationships.<kind>` sequence entry's target id, whether
+/// it's a bare string (any bundle written before edge provenance/
+/// confidence existed) or `okf-generator`'s current
+/// `{target, resolved_by, confidence}` mapping — mirrors
+/// `okf_parser::bundle::parse_relationship_entry`'s own leniency, since
+/// this validator re-parses the raw frontmatter YAML independently rather
+/// than going through `read_bundle`.
+fn relationship_target(value: &serde_yaml::Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.as_mapping()?.get("target")?.as_str())
+}
+
 /// A `relationships` target under the `external/` prefix names something
 /// outside the bundle by convention (e.g. a third-party import — see
 /// `okf-generator`'s external-target handling) and is never expected to
@@ -696,7 +710,7 @@ fn check_relationship_targets(
                 continue;
             };
             for target in targets {
-                let Some(target) = target.as_str() else {
+                let Some(target) = relationship_target(target) else {
                     continue;
                 };
                 if is_external_target(target) {
@@ -709,6 +723,79 @@ fn check_relationship_targets(
                         file: file.relative.clone(),
                         message: format!(
                             "`relationships.{kind}` references `{target}`, which doesn't exist in the bundle"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Validates a `relationships` entry's provenance/confidence metadata,
+/// where present — the "provenance-metadata validation" the CI-validation
+/// roadmap item names, now that edge provenance/confidence actually
+/// exists to validate. A bare-string entry (no metadata at all — any
+/// bundle written before this field existed) is always valid; nothing
+/// here requires the new shape. Only checks a *populated but wrong*
+/// `confidence` (not one of `exact`/`semantic`) or an explicitly *empty*
+/// `resolved_by` — a missing field either way already has a sensible
+/// default applied on read (`okf_parser::bundle::parse_relationship_entry`),
+/// so there's nothing to flag about absence, only about a present value
+/// that can't mean anything.
+fn check_relationship_provenance(files: &[ScannedFile], report: &mut ValidationReport) {
+    for file in files {
+        if is_index(&file.relative) {
+            continue;
+        }
+        let Some((yaml, _)) = split_frontmatter(&file.content) else {
+            continue;
+        };
+        let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+            continue;
+        };
+        let Some(mapping) = value.as_mapping() else {
+            continue;
+        };
+        let Some(relationships) = mapping.get("relationships").and_then(|v| v.as_mapping()) else {
+            continue;
+        };
+
+        for (kind, targets) in relationships {
+            let kind = kind.as_str().unwrap_or("relationships");
+            let Some(targets) = targets.as_sequence() else {
+                continue;
+            };
+            for entry in targets {
+                let Some(entry_map) = entry.as_mapping() else {
+                    continue;
+                };
+                let target = entry_map
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unknown target>");
+                if let Some(confidence) = entry_map.get("confidence").and_then(|v| v.as_str()) {
+                    // Deliberately a local literal list, not
+                    // `okf_parser::Confidence`: this validator re-parses
+                    // raw frontmatter YAML independently of `okf-parser`
+                    // everywhere else (see `relationship_target`'s docs),
+                    // so a malformed bundle stays checkable even if it
+                    // wouldn't parse via `read_bundle` at all.
+                    if !matches!(confidence, "exact" | "semantic") {
+                        report.issues.push(ValidationIssue {
+                            severity: Severity::Error,
+                            file: file.relative.clone(),
+                            message: format!(
+                                "`relationships.{kind}` entry for `{target}` has an unrecognized `confidence: {confidence}` (expected `exact` or `semantic`)"
+                            ),
+                        });
+                    }
+                }
+                if entry_map.get("resolved_by").and_then(|v| v.as_str()) == Some("") {
+                    report.issues.push(ValidationIssue {
+                        severity: Severity::Error,
+                        file: file.relative.clone(),
+                        message: format!(
+                            "`relationships.{kind}` entry for `{target}` has an empty `resolved_by`"
                         ),
                     });
                 }
@@ -759,10 +846,12 @@ fn check_relationship_symmetry(
 
         for (bucket, key) in [(&mut calls_of, "calls"), (&mut called_by_of, "called_by")] {
             if let Some(targets) = relationships.get(key).and_then(|v| v.as_sequence()) {
-                bucket
-                    .entry(id.to_string())
-                    .or_default()
-                    .extend(targets.iter().filter_map(|t| t.as_str()).map(String::from));
+                bucket.entry(id.to_string()).or_default().extend(
+                    targets
+                        .iter()
+                        .filter_map(relationship_target)
+                        .map(String::from),
+                );
             }
         }
     }
@@ -1173,6 +1262,98 @@ mod tests {
         assert!(
             !report.has_errors(),
             "an external:// relationship target should not be flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn accepts_the_object_shaped_relationship_entry_with_valid_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/callee.md",
+            "---\ntype: Rust Function\ntitle: callee\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L5\nrelationships:\n  calls:\n    - target: functions/callee\n      resolved_by: rust-analyzer\n      confidence: semantic\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "a valid object-shaped relationship entry should not be flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn flags_an_unrecognized_confidence_value() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/callee.md",
+            "---\ntype: Rust Function\ntitle: callee\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L5\nrelationships:\n  calls:\n    - target: functions/callee\n      confidence: probably\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.has_errors());
+        assert!(report.issues.iter().any(|i| {
+            i.message.contains("unrecognized `confidence: probably`")
+                && i.message.contains("functions/callee")
+        }));
+    }
+
+    #[test]
+    fn flags_an_empty_resolved_by() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/callee.md",
+            "---\ntype: Rust Function\ntitle: callee\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L5\nrelationships:\n  calls:\n    - target: functions/callee\n      resolved_by: \"\"\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.has_errors());
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.message.contains("empty `resolved_by`")));
+    }
+
+    #[test]
+    fn a_bare_string_relationship_entry_has_no_provenance_to_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/callee.md",
+            "---\ntype: Rust Function\ntitle: callee\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L5\nrelationships:\n  calls:\n    - functions/callee\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "a bare-string relationship entry (pre-provenance bundle format) should stay valid: {:?}",
             report.issues
         );
     }

@@ -370,11 +370,11 @@ mod tests {
             "auth.decode_jwt",
             "src/auth.rs",
         );
-        caller.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: callee.id.clone(),
-            target_display: "decode_jwt".to_string(),
-        });
+        caller.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            callee.id.clone(),
+            "decode_jwt",
+        ));
 
         let concepts = vec![module, caller, callee];
         generate_html(&concepts, dir.path()).unwrap();
@@ -417,11 +417,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let package = concept(ConceptKind::Package, "demo", "demo", "Cargo.toml");
         let mut module = concept(ConceptKind::Module, "lib", "lib", "src/lib.rs");
-        module.relationships.push(Relationship {
-            kind: RelationKind::MemberOf,
-            target: package.id.clone(),
-            target_display: "demo".to_string(),
-        });
+        module.relationships.push(Relationship::new(
+            RelationKind::MemberOf,
+            package.id.clone(),
+            "demo",
+        ));
 
         generate_html(&[package.clone(), module.clone()], dir.path()).unwrap();
 
@@ -459,11 +459,9 @@ mod tests {
     #[test]
     fn markdown_lists_relationships_by_display_name() {
         let mut caller = concept(ConceptKind::Function, "a", "a", "src/lib.rs");
-        caller.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: "functions/b".to_string(),
-            target_display: "b".to_string(),
-        });
+        caller
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/b", "b"));
 
         let markdown = generate_markdown(&[caller]);
         assert!(markdown.contains("**Calls:** b"));

@@ -126,6 +126,16 @@ generated:
 
 Just a markdown file. Open it in any editor, render it on GitHub, or point an AI coding agent at the `knowledge/` directory and let it follow the links.
 
+Alongside the human-readable `# Calls` section above, the frontmatter also carries a machine-readable `relationships` field — each target with `resolved_by` (`tree-sitter`, or the language server that resolved it with `--lsp`, e.g. `rust-analyzer`) and `confidence` (`exact`/`semantic`), so a reviewer or a tool can tell how an edge was produced without leaving the file:
+
+```yaml
+relationships:
+  calls:
+  - target: functions/src/Auth/decode_jwt
+    resolved_by: tree-sitter
+    confidence: exact
+```
+
 ## Tutorial: adding okf-rs to an existing codebase
 
 The quick start above uses a toy example. This walks through adopting `okf-rs` in a real, already-existing project — install once, then wire it into how you and your AI coding agent actually work day to day.

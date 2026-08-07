@@ -150,11 +150,11 @@ mod tests {
             "decode_jwt",
             "src/auth.rs",
         );
-        caller.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: callee.id.clone(),
-            target_display: "decode_jwt".to_string(),
-        });
+        caller.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            callee.id.clone(),
+            "decode_jwt",
+        ));
 
         let concepts = vec![caller.clone(), callee.clone()];
         generate_obsidian(&concepts, dir.path()).unwrap();
@@ -174,11 +174,11 @@ mod tests {
     fn a_relationship_target_outside_the_bundle_is_plain_text_not_a_dangling_link() {
         let dir = tempfile::tempdir().unwrap();
         let mut concept = concept(ConceptKind::Function, "f", "f", "src/lib.rs");
-        concept.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: "external/std::io::Read::read".to_string(),
-            target_display: "Read::read".to_string(),
-        });
+        concept.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "external/std::io::Read::read",
+            "Read::read",
+        ));
 
         generate_obsidian(&[concept.clone()], dir.path()).unwrap();
         let note = fs::read_to_string(dir.path().join(format!("{}.md", concept.id))).unwrap();
