@@ -12,6 +12,16 @@ Based on public information about both projects as of July 2026 (READMEs, docume
 surfaces, published benchmarks); figures from each project's own marketing are treated as
 directional, not independently verified.
 
+**Update, August 2026:** the "15 granular tools stay" framing below (§2, §3, and the GO/no-go
+table) was the reasoning at the time this document was written. Further external review argued
+the granular `graph_*` surface was itself a cost worth fixing, not just working around with an
+additive composite tool — see the "Optimize the MCP API" item in
+[`ROADMAP.md`](../ROADMAP.md#improvement-plan--ai-native-platform-maturity-community-feedback),
+now shipped: the 13 `graph_*` tools collapsed into one `graph(relation=...)` tool, taking
+`okf-mcp`'s registered tool count from 18 down to 6. The composite `okf_explore` item below (§4,
+delivered as `explore`) is unaffected and still addresses the separate "single concept, several
+facts" case this doesn't.
+
 ## 1. What the two projects are
 
 ### CodeGraph

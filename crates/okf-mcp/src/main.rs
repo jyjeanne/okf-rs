@@ -182,16 +182,56 @@ mod tests {
         assert!(names.contains(&"search"));
         assert!(names.contains(&"explore"));
         assert!(names.contains(&"coverage"));
-        assert!(names.contains(&"graph_callers"));
-        assert!(names.contains(&"graph_callees"));
-        assert!(names.contains(&"graph_api"));
-        assert!(names.contains(&"graph_cycles"));
-        assert!(names.contains(&"graph_modules"));
-        assert!(names.contains(&"graph_isolated"));
-        assert!(names.contains(&"graph_stats"));
-        assert!(names.contains(&"graph_path"));
-        assert!(names.contains(&"graph_communities"));
+        assert!(names.contains(&"graph"));
         assert!(names.contains(&"search_semantic"));
+        // The consolidated `graph` tool replaces what used to be one
+        // MCP tool per relation (graph_callers, graph_api, ...) -- assert
+        // those names are gone, not just that `graph` is present, so a
+        // regression that reintroduces the old sprawl is caught here.
+        assert!(!names.contains(&"graph_callers"));
+        assert!(!names.contains(&"graph_api"));
+    }
+
+    #[test]
+    fn graph_tool_schema_lists_every_relation_and_requires_relation_only() {
+        let response = handle_message(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            std::path::Path::new("knowledge"),
+        )
+        .unwrap();
+        let graph_tool = response["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "graph")
+            .unwrap();
+        let relations: Vec<&str> = graph_tool["inputSchema"]["properties"]["relation"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for expected in [
+            "callers",
+            "callees",
+            "path",
+            "api",
+            "cycles",
+            "modules",
+            "isolated",
+            "stats",
+            "layers",
+            "domains",
+            "communities",
+            "patterns",
+            "features",
+        ] {
+            assert!(
+                relations.contains(&expected),
+                "missing relation `{expected}`"
+            );
+        }
+        assert_eq!(graph_tool["inputSchema"]["required"], json!(["relation"]));
     }
 
     #[test]
@@ -227,7 +267,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
-                "params": { "name": "graph_api", "arguments": {} },
+                "params": { "name": "graph", "arguments": { "relation": "api" } },
             }),
             std::path::Path::new("/nonexistent/knowledge-bundle"),
         )
