@@ -168,11 +168,11 @@ mod tests {
             "auth.decode_jwt",
             "src/auth.rs",
         );
-        caller.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: callee.id.clone(),
-            target_display: "decode_jwt".to_string(),
-        });
+        caller.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            callee.id.clone(),
+            "decode_jwt",
+        ));
         caller.description = Some("Verifies a signed token.".to_string());
         caller.tags = vec!["auth".to_string()];
 

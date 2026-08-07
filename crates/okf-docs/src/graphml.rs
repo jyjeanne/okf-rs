@@ -108,11 +108,9 @@ mod tests {
     fn renders_a_well_formed_document_with_nodes_and_edges() {
         let mut caller = concept("functions/a", ConceptKind::Function, true);
         let callee = concept("functions/b", ConceptKind::Function, false);
-        caller.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: "functions/b".to_string(),
-            target_display: "b".to_string(),
-        });
+        caller
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/b", "b"));
 
         let xml = generate_graphml(&[caller, callee]);
 
@@ -129,16 +127,14 @@ mod tests {
     fn called_by_edges_are_omitted_to_avoid_doubling_call_edges() {
         let mut caller = concept("functions/a", ConceptKind::Function, true);
         let mut callee = concept("functions/b", ConceptKind::Function, true);
-        caller.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: "functions/b".to_string(),
-            target_display: "b".to_string(),
-        });
-        callee.relationships.push(Relationship {
-            kind: RelationKind::CalledBy,
-            target: "functions/a".to_string(),
-            target_display: "a".to_string(),
-        });
+        caller
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/b", "b"));
+        callee.relationships.push(Relationship::new(
+            RelationKind::CalledBy,
+            "functions/a",
+            "a",
+        ));
 
         let xml = generate_graphml(&[caller, callee]);
         assert_eq!(xml.matches("<edge ").count(), 1, "{xml}");
@@ -147,11 +143,11 @@ mod tests {
     #[test]
     fn a_relationship_target_outside_the_bundle_produces_no_dangling_edge() {
         let mut caller = concept("functions/a", ConceptKind::Function, true);
-        caller.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: "external/std::io::Read::read".to_string(),
-            target_display: "Read::read".to_string(),
-        });
+        caller.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "external/std::io::Read::read",
+            "Read::read",
+        ));
 
         let xml = generate_graphml(&[caller]);
         assert_eq!(xml.matches("<edge ").count(), 0, "{xml}");

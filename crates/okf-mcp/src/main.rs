@@ -9,14 +9,24 @@
 //! only, since a stray `println!` would corrupt the stream for whatever
 //! is reading it.
 //!
-//! The server is bound to a single project at startup (its argv[1], or
-//! the current directory), the same way `okf-rs search`/`validate`/
-//! `graph` resolve a bundle: an explicit bundle path wins, otherwise
-//! `okf.toml`'s `output` under the project root, otherwise `knowledge`.
-//! Each tool call re-reads the bundle fresh (via `okf_parser::read_bundle`
-//! or `okf_search::SearchIndex::build`), so it always reflects the latest
-//! `okf-rs generate` run without needing a restart.
+//! The server is bound to a single project at startup (its first non-flag
+//! argument, or the current directory), the same way `okf-rs search`/
+//! `validate`/`graph` resolve a bundle: an explicit bundle path wins,
+//! otherwise `okf.toml`'s `output` under the project root, otherwise
+//! `knowledge`. Concept-consuming tool calls go through a per-process
+//! [`cache::BundleCache`] rather than re-parsing the bundle from scratch
+//! every time — see that module's docs for the freshness guarantee this
+//! still makes: a `generate` run between two calls is always picked up,
+//! without needing a restart, the same as before the cache existed.
+//! `search`/`search_ranked` build their own index straight from the
+//! bundle path and aren't cached.
+//!
+//! `--benchmark` skips the stdio JSON-RPC loop entirely and instead
+//! prints a one-shot local session-level cost report to stdout, then
+//! exits — see [`benchmark`] for what it measures and why.
 
+mod benchmark;
+mod cache;
 mod tools;
 
 use anyhow::Result;
@@ -26,15 +36,33 @@ use std::path::PathBuf;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Up to how many sampled concepts `--benchmark` reports on — enough to
+/// average over more than one data point without making a diagnostic
+/// command slow on a large bundle (each sample re-walks the whole project
+/// source tree once, per concept, to compute its naive grep-and-read
+/// cost).
+const BENCHMARK_SAMPLE_SIZE: usize = 5;
+
 fn main() -> Result<()> {
-    let project_root = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let benchmark_mode = args.iter().any(|a| a == "--benchmark");
+    let project_root = args
+        .into_iter()
+        .find(|a| a != "--benchmark")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let project_root = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.clone());
+
+    if benchmark_mode {
+        let report = benchmark::run(&project_root, BENCHMARK_SAMPLE_SIZE)?;
+        print!("{}", report.render());
+        return Ok(());
+    }
+
     let bundle = okf_core::config::resolve_bundle(&project_root, None);
+    let cache = cache::BundleCache::new();
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -58,7 +86,7 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-        if let Some(response) = handle_message(&request, &bundle) {
+        if let Some(response) = handle_message(&request, &bundle, &cache) {
             writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
             stdout.flush()?;
         }
@@ -67,8 +95,14 @@ fn main() -> Result<()> {
 }
 
 /// Dispatches one JSON-RPC message, returning the response to write (or
-/// `None` for notifications, which never get one).
-fn handle_message(request: &Value, bundle: &std::path::Path) -> Option<Value> {
+/// `None` for notifications, which never get one). `cache` amortizes
+/// bundle parsing across calls within this one server process — see the
+/// `cache` module for the freshness guarantee it makes.
+fn handle_message(
+    request: &Value,
+    bundle: &std::path::Path,
+    cache: &cache::BundleCache,
+) -> Option<Value> {
     let method = request.get("method")?.as_str()?;
     let id = request.get("id").cloned();
 
@@ -87,7 +121,7 @@ fn handle_message(request: &Value, bundle: &std::path::Path) -> Option<Value> {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match tools::call(name, &arguments, bundle) {
+            match tools::call(name, &arguments, bundle, cache) {
                 Ok(text) => Ok(json!({
                     "content": [{ "type": "text", "text": text }],
                     "isError": false,
@@ -135,6 +169,7 @@ mod tests {
         let response = handle_message(
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
             std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
         )
         .unwrap();
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
@@ -146,6 +181,7 @@ mod tests {
         let response = handle_message(
             &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
             std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
         );
         assert!(response.is_none());
     }
@@ -155,6 +191,7 @@ mod tests {
         let response = handle_message(
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "bogus" }),
             std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
         )
         .unwrap();
         assert_eq!(response["error"]["code"], -32601);
@@ -162,6 +199,7 @@ mod tests {
         let response = handle_message(
             &json!({ "jsonrpc": "2.0", "method": "notifications/bogus" }),
             std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
         );
         assert!(response.is_none());
     }
@@ -171,6 +209,7 @@ mod tests {
         let response = handle_message(
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
             std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
         )
         .unwrap();
         let names: Vec<&str> = response["result"]["tools"]
@@ -182,16 +221,58 @@ mod tests {
         assert!(names.contains(&"search"));
         assert!(names.contains(&"explore"));
         assert!(names.contains(&"coverage"));
-        assert!(names.contains(&"graph_callers"));
-        assert!(names.contains(&"graph_callees"));
-        assert!(names.contains(&"graph_api"));
-        assert!(names.contains(&"graph_cycles"));
-        assert!(names.contains(&"graph_modules"));
-        assert!(names.contains(&"graph_isolated"));
-        assert!(names.contains(&"graph_stats"));
-        assert!(names.contains(&"graph_path"));
-        assert!(names.contains(&"graph_communities"));
+        assert!(names.contains(&"graph"));
         assert!(names.contains(&"search_semantic"));
+        // The consolidated `graph` tool replaces what used to be one
+        // MCP tool per relation (graph_callers, graph_api, ...) -- assert
+        // those names are gone, not just that `graph` is present, so a
+        // regression that reintroduces the old sprawl is caught here.
+        assert!(!names.contains(&"graph_callers"));
+        assert!(!names.contains(&"graph_api"));
+    }
+
+    #[test]
+    fn graph_tool_schema_lists_every_relation_and_requires_relation_only() {
+        let response = handle_message(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
+        )
+        .unwrap();
+        let graph_tool = response["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "graph")
+            .unwrap();
+        let relations: Vec<&str> = graph_tool["inputSchema"]["properties"]["relation"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for expected in [
+            "callers",
+            "callees",
+            "path",
+            "explain",
+            "api",
+            "cycles",
+            "modules",
+            "isolated",
+            "stats",
+            "layers",
+            "domains",
+            "communities",
+            "patterns",
+            "features",
+        ] {
+            assert!(
+                relations.contains(&expected),
+                "missing relation `{expected}`"
+            );
+        }
+        assert_eq!(graph_tool["inputSchema"]["required"], json!(["relation"]));
     }
 
     #[test]
@@ -211,6 +292,7 @@ mod tests {
                 "params": { "name": "search", "arguments": { "query": "verify_token" } },
             }),
             dir.path(),
+            &cache::BundleCache::new(),
         )
         .unwrap();
 
@@ -227,9 +309,10 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
-                "params": { "name": "graph_api", "arguments": {} },
+                "params": { "name": "graph", "arguments": { "relation": "api" } },
             }),
             std::path::Path::new("/nonexistent/knowledge-bundle"),
+            &cache::BundleCache::new(),
         )
         .unwrap();
 

@@ -26,7 +26,9 @@ pub use cache::AnalysisCache;
 
 use anyhow::{Context, Result};
 use okf_core::{ManifestKind, Project};
-use okf_parser::{Concept, ConceptKind, Language, Location, RelationKind, Relationship};
+use okf_parser::{
+    Concept, ConceptKind, Confidence, Language, Location, RelationKind, Relationship,
+};
 use okf_tree_sitter::CallCandidate;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +53,22 @@ pub struct AnalysisResult {
 pub struct IncrementalStats {
     pub reused: usize,
     pub reparsed: usize,
+}
+
+/// A `Calls` edge resolved by either path — Tree-sitter's own unambiguous
+/// name match, or (with `--lsp`) a real language server confirming which
+/// definition an ambiguous call site resolves to — carrying enough
+/// provenance to build both directions' [`Relationship`]s from. Shared
+/// between the main resolution loop in this module and `lsp`, so an
+/// LSP-resolved edge's real resolver name and [`Confidence::Semantic`]
+/// survive all the way to the `Relationship`s pushed onto the two
+/// concepts involved, instead of being flattened into an undifferentiated
+/// `(caller, callee)` pair partway through.
+pub(crate) struct ResolvedEdge {
+    pub(crate) caller: String,
+    pub(crate) callee: String,
+    pub(crate) resolved_by: String,
+    pub(crate) confidence: Confidence,
 }
 
 /// Scans and analyzes `project`, producing the full concept + relationship
@@ -199,7 +217,7 @@ pub fn analyze_with_cache_lsp(
         }
     }
 
-    let mut resolved_edges: Vec<(String, String)> = Vec::new();
+    let mut resolved_edges: Vec<ResolvedEdge> = Vec::new();
     let mut ambiguous: Vec<&(CallCandidate, Language, String)> = Vec::new();
     for entry in &calls {
         let (call, _, _) = entry;
@@ -214,7 +232,12 @@ pub fn analyze_with_cache_lsp(
         }
         let callee_id = candidates[0].to_string();
         if callee_id != call.caller_id {
-            resolved_edges.push((call.caller_id.clone(), callee_id));
+            resolved_edges.push(ResolvedEdge {
+                caller: call.caller_id.clone(),
+                callee: callee_id,
+                resolved_by: "tree-sitter".to_string(),
+                confidence: Confidence::Exact,
+            });
         }
     }
 
@@ -239,9 +262,9 @@ pub fn analyze_with_cache_lsp(
         .map(|(i, c)| (c.id.clone(), i))
         .collect();
 
-    for (caller_id, callee_id) in resolved_edges {
+    for edge in resolved_edges {
         let (Some(&caller_idx), Some(&callee_idx)) =
-            (index_of.get(&caller_id), index_of.get(&callee_id))
+            (index_of.get(&edge.caller), index_of.get(&edge.callee))
         else {
             continue;
         };
@@ -250,13 +273,17 @@ pub fn analyze_with_cache_lsp(
 
         concepts[caller_idx].relationships.push(Relationship {
             kind: RelationKind::Calls,
-            target: callee_id.clone(),
+            target: edge.callee.clone(),
             target_display: callee_name,
+            resolved_by: edge.resolved_by.clone(),
+            confidence: edge.confidence,
         });
         concepts[callee_idx].relationships.push(Relationship {
             kind: RelationKind::CalledBy,
-            target: caller_id.clone(),
+            target: edge.caller.clone(),
             target_display: caller_name,
+            resolved_by: edge.resolved_by,
+            confidence: edge.confidence,
         });
     }
 
@@ -720,11 +747,11 @@ fn link_modules_to_packages(concepts: &mut [Concept]) {
             dir.is_empty() || file == dir || file.starts_with(&format!("{dir}/"))
         });
         if let Some((_, package_id, package_name)) = owner {
-            concept.relationships.push(Relationship {
-                kind: RelationKind::MemberOf,
-                target: package_id.clone(),
-                target_display: package_name.clone(),
-            });
+            concept.relationships.push(Relationship::new(
+                RelationKind::MemberOf,
+                package_id.clone(),
+                package_name.clone(),
+            ));
         }
     }
 }
@@ -771,20 +798,28 @@ mod tests {
             .iter()
             .find(|c| c.name == "verify_token")
             .unwrap();
-        assert!(verify
+        let calls_decode = verify
             .relationships
             .iter()
-            .any(|r| r.kind == RelationKind::Calls && r.target_display == "decode_jwt"));
+            .find(|r| r.kind == RelationKind::Calls && r.target_display == "decode_jwt")
+            .unwrap();
+        // Resolved by name-unambiguous Tree-sitter matching, not `--lsp`
+        // (never passed here) -- exact confidence, tree-sitter provenance.
+        assert_eq!(calls_decode.resolved_by, "tree-sitter");
+        assert_eq!(calls_decode.confidence, Confidence::Exact);
 
         let decode = result
             .concepts
             .iter()
             .find(|c| c.name == "decode_jwt")
             .unwrap();
-        assert!(decode
+        let called_by_verify = decode
             .relationships
             .iter()
-            .any(|r| r.kind == RelationKind::CalledBy && r.target_display == "verify_token"));
+            .find(|r| r.kind == RelationKind::CalledBy && r.target_display == "verify_token")
+            .unwrap();
+        assert_eq!(called_by_verify.resolved_by, "tree-sitter");
+        assert_eq!(called_by_verify.confidence, Confidence::Exact);
     }
 
     #[test]
@@ -917,6 +952,12 @@ mod tests {
             call.target, "functions/src/a/run",
             "should resolve specifically to a::run, not b::run"
         );
+        // LSP-resolved: real resolver name (not "tree-sitter"), semantic
+        // confidence, not exact -- confirms provenance survives all the
+        // way from `lsp::resolve_ambiguous_calls` to the `Relationship`
+        // actually attached to the concept, not just the default path.
+        assert_eq!(call.resolved_by, "rust-analyzer");
+        assert_eq!(call.confidence, Confidence::Semantic);
     }
 
     fn make_concept(id: &str, signature: &str) -> Concept {
@@ -983,28 +1024,20 @@ mod tests {
     #[test]
     fn diff_ignores_relationship_order() {
         let mut before = make_concept("functions/a", "fn a()");
-        before.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: "functions/x".to_string(),
-            target_display: "x".to_string(),
-        });
-        before.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: "functions/y".to_string(),
-            target_display: "y".to_string(),
-        });
+        before
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/x", "x"));
+        before
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/y", "y"));
 
         let mut after = make_concept("functions/a", "fn a()");
-        after.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: "functions/y".to_string(),
-            target_display: "y".to_string(),
-        });
-        after.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: "functions/x".to_string(),
-            target_display: "x".to_string(),
-        });
+        after
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/y", "y"));
+        after
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/x", "x"));
 
         let report = diff(&[before], &[after]);
         assert!(
@@ -1022,18 +1055,12 @@ mod tests {
         let mut c = make_concept(id, &format!("fn {id}()"));
         c.is_public = is_public;
         for target in calls {
-            c.relationships.push(Relationship {
-                kind: RelationKind::Calls,
-                target: target.to_string(),
-                target_display: target.to_string(),
-            });
+            c.relationships
+                .push(Relationship::new(RelationKind::Calls, *target, *target));
         }
         for source in called_by {
-            c.relationships.push(Relationship {
-                kind: RelationKind::CalledBy,
-                target: source.to_string(),
-                target_display: source.to_string(),
-            });
+            c.relationships
+                .push(Relationship::new(RelationKind::CalledBy, *source, *source));
         }
         c
     }
@@ -1084,11 +1111,11 @@ mod tests {
         public_fn.is_public = true;
         let private_fn = concept_with_edges("functions/private", &[], &[], false);
         let mut recursive = concept_with_edges("functions/recursive", &[], &[], true);
-        recursive.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: "functions/recursive".to_string(),
-            target_display: "recursive".to_string(),
-        });
+        recursive.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "functions/recursive",
+            "recursive",
+        ));
 
         let before: Vec<Concept> = Vec::new();
         let after = vec![public_fn, private_fn, recursive];

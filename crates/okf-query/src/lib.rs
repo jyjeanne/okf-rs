@@ -22,6 +22,23 @@
 //! `okf_graph::Graph`/`okf_search::SearchIndex`/`FullTextIndex` directly,
 //! which already return structured, borrowed data rather than text.
 //!
+//! # Caching
+//!
+//! Every concept-consuming function here (everything except `search`/
+//! `search_ranked`, which build their index straight from `bundle`) comes
+//! in two forms: a `bundle: &Path`-taking one that reads and parses the
+//! bundle fresh every call (via [`load_concepts`]), and a
+//! `*_from_concepts` sibling that runs the identical query against
+//! already-loaded `concepts` instead. `okf-cli` only ever needs the
+//! former — it's a fresh process per invocation, so there's nothing to
+//! amortize. A long-lived caller fielding many queries against the same
+//! bundle in one process (`okf-mcp`'s per-session cache, see its
+//! `cache` module) instead loads once, keeps the `Vec<Concept>` around
+//! for as long as the bundle on disk hasn't changed, and calls the
+//! `*_from_concepts` form — skipping the walk-and-parse cost on every
+//! query without ever risking stale results, since invalidation is the
+//! caller's responsibility and entirely outside this crate.
+//!
 //! # Example
 //!
 //! ```
@@ -174,14 +191,21 @@ fn id_list(ids: &[&Concept]) -> String {
 /// something, the same as `search --ranked`).
 pub fn explore(bundle: &Path, query: &str) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    explore_from_concepts(&concepts, query)
+}
+
+/// Same as [`explore`], but runs against `concepts` already loaded in
+/// memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn explore_from_concepts(concepts: &[Concept], query: &str) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
     // The common case -- an agent chaining `search`/a previous `explore`
     // call, which already has a concept id in hand -- never needs the
     // full-text index at all, so it's only built on the free-text
     // fallback path below, not unconditionally on every call.
     let concept = match graph.get(query) {
         Some(concept) => concept,
-        None => resolve_explore_target_by_search(&graph, &concepts, query)?,
+        None => resolve_explore_target_by_search(&graph, concepts, query)?,
     };
 
     let is_public_api = okf_graph::is_public_api(concept);
@@ -230,7 +254,14 @@ pub fn explore(bundle: &Path, query: &str) -> Result<String> {
 /// Concepts that directly call `id`.
 pub fn graph_callers(bundle: &Path, id: &str) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    graph_callers_from_concepts(&concepts, id)
+}
+
+/// Same as [`graph_callers`], but runs against `concepts` already loaded
+/// in memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn graph_callers_from_concepts(concepts: &[Concept], id: &str) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
     require_concept(&graph, id)?;
     let callers = graph.callers(id);
     if callers.is_empty() {
@@ -242,7 +273,14 @@ pub fn graph_callers(bundle: &Path, id: &str) -> Result<String> {
 /// Concepts `id` directly calls.
 pub fn graph_callees(bundle: &Path, id: &str) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    graph_callees_from_concepts(&concepts, id)
+}
+
+/// Same as [`graph_callees`], but runs against `concepts` already loaded
+/// in memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn graph_callees_from_concepts(concepts: &[Concept], id: &str) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
     require_concept(&graph, id)?;
     let callees = graph.callees(id);
     if callees.is_empty() {
@@ -256,7 +294,14 @@ pub fn graph_callees(bundle: &Path, id: &str) -> Result<String> {
 /// The project's public API surface (public functions/methods/types).
 pub fn graph_api(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    graph_api_from_concepts(&concepts)
+}
+
+/// Same as [`graph_api`], but runs against `concepts` already loaded in
+/// memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn graph_api_from_concepts(concepts: &[Concept]) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
     let api = graph.public_api();
     if api.is_empty() {
         return Ok("No public concepts found".to_string());
@@ -274,7 +319,14 @@ pub fn graph_api(bundle: &Path) -> Result<String> {
 /// Groups of concepts that call each other in a cycle.
 pub fn graph_cycles(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    graph_cycles_from_concepts(&concepts)
+}
+
+/// Same as [`graph_cycles`], but runs against `concepts` already loaded
+/// in memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn graph_cycles_from_concepts(concepts: &[Concept]) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
     let cycles = graph.cycles();
     if cycles.is_empty() {
         return Ok("No cycles found in the call graph".to_string());
@@ -290,7 +342,14 @@ pub fn graph_cycles(bundle: &Path) -> Result<String> {
 /// observed calling anything, and never observed being called).
 pub fn graph_isolated(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    graph_isolated_from_concepts(&concepts)
+}
+
+/// Same as [`graph_isolated`], but runs against `concepts` already loaded
+/// in memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn graph_isolated_from_concepts(concepts: &[Concept]) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
     let isolated = graph.isolated_concepts();
     if isolated.is_empty() {
         return Ok("No isolated concepts found".to_string());
@@ -378,9 +437,23 @@ pub fn coverage(bundle: &Path) -> Result<String> {
     Ok(coverage_report(bundle)?.to_string())
 }
 
+/// Same as [`coverage`], but runs against `concepts` already loaded in
+/// memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn coverage_from_concepts(concepts: &[Concept]) -> String {
+    coverage_report_from_concepts(concepts).to_string()
+}
+
 /// The data behind [`coverage`], as a [`CoverageReport`] instead of text.
 pub fn coverage_report(bundle: &Path) -> Result<CoverageReport> {
     let concepts = load_concepts(bundle)?;
+    Ok(coverage_report_from_concepts(&concepts))
+}
+
+/// Same as [`coverage_report`], but runs against `concepts` already
+/// loaded in memory instead of reading `bundle` fresh — see the
+/// crate-level `# Caching` note.
+pub fn coverage_report_from_concepts(concepts: &[Concept]) -> CoverageReport {
     let total_concepts = concepts.len();
     let with_description = concepts
         .iter()
@@ -392,7 +465,7 @@ pub fn coverage_report(bundle: &Path) -> Result<CoverageReport> {
         .count();
     let with_tags = concepts.iter().filter(|c| !c.tags.is_empty()).count();
 
-    let graph = okf_graph::Graph::build(&concepts);
+    let graph = okf_graph::Graph::build(concepts);
     let isolated: std::collections::HashSet<&str> = graph
         .isolated_concepts()
         .iter()
@@ -417,12 +490,12 @@ pub fn coverage_report(bundle: &Path) -> Result<CoverageReport> {
         })
     };
 
-    Ok(CoverageReport {
+    CoverageReport {
         total_concepts,
         with_description,
         with_tags,
         graph_participation,
-    })
+    }
 }
 
 fn percent(part: usize, total: usize) -> usize {
@@ -442,7 +515,19 @@ pub fn search_semantic(
     limit: usize,
 ) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let hits = okf_enrich::semantic_search(client, &concepts, query, limit)?;
+    search_semantic_from_concepts(&concepts, client, query, limit)
+}
+
+/// Same as [`search_semantic`], but runs against `concepts` already
+/// loaded in memory instead of reading `bundle` fresh — see the
+/// crate-level `# Caching` note.
+pub fn search_semantic_from_concepts(
+    concepts: &[Concept],
+    client: &okf_enrich::EnrichClient,
+    query: &str,
+    limit: usize,
+) -> Result<String> {
+    let hits = okf_enrich::semantic_search(client, concepts, query, limit)?;
     if hits.is_empty() {
         return Ok(format!(
             "No semantic matches for `{query}` (no concept in the bundle has a description to embed and compare against — run `generate --enrich` first, or add descriptions by hand)"
@@ -463,7 +548,14 @@ pub fn search_semantic(
 /// Cross-module call dependency edges: which modules call into which.
 pub fn graph_modules(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    graph_modules_from_concepts(&concepts)
+}
+
+/// Same as [`graph_modules`], but runs against `concepts` already loaded
+/// in memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn graph_modules_from_concepts(concepts: &[Concept]) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
     let deps = graph.module_dependencies();
     if deps.is_empty() {
         return Ok("No cross-module call dependencies found".to_string());
@@ -542,19 +634,33 @@ pub fn graph_stats(bundle: &Path) -> Result<String> {
     Ok(graph_stats_report(bundle)?.to_string())
 }
 
+/// Same as [`graph_stats`], but runs against `concepts` already loaded in
+/// memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn graph_stats_from_concepts(concepts: &[Concept]) -> String {
+    graph_stats_report_from_concepts(concepts).to_string()
+}
+
 /// The data behind [`graph_stats`], as a [`GraphStatsReport`] instead of
 /// text.
 pub fn graph_stats_report(bundle: &Path) -> Result<GraphStatsReport> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    Ok(graph_stats_report_from_concepts(&concepts))
+}
+
+/// Same as [`graph_stats_report`], but runs against `concepts` already
+/// loaded in memory instead of reading `bundle` fresh — see the
+/// crate-level `# Caching` note.
+pub fn graph_stats_report_from_concepts(concepts: &[Concept]) -> GraphStatsReport {
+    let graph = okf_graph::Graph::build(concepts);
 
     let mut by_kind: BTreeMap<ConceptKind, usize> = Default::default();
-    for c in &concepts {
+    for c in concepts {
         *by_kind.entry(c.kind).or_default() += 1;
     }
 
     let mut by_relation: BTreeMap<RelationKind, usize> = Default::default();
-    for c in &concepts {
+    for c in concepts {
         for rel in &c.relationships {
             *by_relation.entry(rel.kind).or_default() += 1;
         }
@@ -567,25 +673,111 @@ pub fn graph_stats_report(bundle: &Path) -> Result<GraphStatsReport> {
         .collect();
     let isolated_count = graph.isolated_concepts().len();
 
-    Ok(GraphStatsReport {
+    GraphStatsReport {
         total_concepts: concepts.len(),
         by_kind,
         by_relation,
         components,
         isolated_count,
-    })
+    }
 }
 
 /// The shortest call path between two concept ids.
 pub fn graph_path(bundle: &Path, from: &str, to: &str) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    graph_path_from_concepts(&concepts, from, to)
+}
+
+/// Same as [`graph_path`], but runs against `concepts` already loaded in
+/// memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn graph_path_from_concepts(concepts: &[Concept], from: &str, to: &str) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
     require_concept(&graph, from)?;
     require_concept(&graph, to)?;
     match graph.shortest_call_path(from, to) {
         Some(steps) => Ok(steps.join(" -> ")),
         None => Ok(format!("No call path found from `{from}` to `{to}`")),
     }
+}
+
+/// Explains *why* a relationship exists between two concepts: which kind
+/// it is, and a human-readable reason derived from its provenance (see
+/// [`okf_parser::Relationship::reason`]) — the "Explainability" roadmap
+/// item, built directly on the edge provenance/confidence it names as
+/// its foundation. Looks for a direct relationship first, checking both
+/// concepts' own relationship lists (a kind like `Calls`/`CalledBy` is
+/// only ever recorded on one side by the extractor that produced it, so
+/// `from`'s list alone isn't guaranteed to have it even when a real edge
+/// exists in the other direction). When there's no single direct edge,
+/// falls back to explaining the shortest call *path* between them, one
+/// hop at a time.
+pub fn explain(bundle: &Path, from: &str, to: &str) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    explain_from_concepts(&concepts, from, to)
+}
+
+/// Same as [`explain`], but runs against `concepts` already loaded in
+/// memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn explain_from_concepts(concepts: &[Concept], from: &str, to: &str) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
+    require_concept(&graph, from)?;
+    require_concept(&graph, to)?;
+
+    if let Some(text) = direct_relationship_explanation(&graph, from, to) {
+        return Ok(text);
+    }
+
+    match graph.shortest_call_path(from, to) {
+        Some(steps) if steps.len() >= 2 => Ok(steps
+            .windows(2)
+            .map(|pair| {
+                direct_relationship_explanation(&graph, pair[0], pair[1]).unwrap_or_else(|| {
+                    format!(
+                        "{}\n    |\n    v\n{}\n\nReason: part of the shortest call path, but no single direct relationship recorded between these two specifically.",
+                        pair[0], pair[1]
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")),
+        _ => Ok(format!(
+            "No direct relationship or call path found between `{from}` and `{to}`"
+        )),
+    }
+}
+
+/// Looks for a relationship directly connecting `a` and `b`, in either
+/// direction, and renders it as an explanation if found. Checks `a`'s
+/// own relationships for one targeting `b` first, then `b`'s for one
+/// targeting `a` — the actual direction of whichever edge is found (not
+/// necessarily `a -> b`) is what gets rendered, so e.g. a `CalledBy`
+/// edge only recorded on the callee's page still explains correctly.
+fn direct_relationship_explanation(
+    graph: &okf_graph::Graph<'_>,
+    a: &str,
+    b: &str,
+) -> Option<String> {
+    if let Some(concept) = graph.get(a) {
+        if let Some(rel) = concept.relationships.iter().find(|r| r.target == b) {
+            return Some(render_explanation(a, rel, b));
+        }
+    }
+    if let Some(concept) = graph.get(b) {
+        if let Some(rel) = concept.relationships.iter().find(|r| r.target == a) {
+            return Some(render_explanation(b, rel, a));
+        }
+    }
+    None
+}
+
+fn render_explanation(source: &str, rel: &okf_parser::Relationship, target: &str) -> String {
+    format!(
+        "{source}\n    |\n    {}\n    v\n{target}\n\nReason: {}",
+        rel.kind.label().to_lowercase(),
+        rel.reason()
+    )
 }
 
 /// Each package's position in the layered architecture derived from the
@@ -596,7 +788,14 @@ pub fn graph_path(bundle: &Path, from: &str, to: &str) -> Result<String> {
 /// function here to duplicate it.
 pub fn graph_layers(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    graph_layers_from_concepts(&concepts)
+}
+
+/// Same as [`graph_layers`], but runs against `concepts` already loaded
+/// in memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn graph_layers_from_concepts(concepts: &[Concept]) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
     let layers = okf_arch::layers(&graph);
     if layers.is_empty() {
         return Ok("No packages found to layer (no Package concepts in the bundle)".to_string());
@@ -613,7 +812,14 @@ pub fn graph_layers(bundle: &Path) -> Result<String> {
 /// dependency in or out is still its own singleton domain.
 pub fn graph_domains(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    graph_domains_from_concepts(&concepts)
+}
+
+/// Same as [`graph_domains`], but runs against `concepts` already loaded
+/// in memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn graph_domains_from_concepts(concepts: &[Concept]) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
     let domains = okf_arch::domains(&graph);
     if domains.is_empty() {
         return Ok("No packages found (no Package concepts in the bundle)".to_string());
@@ -634,7 +840,14 @@ pub fn graph_domains(bundle: &Path) -> Result<String> {
 /// how strongly each already collaborates within its own cluster.
 pub fn graph_communities(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let graph = okf_graph::Graph::build(&concepts);
+    graph_communities_from_concepts(&concepts)
+}
+
+/// Same as [`graph_communities`], but runs against `concepts` already
+/// loaded in memory instead of reading `bundle` fresh — see the
+/// crate-level `# Caching` note.
+pub fn graph_communities_from_concepts(concepts: &[Concept]) -> Result<String> {
+    let graph = okf_graph::Graph::build(concepts);
     let communities = okf_arch::communities(&graph);
     if communities.is_empty() {
         return Ok("No packages found (no Package concepts in the bundle)".to_string());
@@ -652,15 +865,22 @@ pub fn graph_communities(bundle: &Path) -> Result<String> {
 /// this does and doesn't claim to detect.
 pub fn graph_patterns(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let found = okf_arch::detect_patterns(&concepts);
+    Ok(graph_patterns_from_concepts(&concepts))
+}
+
+/// Same as [`graph_patterns`], but runs against `concepts` already
+/// loaded in memory instead of reading `bundle` fresh — see the
+/// crate-level `# Caching` note.
+pub fn graph_patterns_from_concepts(concepts: &[Concept]) -> String {
+    let found = okf_arch::detect_patterns(concepts);
     if found.is_empty() {
-        return Ok("No design patterns detected".to_string());
+        return "No design patterns detected".to_string();
     }
-    Ok(found
+    found
         .iter()
         .map(|p| format!("{:<10} {} — {}", p.kind.as_str(), p.concept_id, p.evidence))
         .collect::<Vec<_>>()
-        .join("\n"))
+        .join("\n")
 }
 
 /// REST endpoints, database models, and event-flow participants detected
@@ -669,17 +889,23 @@ pub fn graph_patterns(bundle: &Path) -> Result<String> {
 /// detect.
 pub fn graph_features(bundle: &Path) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let found = okf_arch::detect_features(&concepts);
+    Ok(graph_features_from_concepts(&concepts))
+}
+
+/// Same as [`graph_features`], but runs against `concepts` already
+/// loaded in memory instead of reading `bundle` fresh — see the
+/// crate-level `# Caching` note.
+pub fn graph_features_from_concepts(concepts: &[Concept]) -> String {
+    let found = okf_arch::detect_features(concepts);
     if found.is_empty() {
-        return Ok(
-            "No REST endpoints, database models, or event-flow participants detected".to_string(),
-        );
+        return "No REST endpoints, database models, or event-flow participants detected"
+            .to_string();
     }
-    Ok(found
+    found
         .iter()
         .map(|f| format!("{:<13} {} — {}", f.kind.as_str(), f.concept_id, f.evidence))
         .collect::<Vec<_>>()
-        .join("\n"))
+        .join("\n")
 }
 
 /// AI-suggested missing links between semantically close concepts —
@@ -697,7 +923,18 @@ pub fn suggest_links(
     max_candidates: usize,
 ) -> Result<String> {
     let concepts = load_concepts(bundle)?;
-    let suggestions = okf_enrich::suggest_missing_links(client, &concepts, max_candidates)?;
+    suggest_links_from_concepts(&concepts, client, max_candidates)
+}
+
+/// Same as [`suggest_links`], but runs against `concepts` already loaded
+/// in memory instead of reading `bundle` fresh — see the crate-level
+/// `# Caching` note.
+pub fn suggest_links_from_concepts(
+    concepts: &[Concept],
+    client: &okf_enrich::EnrichClient,
+    max_candidates: usize,
+) -> Result<String> {
+    let suggestions = okf_enrich::suggest_missing_links(client, concepts, max_candidates)?;
     if suggestions.is_empty() {
         return Ok("No missing links suggested".to_string());
     }
@@ -941,6 +1178,87 @@ mod tests {
             text,
             "functions/auth/verify_token -> functions/auth/decode_jwt"
         );
+    }
+
+    #[test]
+    fn explain_renders_a_direct_edge_with_its_reason() {
+        let dir = sample_bundle();
+        let text = explain(
+            dir.path(),
+            "functions/auth/verify_token",
+            "functions/auth/decode_jwt",
+        )
+        .unwrap();
+        assert!(text.starts_with("functions/auth/verify_token"));
+        assert!(text.contains("calls"));
+        assert!(text.contains("functions/auth/decode_jwt"));
+        assert!(text.contains("Reason:"));
+        assert!(text.contains("Tree-sitter"));
+    }
+
+    #[test]
+    fn explain_works_regardless_of_which_order_the_ids_are_given_in() {
+        let dir = sample_bundle();
+        // Asked in the reverse order, it finds `decode_jwt`'s own
+        // `called_by: verify_token` entry -- a real, correctly-recorded
+        // relationship in its own right (the same underlying fact,
+        // recorded from the other side), rendered in *that* direction
+        // rather than forcing a canonical one that doesn't match what's
+        // actually on either concept's page.
+        let text = explain(
+            dir.path(),
+            "functions/auth/decode_jwt",
+            "functions/auth/verify_token",
+        )
+        .unwrap();
+        assert!(text.starts_with("functions/auth/decode_jwt"));
+        assert!(text.contains("called by"));
+        assert!(text.contains("functions/auth/verify_token"));
+        assert!(text.contains("Reason:"));
+    }
+
+    #[test]
+    fn explain_names_the_real_lsp_server_for_a_semantically_resolved_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - target: functions/b\n      resolved_by: rust-analyzer\n      confidence: semantic\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\n---\n\nbody\n",
+        );
+
+        let text = explain(dir.path(), "functions/a", "functions/b").unwrap();
+        assert!(text.contains("rust-analyzer"));
+        assert!(text.contains("more than one candidate"));
+    }
+
+    #[test]
+    fn explain_reports_clearly_when_there_is_no_relationship_or_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\n---\n\nbody\n",
+        );
+
+        let text = explain(dir.path(), "functions/a", "functions/b").unwrap();
+        assert!(text.contains("No direct relationship or call path found"));
+    }
+
+    #[test]
+    fn explain_unknown_concept_id_is_a_clear_error() {
+        let dir = sample_bundle();
+        let err = explain(dir.path(), "functions/nope", "functions/auth/decode_jwt").unwrap_err();
+        assert!(err.to_string().contains("no concept with id"));
     }
 
     #[test]
@@ -1246,6 +1564,190 @@ mod tests {
         assert_eq!(
             suggest_links(dir.path(), &client, 5).unwrap(),
             "No missing links suggested"
+        );
+    }
+
+    // The `*_from_concepts` siblings exist purely so a long-lived caller
+    // (see okf-mcp's cache) can amortize parsing across calls -- each one
+    // must produce exactly the same output as its `bundle: &Path`-taking
+    // counterpart given the same concepts, or the cache would silently
+    // change what an agent sees. These spot-check that parity across a
+    // representative sample rather than every single function pair,
+    // since the two forms differ only in "read from disk first or not".
+    #[test]
+    fn from_concepts_variants_match_their_path_based_counterparts() {
+        let dir = sample_bundle();
+        let concepts = load_concepts(dir.path()).unwrap();
+
+        assert_eq!(
+            explore(dir.path(), "functions/auth/decode_jwt").unwrap(),
+            explore_from_concepts(&concepts, "functions/auth/decode_jwt").unwrap()
+        );
+        assert_eq!(
+            graph_callers(dir.path(), "functions/auth/decode_jwt").unwrap(),
+            graph_callers_from_concepts(&concepts, "functions/auth/decode_jwt").unwrap()
+        );
+        assert_eq!(
+            graph_callees(dir.path(), "functions/auth/verify_token").unwrap(),
+            graph_callees_from_concepts(&concepts, "functions/auth/verify_token").unwrap()
+        );
+        assert_eq!(
+            graph_api(dir.path()).unwrap(),
+            graph_api_from_concepts(&concepts).unwrap()
+        );
+        assert_eq!(
+            graph_cycles(dir.path()).unwrap(),
+            graph_cycles_from_concepts(&concepts).unwrap()
+        );
+        assert_eq!(
+            graph_isolated(dir.path()).unwrap(),
+            graph_isolated_from_concepts(&concepts).unwrap()
+        );
+        assert_eq!(
+            coverage(dir.path()).unwrap(),
+            coverage_from_concepts(&concepts)
+        );
+        assert_eq!(
+            graph_modules(dir.path()).unwrap(),
+            graph_modules_from_concepts(&concepts).unwrap()
+        );
+        assert_eq!(
+            graph_stats(dir.path()).unwrap(),
+            graph_stats_from_concepts(&concepts)
+        );
+        assert_eq!(
+            graph_path(
+                dir.path(),
+                "functions/auth/verify_token",
+                "functions/auth/decode_jwt"
+            )
+            .unwrap(),
+            graph_path_from_concepts(
+                &concepts,
+                "functions/auth/verify_token",
+                "functions/auth/decode_jwt"
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            explain(
+                dir.path(),
+                "functions/auth/verify_token",
+                "functions/auth/decode_jwt"
+            )
+            .unwrap(),
+            explain_from_concepts(
+                &concepts,
+                "functions/auth/verify_token",
+                "functions/auth/decode_jwt"
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            graph_patterns(dir.path()).unwrap(),
+            graph_patterns_from_concepts(&concepts)
+        );
+        assert_eq!(
+            graph_features(dir.path()).unwrap(),
+            graph_features_from_concepts(&concepts)
+        );
+    }
+
+    #[test]
+    fn layers_domains_communities_from_concepts_match_the_path_based_form() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "packages/core.md",
+            "---\ntype: Rust Package\ntitle: core\nresource: core/Cargo.toml\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "packages/app.md",
+            "---\ntype: Rust Package\ntitle: app\nresource: app/Cargo.toml\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "modules/core.md",
+            "---\ntype: Rust Module\ntitle: core\nresource: core/src/lib.rs#L1\nrelationships:\n  member_of:\n    - packages/core\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "modules/app.md",
+            "---\ntype: Rust Module\ntitle: app\nresource: app/src/lib.rs#L1\nrelationships:\n  member_of:\n    - packages/app\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/app_fn.md",
+            "---\ntype: Rust Function\ntitle: app_fn\nresource: app/src/lib.rs#L1\nrelationships:\n  calls:\n    - functions/core_fn\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/core_fn.md",
+            "---\ntype: Rust Function\ntitle: core_fn\nresource: core/src/lib.rs#L1\n---\n\nbody\n",
+        );
+        let concepts = load_concepts(dir.path()).unwrap();
+
+        assert_eq!(
+            graph_layers(dir.path()).unwrap(),
+            graph_layers_from_concepts(&concepts).unwrap()
+        );
+        assert_eq!(
+            graph_domains(dir.path()).unwrap(),
+            graph_domains_from_concepts(&concepts).unwrap()
+        );
+        assert_eq!(
+            graph_communities(dir.path()).unwrap(),
+            graph_communities_from_concepts(&concepts).unwrap()
+        );
+    }
+
+    #[test]
+    fn search_semantic_from_concepts_matches_the_path_based_form() {
+        use okf_enrich::test_support::{embedding_client_for, start_embedding_mock_server};
+        use std::collections::HashMap;
+
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/verify_token.md",
+            "---\ntype: Rust Function\ntitle: verify_token\ndescription: Verifies a signed authentication token.\nresource: src/auth.rs#L1\nrelationships:\n  calls:\n    - functions/auth/decode_jwt\n---\n\nbody\n",
+        );
+        let mut responses = HashMap::new();
+        responses.insert(
+            "auth::verify_token (Rust Function): Verifies a signed authentication token."
+                .to_string(),
+            vec![1.0, 0.0],
+        );
+        responses.insert("authentication".to_string(), vec![1.0, 0.0]);
+
+        let server = start_embedding_mock_server(responses);
+        let client = embedding_client_for(&server);
+        let concepts = load_concepts(dir.path()).unwrap();
+
+        assert_eq!(
+            search_semantic(dir.path(), &client, "authentication", 10).unwrap(),
+            search_semantic_from_concepts(&concepts, &client, "authentication", 10).unwrap()
+        );
+    }
+
+    #[test]
+    fn suggest_links_from_concepts_matches_the_path_based_form() {
+        use okf_enrich::test_support::{client_for, start_mock_server};
+
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "functions/auth/other.md",
+            "---\ntype: Rust Function\ntitle: other\ndescription: Reads an auth token from the request header.\nresource: src/auth.rs#L20\n---\n\nbody\n",
+        );
+        let server = start_mock_server("looks related");
+        let client = client_for(&server);
+        let concepts = load_concepts(dir.path()).unwrap();
+
+        assert_eq!(
+            suggest_links(dir.path(), &client, 5).unwrap(),
+            suggest_links_from_concepts(&concepts, &client, 5).unwrap()
         );
     }
 }

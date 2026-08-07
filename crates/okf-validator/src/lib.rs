@@ -110,6 +110,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> Result<ValidationReport> {
     check_duplicate_resources(&files, &mut report);
     check_relationship_targets(&files, &known_paths, &mut report);
     check_relationship_symmetry(&files, &known_paths, &mut report);
+    check_relationship_provenance(&files, &mut report);
     let links = check_links_and_collect(&files, &known_paths, &mut report);
     check_reachability(&files, &links, &mut report);
 
@@ -653,6 +654,19 @@ fn check_duplicate_resources(files: &[ScannedFile], report: &mut ValidationRepor
     }
 }
 
+/// Extracts a `relationships.<kind>` sequence entry's target id, whether
+/// it's a bare string (any bundle written before edge provenance/
+/// confidence existed) or `okf-generator`'s current
+/// `{target, resolved_by, confidence}` mapping — mirrors
+/// `okf_parser::bundle::parse_relationship_entry`'s own leniency, since
+/// this validator re-parses the raw frontmatter YAML independently rather
+/// than going through `read_bundle`.
+fn relationship_target(value: &serde_yaml::Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.as_mapping()?.get("target")?.as_str())
+}
+
 /// A `relationships` target under the `external/` prefix names something
 /// outside the bundle by convention (e.g. a third-party import — see
 /// `okf-generator`'s external-target handling) and is never expected to
@@ -696,7 +710,7 @@ fn check_relationship_targets(
                 continue;
             };
             for target in targets {
-                let Some(target) = target.as_str() else {
+                let Some(target) = relationship_target(target) else {
                     continue;
                 };
                 if is_external_target(target) {
@@ -709,6 +723,79 @@ fn check_relationship_targets(
                         file: file.relative.clone(),
                         message: format!(
                             "`relationships.{kind}` references `{target}`, which doesn't exist in the bundle"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Validates a `relationships` entry's provenance/confidence metadata,
+/// where present — the "provenance-metadata validation" the CI-validation
+/// roadmap item names, now that edge provenance/confidence actually
+/// exists to validate. A bare-string entry (no metadata at all — any
+/// bundle written before this field existed) is always valid; nothing
+/// here requires the new shape. Only checks a *populated but wrong*
+/// `confidence` (not one of `exact`/`semantic`) or an explicitly *empty*
+/// `resolved_by` — a missing field either way already has a sensible
+/// default applied on read (`okf_parser::bundle::parse_relationship_entry`),
+/// so there's nothing to flag about absence, only about a present value
+/// that can't mean anything.
+fn check_relationship_provenance(files: &[ScannedFile], report: &mut ValidationReport) {
+    for file in files {
+        if is_index(&file.relative) {
+            continue;
+        }
+        let Some((yaml, _)) = split_frontmatter(&file.content) else {
+            continue;
+        };
+        let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+            continue;
+        };
+        let Some(mapping) = value.as_mapping() else {
+            continue;
+        };
+        let Some(relationships) = mapping.get("relationships").and_then(|v| v.as_mapping()) else {
+            continue;
+        };
+
+        for (kind, targets) in relationships {
+            let kind = kind.as_str().unwrap_or("relationships");
+            let Some(targets) = targets.as_sequence() else {
+                continue;
+            };
+            for entry in targets {
+                let Some(entry_map) = entry.as_mapping() else {
+                    continue;
+                };
+                let target = entry_map
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unknown target>");
+                if let Some(confidence) = entry_map.get("confidence").and_then(|v| v.as_str()) {
+                    // Deliberately a local literal list, not
+                    // `okf_parser::Confidence`: this validator re-parses
+                    // raw frontmatter YAML independently of `okf-parser`
+                    // everywhere else (see `relationship_target`'s docs),
+                    // so a malformed bundle stays checkable even if it
+                    // wouldn't parse via `read_bundle` at all.
+                    if !matches!(confidence, "exact" | "semantic") {
+                        report.issues.push(ValidationIssue {
+                            severity: Severity::Error,
+                            file: file.relative.clone(),
+                            message: format!(
+                                "`relationships.{kind}` entry for `{target}` has an unrecognized `confidence: {confidence}` (expected `exact` or `semantic`)"
+                            ),
+                        });
+                    }
+                }
+                if entry_map.get("resolved_by").and_then(|v| v.as_str()) == Some("") {
+                    report.issues.push(ValidationIssue {
+                        severity: Severity::Error,
+                        file: file.relative.clone(),
+                        message: format!(
+                            "`relationships.{kind}` entry for `{target}` has an empty `resolved_by`"
                         ),
                     });
                 }
@@ -759,10 +846,12 @@ fn check_relationship_symmetry(
 
         for (bucket, key) in [(&mut calls_of, "calls"), (&mut called_by_of, "called_by")] {
             if let Some(targets) = relationships.get(key).and_then(|v| v.as_sequence()) {
-                bucket
-                    .entry(id.to_string())
-                    .or_default()
-                    .extend(targets.iter().filter_map(|t| t.as_str()).map(String::from));
+                bucket.entry(id.to_string()).or_default().extend(
+                    targets
+                        .iter()
+                        .filter_map(relationship_target)
+                        .map(String::from),
+                );
             }
         }
     }
@@ -859,6 +948,30 @@ fn resolve_link(from_relative: &str, link: &str) -> Option<String> {
     Some(components.join("/"))
 }
 
+/// Splits a concept file's content into per-section chunks, breaking at
+/// every line that starts with a top-level `# Heading` (not `##` or
+/// deeper) — `okf-generator` renders each relation kind as its own such
+/// section (`# Calls`, `# Called by`, `# Imports`, ...), so this mirrors
+/// that structure without needing to know the specific heading names.
+/// Content before the first heading (frontmatter, or a file with no
+/// headings at all) is its own leading section.
+fn split_into_sections(content: &str) -> Vec<&str> {
+    let mut boundaries = vec![0];
+    let mut pos = 0;
+    for line in content.split_inclusive('\n') {
+        if line.starts_with("# ") && pos != 0 {
+            boundaries.push(pos);
+        }
+        pos += line.len();
+    }
+    boundaries.push(content.len());
+    boundaries.dedup();
+    boundaries
+        .windows(2)
+        .map(|w| &content[w[0]..w[1]])
+        .collect()
+}
+
 fn check_links_and_collect(
     files: &[ScannedFile],
     known_paths: &HashSet<&str>,
@@ -867,32 +980,43 @@ fn check_links_and_collect(
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
     for file in files {
         let mut resolved_targets = Vec::new();
-        let mut seen_targets: HashSet<String> = HashSet::new();
-        for link in extract_local_links(&file.content) {
-            match resolve_link(&file.relative, &link) {
-                Some(target) if known_paths.contains(target.as_str()) => {
-                    if !seen_targets.insert(target.clone()) {
+        // "Already linked" is tracked per section (`# Calls`, `# Called
+        // by`, ...), not per whole file: two functions that call each
+        // other legitimately link to the same target twice on one page —
+        // once under `# Calls`, once under `# Called by` — which is two
+        // distinct facts (a mutual-call relationship), not a duplicate
+        // worth warning about. A real duplicate (the same target linked
+        // twice within the *same* section) still warns.
+        for section in split_into_sections(&file.content) {
+            let mut seen_targets: HashSet<String> = HashSet::new();
+            for link in extract_local_links(section) {
+                match resolve_link(&file.relative, &link) {
+                    Some(target) if known_paths.contains(target.as_str()) => {
+                        if !seen_targets.insert(target.clone()) {
+                            report.issues.push(ValidationIssue {
+                                severity: Severity::Warning,
+                                file: file.relative.clone(),
+                                message: format!("redundant link to `{target}` (already linked earlier in this file)"),
+                            });
+                        }
+                        resolved_targets.push(target);
+                    }
+                    Some(target) => {
                         report.issues.push(ValidationIssue {
-                            severity: Severity::Warning,
+                            severity: Severity::Error,
                             file: file.relative.clone(),
-                            message: format!("redundant link to `{target}` (already linked earlier in this file)"),
+                            message: format!(
+                                "dangling link to `{target}` (resolved from `{link}`)"
+                            ),
                         });
                     }
-                    resolved_targets.push(target);
-                }
-                Some(target) => {
-                    report.issues.push(ValidationIssue {
-                        severity: Severity::Error,
-                        file: file.relative.clone(),
-                        message: format!("dangling link to `{target}` (resolved from `{link}`)"),
-                    });
-                }
-                None => {
-                    report.issues.push(ValidationIssue {
-                        severity: Severity::Error,
-                        file: file.relative.clone(),
-                        message: format!("link `{link}` escapes the bundle root"),
-                    });
+                    None => {
+                        report.issues.push(ValidationIssue {
+                            severity: Severity::Error,
+                            file: file.relative.clone(),
+                            message: format!("link `{link}` escapes the bundle root"),
+                        });
+                    }
                 }
             }
         }
@@ -1178,6 +1302,98 @@ mod tests {
     }
 
     #[test]
+    fn accepts_the_object_shaped_relationship_entry_with_valid_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/callee.md",
+            "---\ntype: Rust Function\ntitle: callee\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L5\nrelationships:\n  calls:\n    - target: functions/callee\n      resolved_by: rust-analyzer\n      confidence: semantic\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "a valid object-shaped relationship entry should not be flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn flags_an_unrecognized_confidence_value() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/callee.md",
+            "---\ntype: Rust Function\ntitle: callee\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L5\nrelationships:\n  calls:\n    - target: functions/callee\n      confidence: probably\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.has_errors());
+        assert!(report.issues.iter().any(|i| {
+            i.message.contains("unrecognized `confidence: probably`")
+                && i.message.contains("functions/callee")
+        }));
+    }
+
+    #[test]
+    fn flags_an_empty_resolved_by() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/callee.md",
+            "---\ntype: Rust Function\ntitle: callee\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L5\nrelationships:\n  calls:\n    - target: functions/callee\n      resolved_by: \"\"\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.has_errors());
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.message.contains("empty `resolved_by`")));
+    }
+
+    #[test]
+    fn a_bare_string_relationship_entry_has_no_provenance_to_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/callee.md",
+            "---\ntype: Rust Function\ntitle: callee\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L5\nrelationships:\n  calls:\n    - functions/callee\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report.has_errors(),
+            "a bare-string relationship entry (pre-provenance bundle format) should stay valid: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
     fn flags_a_redundant_duplicate_link() {
         let dir = tempfile::tempdir().unwrap();
         write(
@@ -1201,6 +1417,92 @@ mod tests {
             .issues
             .iter()
             .any(|i| { i.severity == Severity::Warning && i.message.contains("redundant link") }));
+    }
+
+    /// Found by real-world benchmarking (August 2026): two functions that
+    /// call each other (`a` calls `b`, `b` calls `a` back) legitimately
+    /// link to the same target twice on one page -- once under `# Calls`,
+    /// once under `# Called by` -- which used to trip the redundant-link
+    /// check even though they're two distinct facts, not a duplicate.
+    #[test]
+    fn mutual_calls_across_different_sections_are_not_flagged_as_redundant() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [a](functions/a.md)\n- [b](functions/b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\n---\n\n# Calls\n\n- [b](b.md)\n\n# Called by\n\n- [b](b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\n---\n\n# Calls\n\n- [a](a.md)\n\n# Called by\n\n- [a](a.md)\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("redundant link")),
+            "a mutual-call pair shouldn't be flagged as a redundant link: {:?}",
+            report.issues
+        );
+    }
+
+    /// The same target linked twice *within one section* is still a real
+    /// duplicate worth flagging -- the section-awareness above narrows
+    /// what counts as "already linked", it doesn't disable the check.
+    #[test]
+    fn a_genuine_duplicate_within_one_section_is_still_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [a](functions/a.md)\n- [b](functions/b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\n---\n\n# Calls\n\n- [b](b.md)\n- [b again](b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.severity == Severity::Warning && i.message.contains("redundant link")));
+    }
+
+    #[test]
+    fn split_into_sections_breaks_only_on_top_level_headings() {
+        assert_eq!(split_into_sections("no headings at all\n").len(), 1);
+
+        let two = split_into_sections("preamble\n# Calls\n\n- [x](x.md)\n");
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0], "preamble\n");
+        assert!(two[1].starts_with("# Calls"));
+
+        let two_headings =
+            split_into_sections("# Calls\n\n- [x](x.md)\n# Called by\n\n- [y](y.md)\n");
+        assert_eq!(two_headings.len(), 2);
+        assert!(two_headings[0].starts_with("# Calls"));
+        assert!(two_headings[1].starts_with("# Called by"));
+
+        // A "##" subheading is deliberately not a section boundary --
+        // only a top-level "# " heading is, matching what okf-generator
+        // actually renders (one level of heading per relation kind).
+        let with_sub = split_into_sections("# Calls\n\n## Not a real subheading\n- [x](x.md)\n");
+        assert_eq!(with_sub.len(), 1);
     }
 
     #[test]

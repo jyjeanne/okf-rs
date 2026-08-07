@@ -66,22 +66,37 @@ struct GeneratedFrontmatter {
     at: Option<DateTime<Utc>>,
 }
 
+/// One rendered `relationships.<kind>` entry: the target id, plus the
+/// provenance/confidence metadata the "Record edge provenance"/
+/// "Confidence levels" roadmap items ask for — how this edge was
+/// produced (`tree-sitter`, or the language server that resolved it) and
+/// how much to trust it. `okf_parser::read_bundle` also accepts a plain
+/// target-id string in this position (any bundle written before this
+/// field existed, or a hand-edited entry kept simple); `okf-generator`
+/// itself only ever writes this richer shape.
+#[derive(Serialize)]
+struct RelationshipEntry {
+    target: String,
+    resolved_by: String,
+    confidence: &'static str,
+}
+
 #[derive(Serialize, Default)]
 struct RelationshipsFrontmatter {
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    imports: Vec<String>,
+    imports: Vec<RelationshipEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    calls: Vec<String>,
+    calls: Vec<RelationshipEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    called_by: Vec<String>,
+    called_by: Vec<RelationshipEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    implements: Vec<String>,
+    implements: Vec<RelationshipEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    inherits: Vec<String>,
+    inherits: Vec<RelationshipEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    depends_on: Vec<String>,
+    depends_on: Vec<RelationshipEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    member_of: Vec<String>,
+    member_of: Vec<RelationshipEntry>,
 }
 
 /// Groups `concept`'s relationship targets by kind for frontmatter,
@@ -111,7 +126,11 @@ fn relationships_frontmatter(concept: &Concept) -> Option<RelationshipsFrontmatt
             RelationKind::DependsOn => &mut grouped.depends_on,
             RelationKind::MemberOf => &mut grouped.member_of,
         };
-        bucket.push(rel.target.clone());
+        bucket.push(RelationshipEntry {
+            target: rel.target.clone(),
+            resolved_by: rel.resolved_by.clone(),
+            confidence: rel.confidence.as_str(),
+        });
     }
     Some(grouped)
 }
@@ -341,16 +360,16 @@ mod tests {
             "src/auth.rs",
         );
 
-        caller.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: callee.id.clone(),
-            target_display: "decode_jwt".to_string(),
-        });
-        module.relationships.push(Relationship {
-            kind: RelationKind::Imports,
-            target: "external/std-collections-hashmap".to_string(),
-            target_display: "std::collections::HashMap".to_string(),
-        });
+        caller.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            callee.id.clone(),
+            "decode_jwt",
+        ));
+        module.relationships.push(Relationship::new(
+            RelationKind::Imports,
+            "external/std-collections-hashmap",
+            "std::collections::HashMap",
+        ));
 
         let concepts = vec![module, caller, callee];
         write_bundle(&concepts, dir.path()).unwrap();
@@ -454,17 +473,21 @@ mod tests {
             "auth.decode_jwt",
             "src/auth.rs",
         );
-        caller.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: callee.id.clone(),
-            target_display: "decode_jwt".to_string(),
-        });
+        caller.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            callee.id.clone(),
+            "decode_jwt",
+        ));
 
         write_bundle(&[caller, callee], dir.path()).unwrap();
 
         let content =
             fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
-        assert!(content.contains("relationships:\n  calls:\n  - functions/auth/decode_jwt\n"));
+        assert!(
+            content.contains("relationships:\n  calls:\n  - target: functions/auth/decode_jwt\n")
+        );
+        assert!(content.contains("resolved_by: tree-sitter"));
+        assert!(content.contains("confidence: exact"));
     }
 
     #[test]
@@ -488,18 +511,20 @@ mod tests {
             "src/auth.rs",
         );
         for _ in 0..2 {
-            caller.relationships.push(Relationship {
-                kind: RelationKind::Calls,
-                target: callee.id.clone(),
-                target_display: "decode_jwt".to_string(),
-            });
+            caller.relationships.push(Relationship::new(
+                RelationKind::Calls,
+                callee.id.clone(),
+                "decode_jwt",
+            ));
         }
 
         write_bundle(&[caller, callee], dir.path()).unwrap();
 
         let content =
             fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
-        assert!(content.contains("relationships:\n  calls:\n  - functions/auth/decode_jwt\n"));
+        assert!(
+            content.contains("relationships:\n  calls:\n  - target: functions/auth/decode_jwt\n")
+        );
         assert_eq!(
             content
                 .matches("[decode_jwt](../../functions/auth/decode_jwt.md)")
@@ -524,15 +549,21 @@ mod tests {
             "auth.decode_jwt",
             "src/auth.rs",
         );
-        caller.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: callee.id.clone(),
-            target_display: "decode_jwt".to_string(),
-        });
-        callee.relationships.push(Relationship {
+        caller.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            callee.id.clone(),
+            "decode_jwt",
+        ));
+        // A non-default provenance/confidence, as `okf-analyzer` would
+        // build for an `--lsp`-resolved edge -- confirms the round trip
+        // carries the *actual* values through, not just the tree-sitter
+        // defaults every other fixture in this file happens to use.
+        callee.relationships.push(okf_parser::Relationship {
             kind: RelationKind::CalledBy,
             target: caller.id.clone(),
             target_display: "verify_token".to_string(),
+            resolved_by: "rust-analyzer".to_string(),
+            confidence: okf_parser::Confidence::Semantic,
         });
 
         write_bundle(&[caller.clone(), callee.clone()], dir.path()).unwrap();
@@ -544,10 +575,20 @@ mod tests {
         assert_eq!(read_caller.relationships[0].kind, RelationKind::Calls);
         assert_eq!(read_caller.relationships[0].target, callee.id);
         assert_eq!(read_caller.relationships[0].target_display, "decode_jwt");
+        assert_eq!(read_caller.relationships[0].resolved_by, "tree-sitter");
+        assert_eq!(
+            read_caller.relationships[0].confidence,
+            okf_parser::Confidence::Exact
+        );
 
         let read_callee = read_back.iter().find(|c| c.id == callee.id).unwrap();
         assert_eq!(read_callee.relationships[0].kind, RelationKind::CalledBy);
         assert_eq!(read_callee.relationships[0].target_display, "verify_token");
+        assert_eq!(read_callee.relationships[0].resolved_by, "rust-analyzer");
+        assert_eq!(
+            read_callee.relationships[0].confidence,
+            okf_parser::Confidence::Semantic
+        );
     }
 
     #[test]
@@ -565,11 +606,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let package = concept(ConceptKind::Package, "demo", "demo", "Cargo.toml");
         let mut module = concept(ConceptKind::Module, "lib", "lib", "src/lib.rs");
-        module.relationships.push(Relationship {
-            kind: RelationKind::MemberOf,
-            target: package.id.clone(),
-            target_display: "demo".to_string(),
-        });
+        module.relationships.push(Relationship::new(
+            RelationKind::MemberOf,
+            package.id.clone(),
+            "demo",
+        ));
 
         write_bundle(&[package.clone(), module.clone()], dir.path()).unwrap();
 

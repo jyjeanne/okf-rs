@@ -1,8 +1,9 @@
 //! LSP-backed disambiguation of ambiguous call candidates — see
 //! [`crate::analyze_with_cache_lsp`] for the algorithm this plugs into.
 
+use crate::ResolvedEdge;
 use okf_core::Project;
-use okf_parser::{Language, Location};
+use okf_parser::{Confidence, Language, Location};
 use okf_tree_sitter::CallCandidate;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -43,7 +44,7 @@ pub(crate) fn resolve_ambiguous_calls(
     file_sources: &HashMap<String, String>,
     id_to_location: &HashMap<&str, &Location>,
     candidates_by_name: &HashMap<&str, Vec<&str>>,
-    resolved_edges: &mut Vec<(String, String)>,
+    resolved_edges: &mut Vec<ResolvedEdge>,
 ) {
     let mut clients: HashMap<Language, ClientState> = HashMap::new();
 
@@ -114,7 +115,15 @@ pub(crate) fn resolve_ambiguous_calls(
         });
         if let Some(callee_id) = matched {
             if **callee_id != call.caller_id {
-                resolved_edges.push((call.caller_id.clone(), (*callee_id).to_string()));
+                let resolved_by = okf_lsp::server_command(*language)
+                    .map(|(name, _)| name.to_string())
+                    .unwrap_or_else(|| format!("{language}"));
+                resolved_edges.push(ResolvedEdge {
+                    caller: call.caller_id.clone(),
+                    callee: (*callee_id).to_string(),
+                    resolved_by,
+                    confidence: Confidence::Semantic,
+                });
             }
         }
     }

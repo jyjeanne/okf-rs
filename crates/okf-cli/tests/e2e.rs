@@ -727,6 +727,191 @@ fn standalone_binary_generate_lsp_disambiguates_a_call_via_rust_analyzer() {
     assert!(!callees_lsp_out.contains("functions/src/b/run"));
 }
 
+/// `--check-determinism` runs analysis twice, independently, and diffs
+/// the two renders — on the default tree-sitter-only path (no `--lsp`,
+/// no external process involved) that should always agree, since the
+/// only input is the source text itself. Also confirms it doesn't write
+/// a bundle at all: `--output` is never consulted on this path, so
+/// `knowledge/` shouldn't exist afterward.
+#[test]
+fn standalone_binary_check_determinism_reports_deterministic_on_the_tree_sitter_path() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn callee() {}\npub fn caller() { callee(); }\n",
+    )
+    .unwrap();
+
+    let check = run(&project, &["generate", ".", "--check-determinism"]);
+    assert_success(&check, &["generate --check-determinism"]);
+    let out = stdout_of(&check);
+    assert!(out.contains("Deterministic"), "unexpected output: {out}");
+    assert!(out.contains("4 concepts"), "unexpected output: {out}");
+    assert!(
+        !project.join("knowledge").exists(),
+        "--check-determinism shouldn't write a bundle to the default output directory"
+    );
+}
+
+/// `--check-determinism --enrich` is rejected up front, before any
+/// analysis or network call — enrichment's own non-determinism (a live
+/// endpoint's response isn't guaranteed byte-identical across calls)
+/// would otherwise be reported as a false positive unrelated to what
+/// this flag actually checks.
+#[test]
+fn standalone_binary_check_determinism_rejects_enrich() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let check = run(
+        &project,
+        &["generate", ".", "--check-determinism", "--enrich"],
+    );
+    assert!(
+        !check.status.success(),
+        "expected --check-determinism --enrich to fail"
+    );
+    let err = stderr_of(&check);
+    assert!(
+        err.contains("--check-determinism") && err.contains("--enrich"),
+        "unexpected stderr: {err}"
+    );
+}
+
+/// `--check-fresh` verifies the bundle already on disk still matches a
+/// fresh `generate` — the "bundle is up to date with source" CI check.
+/// Right after a real `generate`, the two must agree.
+#[test]
+fn standalone_binary_check_fresh_reports_up_to_date_right_after_generate() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let generate = run(&project, &["generate", "."]);
+    assert_success(&generate, &["generate"]);
+
+    let check = run(&project, &["generate", ".", "--check-fresh"]);
+    assert_success(&check, &["generate --check-fresh"]);
+    let out = stdout_of(&check);
+    assert!(out.contains("Up to date"), "unexpected output: {out}");
+}
+
+/// Adding a new function after `generate` has already run makes the
+/// committed bundle stale — `--check-fresh` must catch that, exit
+/// non-zero, and name the file that's out of sync, without silently
+/// overwriting `knowledge/` itself.
+#[test]
+fn standalone_binary_check_fresh_reports_stale_after_a_source_change() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let generate = run(&project, &["generate", "."]);
+    assert_success(&generate, &["generate"]);
+    let bundle_before = fs::read_to_string(project.join("knowledge/functions/index.md")).unwrap();
+
+    // Source changes (a new function) without regenerating -- the
+    // committed bundle no longer reflects the project.
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\npub fn g() {}\n").unwrap();
+
+    let check = run(&project, &["generate", ".", "--check-fresh"]);
+    assert!(
+        !check.status.success(),
+        "expected --check-fresh to fail on a stale bundle"
+    );
+    let out = stdout_of(&check);
+    assert!(out.contains("Stale"), "unexpected output: {out}");
+    assert!(out.contains("g.md"), "unexpected output: {out}");
+    // Read-only: the committed bundle itself is untouched, not
+    // silently regenerated out from under the CI check.
+    let bundle_after = fs::read_to_string(project.join("knowledge/functions/index.md")).unwrap();
+    assert_eq!(bundle_before, bundle_after);
+}
+
+/// `--check-fresh` needs an existing bundle to compare against -- on a
+/// project that's never been generated, it should fail with a clear
+/// message pointing at `generate`, not report every file as "stale".
+#[test]
+fn standalone_binary_check_fresh_fails_clearly_with_no_existing_bundle() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let check = run(&project, &["generate", ".", "--check-fresh"]);
+    assert!(!check.status.success());
+    let err = stderr_of(&check);
+    assert!(
+        err.contains("generate"),
+        "expected the error to point at running generate first: {err}"
+    );
+}
+
+/// `--check-fresh --enrich` is rejected up front, for the same reason as
+/// `--check-determinism --enrich`: comparing against a freshly analyzed
+/// (unenriched) bundle would flag every AI-written description as
+/// spurious drift, not a real staleness signal.
+#[test]
+fn standalone_binary_check_fresh_rejects_enrich() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let check = run(&project, &["generate", ".", "--check-fresh", "--enrich"]);
+    assert!(
+        !check.status.success(),
+        "expected --check-fresh --enrich to fail"
+    );
+    let err = stderr_of(&check);
+    assert!(
+        err.contains("--check-fresh") && err.contains("--enrich"),
+        "unexpected stderr: {err}"
+    );
+}
+
+/// `--check-determinism` and `--check-fresh` check different things and
+/// can't both be requested in the same invocation.
+#[test]
+fn standalone_binary_rejects_check_determinism_and_check_fresh_together() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let check = run(
+        &project,
+        &["generate", ".", "--check-determinism", "--check-fresh"],
+    );
+    assert!(!check.status.success());
+    let err = stderr_of(&check);
+    assert!(
+        err.contains("--check-determinism") && err.contains("--check-fresh"),
+        "unexpected stderr: {err}"
+    );
+}
+
 /// `okf-rs watch` regenerates the bundle once immediately on startup and
 /// then blocks watching for filesystem changes. This test only exercises
 /// that baseline regenerate — it starts the real subprocess, waits for

@@ -1107,11 +1107,15 @@ name = "okf-mcp"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "ignore",
  "okf-core",
  "okf-enrich",
+ "okf-graph",
+ "okf-parser",
  "okf-query",
  "serde_json",
  "tempfile",
+ "walkdir",
 ]
 
 [[package]]

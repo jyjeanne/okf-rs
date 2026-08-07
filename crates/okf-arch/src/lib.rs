@@ -460,19 +460,17 @@ mod tests {
     }
 
     fn member_of(concept: &mut Concept, package_id: &str) {
-        concept.relationships.push(Relationship {
-            kind: RelationKind::MemberOf,
-            target: package_id.to_string(),
-            target_display: package_id.to_string(),
-        });
+        concept.relationships.push(Relationship::new(
+            RelationKind::MemberOf,
+            package_id,
+            package_id,
+        ));
     }
 
     fn calls(concept: &mut Concept, target_id: &str) {
-        concept.relationships.push(Relationship {
-            kind: RelationKind::Calls,
-            target: target_id.to_string(),
-            target_display: target_id.to_string(),
-        });
+        concept
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, target_id, target_id));
     }
 
     /// Two packages, `core` (no dependencies) and `app` (depends on

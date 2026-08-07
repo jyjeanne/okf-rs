@@ -76,11 +76,11 @@ pub fn strip_quotes(s: &str) -> String {
 /// external id. `okf-generator` renders these as plain text rather than
 /// links, since the target is not (yet) a concept in the bundle.
 pub fn import_relationship(raw: &str) -> Relationship {
-    Relationship {
-        kind: RelationKind::Imports,
-        target: format!("external/{}", slugify(raw)),
-        target_display: raw.to_string(),
-    }
+    Relationship::new(
+        RelationKind::Imports,
+        format!("external/{}", slugify(raw)),
+        raw,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
