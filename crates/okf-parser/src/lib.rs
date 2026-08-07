@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 mod bundle;
-pub use bundle::read_bundle;
+pub use bundle::{is_concept_file, read_bundle};
 
 /// A programming language recognized by okf-rs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

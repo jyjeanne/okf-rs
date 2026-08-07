@@ -111,8 +111,12 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path, cache: &BundleCache) -
             okf_query::search_semantic_from_concepts(&concepts, &client, &query, limit)
         }
         "explore" => {
-            let concepts = cache.get_or_load(bundle)?;
-            okf_query::explore_from_concepts(&concepts, &arg_str(arguments, "query")?)
+            // Validate the argument before touching the bundle/cache at
+            // all, so a malformed request (missing `query`) always gets
+            // its own clear error, even against a project that hasn't
+            // been `generate`d yet -- matching every other tool here.
+            let query = arg_str(arguments, "query")?;
+            okf_query::explore_from_concepts(&cache.get_or_load(bundle)?, &query)
         }
         "coverage" => Ok(okf_query::coverage_from_concepts(
             &cache.get_or_load(bundle)?,
@@ -130,30 +134,46 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path, cache: &BundleCache) -
 /// system prompt) per query.
 fn graph_relation(bundle: &Path, arguments: &Value, cache: &BundleCache) -> Result<String> {
     let relation = arg_str(arguments, "relation")?;
-    let concepts = cache.get_or_load(bundle)?;
+    // Each arm validates the arguments *that relation* needs before
+    // touching the bundle/cache, so a malformed request (missing `id`/
+    // `from`/`to`) always gets its own clear error rather than a
+    // "no bundle found" error from a project that hasn't been
+    // `generate`d yet masking the real problem with the request.
     match relation.as_str() {
-        "callers" => okf_query::graph_callers_from_concepts(&concepts, &arg_str(arguments, "id")?),
-        "callees" => okf_query::graph_callees_from_concepts(&concepts, &arg_str(arguments, "id")?),
-        "path" => okf_query::graph_path_from_concepts(
-            &concepts,
-            &arg_str(arguments, "from")?,
-            &arg_str(arguments, "to")?,
-        ),
-        "explain" => okf_query::explain_from_concepts(
-            &concepts,
-            &arg_str(arguments, "from")?,
-            &arg_str(arguments, "to")?,
-        ),
-        "api" => okf_query::graph_api_from_concepts(&concepts),
-        "cycles" => okf_query::graph_cycles_from_concepts(&concepts),
-        "modules" => okf_query::graph_modules_from_concepts(&concepts),
-        "isolated" => okf_query::graph_isolated_from_concepts(&concepts),
-        "stats" => Ok(okf_query::graph_stats_from_concepts(&concepts)),
-        "layers" => okf_query::graph_layers_from_concepts(&concepts),
-        "domains" => okf_query::graph_domains_from_concepts(&concepts),
-        "communities" => okf_query::graph_communities_from_concepts(&concepts),
-        "patterns" => Ok(okf_query::graph_patterns_from_concepts(&concepts)),
-        "features" => Ok(okf_query::graph_features_from_concepts(&concepts)),
+        "callers" => {
+            let id = arg_str(arguments, "id")?;
+            okf_query::graph_callers_from_concepts(&cache.get_or_load(bundle)?, &id)
+        }
+        "callees" => {
+            let id = arg_str(arguments, "id")?;
+            okf_query::graph_callees_from_concepts(&cache.get_or_load(bundle)?, &id)
+        }
+        "path" => {
+            let from = arg_str(arguments, "from")?;
+            let to = arg_str(arguments, "to")?;
+            okf_query::graph_path_from_concepts(&cache.get_or_load(bundle)?, &from, &to)
+        }
+        "explain" => {
+            let from = arg_str(arguments, "from")?;
+            let to = arg_str(arguments, "to")?;
+            okf_query::explain_from_concepts(&cache.get_or_load(bundle)?, &from, &to)
+        }
+        "api" => okf_query::graph_api_from_concepts(&cache.get_or_load(bundle)?),
+        "cycles" => okf_query::graph_cycles_from_concepts(&cache.get_or_load(bundle)?),
+        "modules" => okf_query::graph_modules_from_concepts(&cache.get_or_load(bundle)?),
+        "isolated" => okf_query::graph_isolated_from_concepts(&cache.get_or_load(bundle)?),
+        "stats" => Ok(okf_query::graph_stats_from_concepts(
+            &cache.get_or_load(bundle)?,
+        )),
+        "layers" => okf_query::graph_layers_from_concepts(&cache.get_or_load(bundle)?),
+        "domains" => okf_query::graph_domains_from_concepts(&cache.get_or_load(bundle)?),
+        "communities" => okf_query::graph_communities_from_concepts(&cache.get_or_load(bundle)?),
+        "patterns" => Ok(okf_query::graph_patterns_from_concepts(
+            &cache.get_or_load(bundle)?,
+        )),
+        "features" => Ok(okf_query::graph_features_from_concepts(
+            &cache.get_or_load(bundle)?,
+        )),
         other => Err(anyhow!(
             "unknown relation `{other}` for the graph tool — expected one of: callers, callees, path, explain, api, cycles, modules, isolated, stats, layers, domains, communities, patterns, features"
         )),
@@ -430,6 +450,49 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("okf-rs generate"));
+    }
+
+    // A malformed request must be reported as exactly that -- never
+    // masked by a "no bundle found" error from a project that also
+    // hasn't been `generate`d yet, which would point the caller at the
+    // wrong fix (regenerate the bundle) instead of the real one (fix the
+    // request). Each of these pairs a bad/missing argument with a
+    // nonexistent bundle path specifically to catch a regression that
+    // reintroduces bundle-loading before argument validation.
+    #[test]
+    fn missing_argument_is_reported_even_against_a_bundle_that_does_not_exist() {
+        let err = call("explore", &json!({}), Path::new("/nonexistent"), &cache()).unwrap_err();
+        assert!(err.to_string().contains("missing required argument"));
+
+        let err = call(
+            "graph",
+            &json!({ "relation": "callers" }),
+            Path::new("/nonexistent"),
+            &cache(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("missing required argument"));
+
+        let err = call(
+            "graph",
+            &json!({ "relation": "path", "from": "a" }),
+            Path::new("/nonexistent"),
+            &cache(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("missing required argument"));
+    }
+
+    #[test]
+    fn unknown_relation_is_reported_even_against_a_bundle_that_does_not_exist() {
+        let err = call(
+            "graph",
+            &json!({ "relation": "bogus" }),
+            Path::new("/nonexistent"),
+            &cache(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown relation `bogus`"));
     }
 
     #[test]

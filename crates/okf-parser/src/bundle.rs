@@ -9,6 +9,20 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+/// Whether `path` is a concept file [`read_bundle`] would actually parse:
+/// a `.md` file that isn't the reserved `index.md` navigation filename.
+/// Exposed so a caller that needs to know *which files* `read_bundle`
+/// would consider — without paying for a full parse of each one, e.g.
+/// `okf-mcp`'s bundle cache computing a cheap invalidation fingerprint —
+/// shares this one definition instead of re-encoding the same two
+/// conditions and silently drifting from it over time.
+pub fn is_concept_file(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some("md") {
+        return false;
+    }
+    path.file_name().and_then(|n| n.to_str()) != Some("index.md")
+}
+
 /// Walks `bundle_dir` and reconstructs every concept file's frontmatter
 /// (and, where present, its `# Signature` body section) into a [`Concept`].
 /// Skips `index.md` navigation pages, which carry no frontmatter, and any
@@ -30,10 +44,7 @@ pub fn read_bundle(bundle_dir: &Path) -> Result<Vec<Concept>> {
             continue;
         }
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        if path.file_name().and_then(|n| n.to_str()) == Some("index.md") {
+        if !is_concept_file(path) {
             continue;
         }
         let relative = path

@@ -54,9 +54,10 @@ struct Fingerprint {
     latest_mtime: Option<SystemTime>,
 }
 
-/// Walks `bundle` the same way `okf_parser::read_bundle` does (same
-/// `.md`-extension, non-`index.md` filter), but only stats each file
-/// rather than reading it.
+/// Walks `bundle` the same way `okf_parser::read_bundle` does — via the
+/// same [`okf_parser::is_concept_file`] filter `read_bundle` itself uses,
+/// not a re-encoded copy of its two conditions that could silently drift
+/// out of sync with it — but only stats each file rather than reading it.
 fn fingerprint(bundle: &Path) -> Fingerprint {
     let mut file_count = 0usize;
     let mut total_bytes = 0u64;
@@ -70,10 +71,7 @@ fn fingerprint(bundle: &Path) -> Fingerprint {
             continue;
         }
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        if path.file_name().and_then(|n| n.to_str()) == Some("index.md") {
+        if !okf_parser::is_concept_file(path) {
             continue;
         }
         let Ok(metadata) = entry.metadata() else {

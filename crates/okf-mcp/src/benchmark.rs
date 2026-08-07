@@ -219,10 +219,14 @@ pub fn run(project_root: &Path, sample_size: usize) -> Result<Report> {
     let schema_bytes = serde_json::to_string(&tools).map(|s| s.len()).unwrap_or(0);
     let schema_tokens = approx_tokens(schema_bytes);
 
-    // A one-shot process (this whole command runs once and exits), so a
-    // throwaway cache is fine -- it's here only because `tools::call`
-    // requires one, not because there's anything to amortize within a
-    // single benchmark run.
+    // `tools::call` requires a cache; this one is shared across every
+    // sampled query below (so only the first is a real parse, same as a
+    // real chatty session), but it's still created fresh here and
+    // dropped at the end of this one-shot process/command -- nothing
+    // persists across separate `--benchmark` invocations, and the
+    // reported numbers are response *sizes*, not call latency, so how
+    // many of these calls hit the cache doesn't change what gets
+    // reported either way.
     let cache = crate::cache::BundleCache::new();
     let mut queries = Vec::new();
     for c in sample_concepts(&concepts, sample_size) {
