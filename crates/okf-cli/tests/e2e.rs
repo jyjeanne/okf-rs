@@ -727,6 +727,66 @@ fn standalone_binary_generate_lsp_disambiguates_a_call_via_rust_analyzer() {
     assert!(!callees_lsp_out.contains("functions/src/b/run"));
 }
 
+/// `--check-determinism` runs analysis twice, independently, and diffs
+/// the two renders — on the default tree-sitter-only path (no `--lsp`,
+/// no external process involved) that should always agree, since the
+/// only input is the source text itself. Also confirms it doesn't write
+/// a bundle at all: `--output` is never consulted on this path, so
+/// `knowledge/` shouldn't exist afterward.
+#[test]
+fn standalone_binary_check_determinism_reports_deterministic_on_the_tree_sitter_path() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn callee() {}\npub fn caller() { callee(); }\n",
+    )
+    .unwrap();
+
+    let check = run(&project, &["generate", ".", "--check-determinism"]);
+    assert_success(&check, &["generate --check-determinism"]);
+    let out = stdout_of(&check);
+    assert!(out.contains("Deterministic"), "unexpected output: {out}");
+    assert!(out.contains("4 concepts"), "unexpected output: {out}");
+    assert!(
+        !project.join("knowledge").exists(),
+        "--check-determinism shouldn't write a bundle to the default output directory"
+    );
+}
+
+/// `--check-determinism --enrich` is rejected up front, before any
+/// analysis or network call — enrichment's own non-determinism (a live
+/// endpoint's response isn't guaranteed byte-identical across calls)
+/// would otherwise be reported as a false positive unrelated to what
+/// this flag actually checks.
+#[test]
+fn standalone_binary_check_determinism_rejects_enrich() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let check = run(
+        &project,
+        &["generate", ".", "--check-determinism", "--enrich"],
+    );
+    assert!(
+        !check.status.success(),
+        "expected --check-determinism --enrich to fail"
+    );
+    let err = stderr_of(&check);
+    assert!(
+        err.contains("--check-determinism") && err.contains("--enrich"),
+        "unexpected stderr: {err}"
+    );
+}
+
 /// `okf-rs watch` regenerates the bundle once immediately on startup and
 /// then blocks watching for filesystem changes. This test only exercises
 /// that baseline regenerate — it starts the real subprocess, waits for

@@ -89,6 +89,21 @@ enum Command {
         /// skipped with a warning rather than failing the whole command.
         #[arg(long)]
         dita: Option<PathBuf>,
+        /// Verify determinism instead of writing a bundle: runs analysis
+        /// twice, independently (always bypassing the incremental cache
+        /// both times, regardless of `--no-cache`), renders each to a
+        /// throwaway directory, and diffs them byte-for-byte. Exits
+        /// non-zero and lists every differing file if they're not
+        /// identical — the tree-sitter-only path is expected to always
+        /// pass; combined with `--lsp`, this is the tool for the
+        /// local-vs-cold-CI-runner divergence documented in
+        /// `ROADMAP.md`'s Phase 2 known limitations. Doesn't touch
+        /// `--output` or the real `.okf-cache.json`. Not combinable with
+        /// `--enrich`, since a live endpoint's response isn't guaranteed
+        /// byte-identical across calls and would report unrelated
+        /// non-determinism.
+        #[arg(long)]
+        check_determinism: bool,
     },
     /// Watch a project and keep its OKF bundle up to date as files change.
     /// Runs until interrupted (Ctrl+C). Regenerates once immediately, then
@@ -452,19 +467,31 @@ fn run(command: Command) -> Result<ExitCode> {
             enrich_model,
             enrich_api_key,
             dita,
-        } => cmd_generate(
-            &path,
-            output,
-            no_cache,
-            lsp,
-            EnrichArgs {
-                enrich,
-                base_url: enrich_base_url,
-                model: enrich_model,
-                api_key: enrich_api_key,
-            },
-            dita,
-        ),
+            check_determinism,
+        } => {
+            if check_determinism {
+                if enrich {
+                    anyhow::bail!(
+                        "--check-determinism can't be combined with --enrich: enrichment depends on a live endpoint's response, which isn't guaranteed byte-identical across calls, and would report non-determinism unrelated to what this flag actually checks"
+                    );
+                }
+                cmd_check_determinism(&path, lsp, dita.as_deref())
+            } else {
+                cmd_generate(
+                    &path,
+                    output,
+                    no_cache,
+                    lsp,
+                    EnrichArgs {
+                        enrich,
+                        base_url: enrich_base_url,
+                        model: enrich_model,
+                        api_key: enrich_api_key,
+                    },
+                    dita,
+                )
+            }
+        }
         Command::Watch {
             path,
             output,
@@ -746,6 +773,150 @@ fn cmd_generate(
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `okf-rs generate --check-determinism`: runs the analysis pipeline
+/// twice, independently, and diffs the two renders byte-for-byte instead
+/// of writing a bundle. Neither run touches `--output` or the real
+/// `.okf-cache.json` — each gets its own fresh, throwaway cache and its
+/// own throwaway render directory, both cleaned up on return.
+///
+/// This exists specifically because determinism means different things
+/// on the two paths `generate` can take: the default tree-sitter-only
+/// path has no input but the source text itself, so two runs are
+/// expected to always agree. `--lsp` resolution asks a real language
+/// server, whose answer can depend on that server's own index state in
+/// whatever environment it's running in — see `ROADMAP.md`'s Phase 2
+/// known limitations for the concrete local-vs-cold-CI-runner scenario
+/// this flag exists to let someone actually check for, rather than
+/// discover the hard way in CI.
+fn cmd_check_determinism(
+    path: &std::path::Path,
+    lsp: bool,
+    dita: Option<&std::path::Path>,
+) -> Result<ExitCode> {
+    let project = Project::load(path)?;
+
+    let mut cache1 = okf_analyzer::AnalysisCache::default();
+    let (mut result1, _) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache1, lsp)?;
+    let mut cache2 = okf_analyzer::AnalysisCache::default();
+    let (mut result2, _) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache2, lsp)?;
+
+    if let Some(dita_path) = dita {
+        let (concepts1, _) = okf_dita::import_dita(dita_path)
+            .with_context(|| format!("failed to import DITA corpus at {}", dita_path.display()))?;
+        let (concepts2, _) = okf_dita::import_dita(dita_path)
+            .with_context(|| format!("failed to import DITA corpus at {}", dita_path.display()))?;
+        result1.concepts.extend(concepts1);
+        result2.concepts.extend(concepts2);
+    }
+
+    let run1 = ScratchDir::new("determinism-run1");
+    let run2 = ScratchDir::new("determinism-run2");
+    okf_generator::write_bundle(&result1.concepts, run1.path())?;
+    okf_generator::write_bundle(&result2.concepts, run2.path())?;
+
+    let diffs = diff_dirs(run1.path(), run2.path())?;
+    if diffs.is_empty() {
+        println!(
+            "Deterministic: two independent `generate{}` runs on {} produced byte-identical output ({} concepts).",
+            if lsp { " --lsp" } else { "" },
+            path.display(),
+            result1.concepts.len(),
+        );
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!(
+            "Non-deterministic: {} file(s) differed between two independent `generate{}` runs on {}{}:",
+            diffs.len(),
+            if lsp { " --lsp" } else { "" },
+            path.display(),
+            if lsp {
+                " (expected culprit: language-server index state, not source text — see ROADMAP.md's Phase 2 known limitations)"
+            } else {
+                " (unexpected on the tree-sitter-only path — please report this as a bug)"
+            },
+        );
+        for d in &diffs {
+            println!("  {d}");
+        }
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+/// A throwaway directory under the OS temp dir, removed on drop whether
+/// or not the caller succeeded — the same manual-temp-dir-plus-`Drop`
+/// shape [`WorktreeCheckout`] already uses for `diff`/`impact`/`review`'s
+/// git worktrees, reused here for two disposable bundle renders instead.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new(label: &str) -> Self {
+        ScratchDir(std::env::temp_dir().join(format!(
+            "okf-rs-{label}-{}-{}",
+            std::process::id(),
+            fastrand_suffix()
+        )))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Recursively compares two directory trees for byte-for-byte identity,
+/// returning one human-readable line per relative path that differs
+/// (present on only one side, or with different content) — empty means
+/// the trees are identical.
+fn diff_dirs(a: &std::path::Path, b: &std::path::Path) -> Result<Vec<String>> {
+    let mut a_files = BTreeMap::new();
+    collect_files(a, a, &mut a_files)?;
+    let mut b_files = BTreeMap::new();
+    collect_files(b, b, &mut b_files)?;
+
+    let all_paths: std::collections::BTreeSet<&String> =
+        a_files.keys().chain(b_files.keys()).collect();
+    let mut diffs = Vec::new();
+    for rel in &all_paths {
+        match (a_files.get(*rel), b_files.get(*rel)) {
+            (Some(x), Some(y)) if x == y => {}
+            (Some(_), Some(_)) => {
+                diffs.push(format!("{rel} (content differs between the two runs)"))
+            }
+            (Some(_), None) => diffs.push(format!("{rel} (present in run 1 only)")),
+            (None, Some(_)) => diffs.push(format!("{rel} (present in run 2 only)")),
+            (None, None) => unreachable!("path came from one of the two maps"),
+        }
+    }
+    Ok(diffs)
+}
+
+fn collect_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(root, &path, out)?;
+        } else {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.insert(relative, std::fs::read(&path)?);
+        }
+    }
+    Ok(())
 }
 
 /// Resolves `--enrich-*` flags, falling back to the matching
@@ -1409,5 +1580,79 @@ mod review_tests {
         };
         let markdown = render_review_markdown(&report, "main", "feature");
         assert!(markdown.contains("2 concept(s) changed, affecting 1 other concept(s)"));
+    }
+}
+
+#[cfg(test)]
+mod determinism_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn diff_dirs_is_empty_for_byte_identical_trees() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::create_dir_all(a.path().join("functions")).unwrap();
+        fs::create_dir_all(b.path().join("functions")).unwrap();
+        fs::write(a.path().join("functions/f.md"), "same content\n").unwrap();
+        fs::write(b.path().join("functions/f.md"), "same content\n").unwrap();
+
+        assert!(diff_dirs(a.path(), b.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diff_dirs_reports_content_that_differs_between_the_two_runs() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("f.md"), "run one\n").unwrap();
+        fs::write(b.path().join("f.md"), "run two\n").unwrap();
+
+        let diffs = diff_dirs(a.path(), b.path()).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].contains("f.md"));
+        assert!(diffs[0].contains("content differs"));
+    }
+
+    #[test]
+    fn diff_dirs_reports_a_file_present_on_only_one_side() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("only_in_a.md"), "x\n").unwrap();
+        fs::write(b.path().join("only_in_b.md"), "x\n").unwrap();
+
+        let diffs = diff_dirs(a.path(), b.path()).unwrap();
+        assert_eq!(diffs.len(), 2);
+        assert!(diffs
+            .iter()
+            .any(|d| d.contains("only_in_a.md") && d.contains("run 1 only")));
+        assert!(diffs
+            .iter()
+            .any(|d| d.contains("only_in_b.md") && d.contains("run 2 only")));
+    }
+
+    #[test]
+    fn diff_dirs_walks_nested_subdirectories() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::create_dir_all(a.path().join("functions/nested")).unwrap();
+        fs::create_dir_all(b.path().join("functions/nested")).unwrap();
+        fs::write(a.path().join("functions/nested/f.md"), "a\n").unwrap();
+        fs::write(b.path().join("functions/nested/f.md"), "b\n").unwrap();
+
+        let diffs = diff_dirs(a.path(), b.path()).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].contains("functions/nested/f.md"));
+    }
+
+    #[test]
+    fn scratch_dir_is_removed_on_drop() {
+        let path = {
+            let scratch = ScratchDir::new("determinism-test");
+            fs::create_dir_all(scratch.path()).unwrap();
+            fs::write(scratch.path().join("f.txt"), "x").unwrap();
+            assert!(scratch.path().exists());
+            scratch.path().to_path_buf()
+        };
+        assert!(!path.exists());
     }
 }
