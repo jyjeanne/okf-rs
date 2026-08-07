@@ -278,6 +278,8 @@ Register it with opencode by adding it to `opencode.json`:
 
 or point any other MCP client's stdio transport at the same binary and argument.
 
+Run `okf-mcp <project> --benchmark` instead of registering it with a client to get a local, offline session-level cost report for that project's own bundle: the fixed token cost of registering this server's tool schemas, a sample of real "who calls this?" queries comparing that against a naive grep-and-read baseline, and the resulting break-even point — no LLM call, no client needed. See [`ROADMAP.md`](ROADMAP.md#improvement-plan--ai-native-platform-maturity-community-feedback) for what it does and doesn't measure.
+
 #### Why this reduces token consumption
 
 Without `okf-rs`, an agent answering "who calls `verify_token`?" has to `grep` for the name, then open every file that matches to read enough surrounding code to confirm which hits are real call sites — each opened file costs its full size in context tokens, and a large file costs that every single time it's reopened across a session, including after a context compaction.

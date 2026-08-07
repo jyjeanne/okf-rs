@@ -9,14 +9,20 @@
 //! only, since a stray `println!` would corrupt the stream for whatever
 //! is reading it.
 //!
-//! The server is bound to a single project at startup (its argv[1], or
-//! the current directory), the same way `okf-rs search`/`validate`/
-//! `graph` resolve a bundle: an explicit bundle path wins, otherwise
-//! `okf.toml`'s `output` under the project root, otherwise `knowledge`.
-//! Each tool call re-reads the bundle fresh (via `okf_parser::read_bundle`
-//! or `okf_search::SearchIndex::build`), so it always reflects the latest
-//! `okf-rs generate` run without needing a restart.
+//! The server is bound to a single project at startup (its first non-flag
+//! argument, or the current directory), the same way `okf-rs search`/
+//! `validate`/`graph` resolve a bundle: an explicit bundle path wins,
+//! otherwise `okf.toml`'s `output` under the project root, otherwise
+//! `knowledge`. Each tool call re-reads the bundle fresh (via
+//! `okf_parser::read_bundle` or `okf_search::SearchIndex::build`), so it
+//! always reflects the latest `okf-rs generate` run without needing a
+//! restart.
+//!
+//! `--benchmark` skips the stdio JSON-RPC loop entirely and instead
+//! prints a one-shot local session-level cost report to stdout, then
+//! exits — see [`benchmark`] for what it measures and why.
 
+mod benchmark;
 mod tools;
 
 use anyhow::Result;
@@ -26,14 +32,31 @@ use std::path::PathBuf;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Up to how many sampled concepts `--benchmark` reports on — enough to
+/// average over more than one data point without making a diagnostic
+/// command slow on a large bundle (each sample re-walks the whole project
+/// source tree once, per concept, to compute its naive grep-and-read
+/// cost).
+const BENCHMARK_SAMPLE_SIZE: usize = 5;
+
 fn main() -> Result<()> {
-    let project_root = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let benchmark_mode = args.iter().any(|a| a == "--benchmark");
+    let project_root = args
+        .into_iter()
+        .find(|a| a != "--benchmark")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let project_root = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.clone());
+
+    if benchmark_mode {
+        let report = benchmark::run(&project_root, BENCHMARK_SAMPLE_SIZE)?;
+        print!("{}", report.render());
+        return Ok(());
+    }
+
     let bundle = okf_core::config::resolve_bundle(&project_root, None);
 
     let stdin = io::stdin();
