@@ -10,8 +10,8 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase 2 — Depth & Integration | ✅ Complete (11/11) |
 | Phase 3 — Search, Interop & Intelligence | ✅ Complete (15/15) |
 | Improvement Plan Delivery (competitive gap-closing) | ✅ Complete (7/7) |
+| Improvement Plan (AI-native platform maturity, community feedback) | 💡 Planned (2 in progress) |
 | Phase 4 — Ecosystem | ⬜ Not started |
-| Phase 5 — AI-Native Platform Maturity (Community Improvement Plan) | 💡 Planned (2 in progress) |
 
 ---
 
@@ -187,22 +187,11 @@ A follow-up code review of this delivery (five independent finder passes, plus a
 
 ---
 
-## Phase 4 — Ecosystem
+## Improvement Plan — AI-Native Platform Maturity (Community Feedback)
 
-Both items below build directly on Phase 3's stable `okf-graph`/`okf-query` library API rather than re-implementing graph access.
+Sequenced ahead of Phase 4 — Ecosystem below: this plan makes the graph itself more trustworthy and cheaper for an agent to consume, which is higher-leverage right now than `okf-server`/multi-repo serving, and several Phase 4 items (notably the LSP server) are more valuable once determinism and provenance here are solid.
 
-- [ ] `okf-server`: REST + GraphQL API over the knowledge graph — multi-repository, organization-wide serving
-- [ ] `okf-rs` as an LSP server: hover, go-to-definition, and find-references backed by the OKF bundle, reachable from any LSP-capable editor through one server implementation rather than a bespoke plugin per IDE; dedicated VS Code/JetBrains extensions remain useful afterward as thin wrappers around it
-- [ ] Visualization: interactive graph explorer over `okf-server`
-- [ ] Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
-
-The improvement plan's remaining conditional-GO/no-go items — bundled local embedding runtime, persisted query cache, static SVG export, multi-repo/daemon serving — stay deliberately out of scope; see [`docs/improvement-plan.md`](docs/improvement-plan.md#6-costbenefit-study-and-gonogo) for why each was scored that way.
-
----
-
-## Phase 5 — AI-Native Platform Maturity (Community Improvement Plan)
-
-External review feedback (recorded verbatim in [`docs/feedback/2026-08-community-roadmap-review.md`](docs/feedback/2026-08-community-roadmap-review.md)) on the MCP tool surface, determinism guarantees, and provenance/confidence tracking, distilled into a status-tracked plan below. It doesn't replace [`docs/improvement-plan.md`](docs/improvement-plan.md) (the competitive gap analysis against CodeGraph/code-review-graph, already delivered above) — it's the next layer once that gap is closed: making the graph itself more trustworthy and cheaper for an agent to consume, rather than adding more features to it.
+External review feedback (recorded verbatim in [`docs/feedback/2026-08-community-roadmap-review.md`](docs/feedback/2026-08-community-roadmap-review.md)) on the MCP tool surface, determinism guarantees, and provenance/confidence tracking, distilled into a status-tracked plan below. It doesn't replace [`docs/improvement-plan.md`](docs/improvement-plan.md) (the competitive gap analysis against CodeGraph/code-review-graph, already delivered above) — it's the next layer once that gap is closed.
 
 **Vision:** `okf-rs` should be **deterministic, auditable, Git-native, AI-friendly, CI-ready, and language-independent** — not just another code graph generator, but a transparent, deterministic, Git-native knowledge graph platform for AI coding agents, developer tooling, and CI/CD.
 
@@ -217,7 +206,7 @@ External review feedback (recorded verbatim in [`docs/feedback/2026-08-community
 ### Medium priority
 
 - [ ] 💡 **Better highlight Git-native Markdown as a differentiator** — this is already `okf-rs`'s core architectural bet and the explicit reason it's *not* a CodeGraph/code-review-graph-style SQLite-backed tool (see [`docs/improvement-plan.md`](docs/improvement-plan.md#1-what-the-two-projects-are)); this item is positioning/documentation work (README, landing copy) to make that advantage legible to a first-time visitor, not new engineering.
-- [x] 🚧 **CI validation mode** — `okf-rs validate --project . --ci` already ships (warnings-as-errors gate, exercised in `okf-cli`'s e2e suite) and, together with [`.github/workflows/pr-review.yml`](.github/workflows/pr-review.yml) from the Improvement Plan Delivery above, covers "perfect for GitHub Actions." Still open: an explicit "bundle is up to date with source" check (today `generate` must be re-run manually before `validate --ci`, with nothing to catch a stale, un-regenerated bundle in CI) and provenance-metadata validation, once provenance (above) exists to validate.
+- [ ] 🚧 **CI validation mode** — `okf-rs validate --project . --ci` already ships (warnings-as-errors gate, exercised in `okf-cli`'s e2e suite) and, together with [`.github/workflows/pr-review.yml`](.github/workflows/pr-review.yml) from the Improvement Plan Delivery above, covers "perfect for GitHub Actions." Still open: an explicit "bundle is up to date with source" check (today `generate` must be re-run manually before `validate --ci`, with nothing to catch a stale, un-regenerated bundle in CI) and provenance-metadata validation, once provenance (above) exists to validate.
 - [ ] 💡 **Separate syntax vs. semantic relationship kind** — tag each edge `kind: syntax` (tree-sitter-derived) vs. `kind: semantic` (LSP-resolved), enabling `okf-rs graph`/`search` to filter by it. Builds directly on edge provenance and confidence levels above rather than being independent work — likely delivered together.
 
 ### Long-term
@@ -230,11 +219,24 @@ External review feedback (recorded verbatim in [`docs/feedback/2026-08-community
 
 Exploratory, not yet scheduled: deterministic semantic analysis, incremental graph updates, graph compression, provenance tracking (concrete form TBD by the provenance item above), multi-language project federation, graph federation across repositories, AI-native graph formats, and knowledge-graph diff algorithms (`okf-rs diff` already exists at the concept level — this is the open question of what a genuinely *graph-structural* diff, not just an added/removed/changed concept list, would look like).
 
-### Guiding principles for this phase
+### Guiding principles for this plan
 
 Every item above should improve at least one of: determinism, transparency, auditability, AI efficiency, developer experience, CI/CD integration, or Git friendliness — the same test the rest of this roadmap has applied since Phase 1.
 
 **Not done here, deliberately:** the reviewer's suggestion to convert this into a GitHub Projects roadmap with milestones and linked issues is a good one, but it's a repository/process change (creating GitHub milestones and issues) rather than a documentation change, so it's left for an explicit follow-up request rather than done as a side effect of recording this feedback.
+
+---
+
+## Phase 4 — Ecosystem
+
+Both items below build directly on Phase 3's stable `okf-graph`/`okf-query` library API rather than re-implementing graph access.
+
+- [ ] `okf-server`: REST + GraphQL API over the knowledge graph — multi-repository, organization-wide serving
+- [ ] `okf-rs` as an LSP server: hover, go-to-definition, and find-references backed by the OKF bundle, reachable from any LSP-capable editor through one server implementation rather than a bespoke plugin per IDE; dedicated VS Code/JetBrains extensions remain useful afterward as thin wrappers around it
+- [ ] Visualization: interactive graph explorer over `okf-server`
+- [ ] Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
+
+The improvement plan's remaining conditional-GO/no-go items — bundled local embedding runtime, persisted query cache, static SVG export, multi-repo/daemon serving — stay deliberately out of scope; see [`docs/improvement-plan.md`](docs/improvement-plan.md#6-costbenefit-study-and-gonogo) for why each was scored that way.
 
 ---
 

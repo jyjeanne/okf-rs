@@ -3,7 +3,7 @@
 Raw improvement ideas submitted by a technical reviewer evaluating `okf-rs` for use as a
 knowledge-graph backend for AI coding agents. Kept verbatim here for traceability — the
 distilled, prioritized version tracked against actual delivery lives in
-[`ROADMAP.md`](../../ROADMAP.md#phase-5--ai-native-platform-maturity-community-improvement-plan).
+[`ROADMAP.md`](../../ROADMAP.md#improvement-plan--ai-native-platform-maturity-community-feedback).
 
 Recorded 2026-08-07. Source: external review, unsolicited feedback on the MCP tool surface,
 determinism guarantees, and provenance/confidence tracking.
