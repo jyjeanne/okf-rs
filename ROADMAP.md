@@ -11,6 +11,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase 3 — Search, Interop & Intelligence | ✅ Complete (15/15) |
 | Improvement Plan Delivery (competitive gap-closing) | ✅ Complete (7/7) |
 | Phase 4 — Ecosystem | ⬜ Not started |
+| Phase 5 — AI-Native Platform Maturity (Community Improvement Plan) | 💡 Planned (2 in progress) |
 
 ---
 
@@ -196,6 +197,44 @@ Both items below build directly on Phase 3's stable `okf-graph`/`okf-query` libr
 - [ ] Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
 
 The improvement plan's remaining conditional-GO/no-go items — bundled local embedding runtime, persisted query cache, static SVG export, multi-repo/daemon serving — stay deliberately out of scope; see [`docs/improvement-plan.md`](docs/improvement-plan.md#6-costbenefit-study-and-gonogo) for why each was scored that way.
+
+---
+
+## Phase 5 — AI-Native Platform Maturity (Community Improvement Plan)
+
+External review feedback (recorded verbatim in [`docs/feedback/2026-08-community-roadmap-review.md`](docs/feedback/2026-08-community-roadmap-review.md)) on the MCP tool surface, determinism guarantees, and provenance/confidence tracking, distilled into a status-tracked plan below. It doesn't replace [`docs/improvement-plan.md`](docs/improvement-plan.md) (the competitive gap analysis against CodeGraph/code-review-graph, already delivered above) — it's the next layer once that gap is closed: making the graph itself more trustworthy and cheaper for an agent to consume, rather than adding more features to it.
+
+**Vision:** `okf-rs` should be **deterministic, auditable, Git-native, AI-friendly, CI-ready, and language-independent** — not just another code graph generator, but a transparent, deterministic, Git-native knowledge graph platform for AI coding agents, developer tooling, and CI/CD.
+
+### High priority
+
+- [ ] 💡 **Optimize the MCP API** — collapse today's 18 narrowly-scoped `graph_*`/`search*` tools (each contributing its own JSON schema to every session's system prompt) toward fewer, more generic ones, e.g. a single `explore(relation="callers"|"callees"|"dependencies"|"children"|...)` instead of one tool per relation. Note: the existing `explore` MCP tool (Improvement Plan Delivery, above) already bundles one concept's callers/callees/blast-radius/API-membership/cycle-membership into one *response* — this item is the complementary, still-open half: collapsing the *tool count* itself, which `explore` doesn't do today (it sits alongside `graph_callers`/`graph_callees`/etc., not in place of them). Expected payoff: lower prompt token usage, faster agent init, simpler API surface to maintain.
+- [ ] 💡 **Measure session-level MCP performance** — extend benchmarking beyond single-query latency to MCP initialization cost, prompt token overhead, session break-even point (tokens saved per structural query vs. tokens added by the tool schemas), and a direct cost comparison against RAG-based approaches.
+- [ ] 🚧 **Strengthen deterministic-build guarantees** — tree-sitter parsing is already deterministic and verified as such by dogfooding (Phase 1/2/3). What's still open: a single documented statement of the guarantee (today it's scattered across "Known limitations" notes per phase), improved reproducibility of `--lsp` mode (which depends on external language-server state/indexing, not just source text), and a way to actually *detect* non-deterministic graph generation (e.g. a `--check-determinism` mode that runs `generate` twice and diffs) rather than relying on manual dogfooding checks each time.
+- [ ] 💡 **Record edge provenance** — every relationship (`Calls`/`CalledBy`/`Imports`/...) should carry how it was produced: `resolved_by: tree-sitter` vs. `resolved_by: rust-analyzer` (or another language server), plus resolver version/strategy. Today `okf-rs generate --lsp` silently upgrades some calls from unresolved to resolved with no record of which resolver decided it — this closes that gap, and feeds CI diagnostics and graph auditing.
+- [ ] 💡 **Confidence levels** — tag each relationship `exact` / `semantic` / `inferred` / `unresolved` so an agent can prioritize high-confidence edges over heuristic ones (e.g. `okf-arch`'s pattern/feature detectors are already explicitly "structural signals to review," not guarantees — confidence levels would make that distinction machine-readable instead of prose-only).
+
+### Medium priority
+
+- [ ] 💡 **Better highlight Git-native Markdown as a differentiator** — this is already `okf-rs`'s core architectural bet and the explicit reason it's *not* a CodeGraph/code-review-graph-style SQLite-backed tool (see [`docs/improvement-plan.md`](docs/improvement-plan.md#1-what-the-two-projects-are)); this item is positioning/documentation work (README, landing copy) to make that advantage legible to a first-time visitor, not new engineering.
+- [x] 🚧 **CI validation mode** — `okf-rs validate --project . --ci` already ships (warnings-as-errors gate, exercised in `okf-cli`'s e2e suite) and, together with [`.github/workflows/pr-review.yml`](.github/workflows/pr-review.yml) from the Improvement Plan Delivery above, covers "perfect for GitHub Actions." Still open: an explicit "bundle is up to date with source" check (today `generate` must be re-run manually before `validate --ci`, with nothing to catch a stale, un-regenerated bundle in CI) and provenance-metadata validation, once provenance (above) exists to validate.
+- [ ] 💡 **Separate syntax vs. semantic relationship kind** — tag each edge `kind: syntax` (tree-sitter-derived) vs. `kind: semantic` (LSP-resolved), enabling `okf-rs graph`/`search` to filter by it. Builds directly on edge provenance and confidence levels above rather than being independent work — likely delivered together.
+
+### Long-term
+
+- [ ] 💡 **Real-world benchmarks beyond self-hosting** — every benchmark and dogfooding pass so far (Phases 1–3, Improvement Plan Delivery) runs against `okf-rs`'s own ~850-concept, 18-crate Rust workspace. This item is running the same measurements — generation time, graph size, memory, MCP prompt size, token savings, AI task-completion time, comparison against RAG — against real, large, external open-source projects across Rust, Java, Python, TypeScript, Go, and C#, all of which `okf-rs` already has extractors for.
+- [ ] 💡 **Explainability** — richer, structured explanations for *why* a relationship exists (e.g. "resolved through rust-analyzer symbol resolution" as a rendered reason, not just the edge itself), building directly on edge provenance above.
+- [ ] 🚧 **Continued AI-agent optimization** — token-efficient graph serialization, incremental/lazy graph loading, context-aware extraction, and hybrid graph+RAG workflows. Partially underway already: `search --semantic` (embeddings), `explore` (composite context in one call), and the incremental `.okf-cache.json` (Phase 2) all point this direction; what's still open is applying "incremental"/"lazy" to *serving* a bundle to an agent (today every MCP call re-reads and rebuilds indexes from the full bundle on disk, per `docs/improvement-plan.md`'s own gap analysis), not just to generating it.
+
+### Research topics
+
+Exploratory, not yet scheduled: deterministic semantic analysis, incremental graph updates, graph compression, provenance tracking (concrete form TBD by the provenance item above), multi-language project federation, graph federation across repositories, AI-native graph formats, and knowledge-graph diff algorithms (`okf-rs diff` already exists at the concept level — this is the open question of what a genuinely *graph-structural* diff, not just an added/removed/changed concept list, would look like).
+
+### Guiding principles for this phase
+
+Every item above should improve at least one of: determinism, transparency, auditability, AI efficiency, developer experience, CI/CD integration, or Git friendliness — the same test the rest of this roadmap has applied since Phase 1.
+
+**Not done here, deliberately:** the reviewer's suggestion to convert this into a GitHub Projects roadmap with milestones and linked issues is a good one, but it's a repository/process change (creating GitHub milestones and issues) rather than a documentation change, so it's left for an explicit follow-up request rather than done as a side effect of recording this feedback.
 
 ---
 
