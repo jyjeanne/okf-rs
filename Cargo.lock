@@ -1115,6 +1115,7 @@ dependencies = [
  "okf-query",
  "serde_json",
  "tempfile",
+ "walkdir",
 ]
 
 [[package]]

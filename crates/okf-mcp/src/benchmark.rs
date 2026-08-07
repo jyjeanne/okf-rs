@@ -219,6 +219,11 @@ pub fn run(project_root: &Path, sample_size: usize) -> Result<Report> {
     let schema_bytes = serde_json::to_string(&tools).map(|s| s.len()).unwrap_or(0);
     let schema_tokens = approx_tokens(schema_bytes);
 
+    // A one-shot process (this whole command runs once and exits), so a
+    // throwaway cache is fine -- it's here only because `tools::call`
+    // requires one, not because there's anything to amortize within a
+    // single benchmark run.
+    let cache = crate::cache::BundleCache::new();
     let mut queries = Vec::new();
     for c in sample_concepts(&concepts, sample_size) {
         let (naive_files, naive_bytes) =
@@ -227,6 +232,7 @@ pub fn run(project_root: &Path, sample_size: usize) -> Result<Report> {
             "graph",
             &serde_json::json!({ "relation": "callers", "id": c.id }),
             &bundle,
+            &cache,
         )?;
         queries.push(QueryCost {
             concept_id: c.id.clone(),

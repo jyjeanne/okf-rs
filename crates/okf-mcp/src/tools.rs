@@ -2,6 +2,7 @@
 //! result and the implementation behind `tools/call`, both wrapping the
 //! same `okf-query` layer `okf-rs search`/`graph` use from the CLI.
 
+use crate::cache::BundleCache;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -86,7 +87,15 @@ pub fn list() -> Vec<Value> {
 /// error result (`isError: true`), not a JSON-RPC protocol error — a
 /// missing bundle or unknown concept id is something the calling agent
 /// can react to, not a malformed request.
-pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
+///
+/// Every concept-consuming tool loads concepts through `cache` (an
+/// [`okf_query::load_concepts`] equivalent that reuses the previous
+/// parse when the bundle hasn't changed since — see the `cache` module)
+/// and runs the matching `okf_query::*_from_concepts` query against
+/// them, rather than each tool re-reading the bundle from scratch.
+/// `search`/`search_ranked` are the exception: they build their own
+/// index (exact/BM25) straight from `bundle` and aren't cached here.
+pub fn call(name: &str, arguments: &Value, bundle: &Path, cache: &BundleCache) -> Result<String> {
     match name {
         "search" => okf_query::search(bundle, &arg_str(arguments, "query")?),
         "search_ranked" => okf_query::search_ranked(bundle, &arg_str(arguments, "query")?),
@@ -98,11 +107,17 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
                 .unwrap_or(25) as usize;
             let config = enrich_config_from_env()?;
             let client = okf_enrich::EnrichClient::new(config);
-            okf_query::search_semantic(bundle, &client, &query, limit)
+            let concepts = cache.get_or_load(bundle)?;
+            okf_query::search_semantic_from_concepts(&concepts, &client, &query, limit)
         }
-        "explore" => okf_query::explore(bundle, &arg_str(arguments, "query")?),
-        "coverage" => okf_query::coverage(bundle),
-        "graph" => graph_relation(bundle, arguments),
+        "explore" => {
+            let concepts = cache.get_or_load(bundle)?;
+            okf_query::explore_from_concepts(&concepts, &arg_str(arguments, "query")?)
+        }
+        "coverage" => Ok(okf_query::coverage_from_concepts(
+            &cache.get_or_load(bundle)?,
+        )),
+        "graph" => graph_relation(bundle, arguments, cache),
         other => Err(anyhow!("unknown tool `{other}`")),
     }
 }
@@ -113,31 +128,32 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path) -> Result<String> {
 /// grows by one `enum` variant per new graph query instead of one whole
 /// tool (with its own name and JSON Schema, repeated in every session's
 /// system prompt) per query.
-fn graph_relation(bundle: &Path, arguments: &Value) -> Result<String> {
+fn graph_relation(bundle: &Path, arguments: &Value, cache: &BundleCache) -> Result<String> {
     let relation = arg_str(arguments, "relation")?;
+    let concepts = cache.get_or_load(bundle)?;
     match relation.as_str() {
-        "callers" => okf_query::graph_callers(bundle, &arg_str(arguments, "id")?),
-        "callees" => okf_query::graph_callees(bundle, &arg_str(arguments, "id")?),
-        "path" => okf_query::graph_path(
-            bundle,
+        "callers" => okf_query::graph_callers_from_concepts(&concepts, &arg_str(arguments, "id")?),
+        "callees" => okf_query::graph_callees_from_concepts(&concepts, &arg_str(arguments, "id")?),
+        "path" => okf_query::graph_path_from_concepts(
+            &concepts,
             &arg_str(arguments, "from")?,
             &arg_str(arguments, "to")?,
         ),
-        "explain" => okf_query::explain(
-            bundle,
+        "explain" => okf_query::explain_from_concepts(
+            &concepts,
             &arg_str(arguments, "from")?,
             &arg_str(arguments, "to")?,
         ),
-        "api" => okf_query::graph_api(bundle),
-        "cycles" => okf_query::graph_cycles(bundle),
-        "modules" => okf_query::graph_modules(bundle),
-        "isolated" => okf_query::graph_isolated(bundle),
-        "stats" => okf_query::graph_stats(bundle),
-        "layers" => okf_query::graph_layers(bundle),
-        "domains" => okf_query::graph_domains(bundle),
-        "communities" => okf_query::graph_communities(bundle),
-        "patterns" => okf_query::graph_patterns(bundle),
-        "features" => okf_query::graph_features(bundle),
+        "api" => okf_query::graph_api_from_concepts(&concepts),
+        "cycles" => okf_query::graph_cycles_from_concepts(&concepts),
+        "modules" => okf_query::graph_modules_from_concepts(&concepts),
+        "isolated" => okf_query::graph_isolated_from_concepts(&concepts),
+        "stats" => Ok(okf_query::graph_stats_from_concepts(&concepts)),
+        "layers" => okf_query::graph_layers_from_concepts(&concepts),
+        "domains" => okf_query::graph_domains_from_concepts(&concepts),
+        "communities" => okf_query::graph_communities_from_concepts(&concepts),
+        "patterns" => Ok(okf_query::graph_patterns_from_concepts(&concepts)),
+        "features" => Ok(okf_query::graph_features_from_concepts(&concepts)),
         other => Err(anyhow!(
             "unknown relation `{other}` for the graph tool — expected one of: callers, callees, path, explain, api, cycles, modules, isolated, stats, layers, domains, communities, patterns, features"
         )),
@@ -200,10 +216,24 @@ mod tests {
         dir
     }
 
+    /// A fresh, empty cache for each test -- these tests care about
+    /// `call`'s behavior, not the cache's, so every call here is
+    /// necessarily a cache miss. `cache.rs` has its own dedicated tests
+    /// for hit/invalidation behavior.
+    fn cache() -> BundleCache {
+        BundleCache::new()
+    }
+
     #[test]
     fn search_finds_a_concept_by_title() {
         let dir = sample_bundle();
-        let text = call("search", &json!({ "query": "decode_jwt" }), dir.path()).unwrap();
+        let text = call(
+            "search",
+            &json!({ "query": "decode_jwt" }),
+            dir.path(),
+            &cache(),
+        )
+        .unwrap();
         assert!(text.contains("decode_jwt"));
         assert!(text.contains("functions/auth/decode_jwt"));
     }
@@ -215,6 +245,7 @@ mod tests {
             "search_ranked",
             &json!({ "query": "decode_jwt" }),
             dir.path(),
+            &cache(),
         )
         .unwrap();
         assert!(text.contains("functions/auth/decode_jwt"));
@@ -223,15 +254,40 @@ mod tests {
     #[test]
     fn graph_layers_domains_patterns_and_features_run_without_error() {
         let dir = sample_bundle();
+        let cache = cache();
         // No Package concepts in this fixture -- both should report the
         // clear "none found" text, not error.
-        let layers = call("graph", &json!({ "relation": "layers" }), dir.path()).unwrap();
+        let layers = call(
+            "graph",
+            &json!({ "relation": "layers" }),
+            dir.path(),
+            &cache,
+        )
+        .unwrap();
         assert!(layers.contains("No packages found"));
-        let domains = call("graph", &json!({ "relation": "domains" }), dir.path()).unwrap();
+        let domains = call(
+            "graph",
+            &json!({ "relation": "domains" }),
+            dir.path(),
+            &cache,
+        )
+        .unwrap();
         assert!(domains.contains("No packages found"));
-        let patterns = call("graph", &json!({ "relation": "patterns" }), dir.path()).unwrap();
+        let patterns = call(
+            "graph",
+            &json!({ "relation": "patterns" }),
+            dir.path(),
+            &cache,
+        )
+        .unwrap();
         assert_eq!(patterns, "No design patterns detected");
-        let features = call("graph", &json!({ "relation": "features" }), dir.path()).unwrap();
+        let features = call(
+            "graph",
+            &json!({ "relation": "features" }),
+            dir.path(),
+            &cache,
+        )
+        .unwrap();
         assert_eq!(
             features,
             "No REST endpoints, database models, or event-flow participants detected"
@@ -245,7 +301,13 @@ mod tests {
         std::env::remove_var("OKF_ENRICH_BASE_URL");
         std::env::remove_var("OKF_ENRICH_MODEL");
         let dir = sample_bundle();
-        let err = call("search_semantic", &json!({ "query": "token" }), dir.path()).unwrap_err();
+        let err = call(
+            "search_semantic",
+            &json!({ "query": "token" }),
+            dir.path(),
+            &cache(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("OKF_ENRICH_BASE_URL"));
     }
 
@@ -256,6 +318,7 @@ mod tests {
             "explore",
             &json!({ "query": "functions/auth/decode_jwt" }),
             dir.path(),
+            &cache(),
         )
         .unwrap();
         assert!(text.starts_with("functions/auth/decode_jwt — Rust Function"));
@@ -266,10 +329,12 @@ mod tests {
     #[test]
     fn graph_callers_and_callees_round_trip() {
         let dir = sample_bundle();
+        let cache = cache();
         let callers = call(
             "graph",
             &json!({ "relation": "callers", "id": "functions/auth/decode_jwt" }),
             dir.path(),
+            &cache,
         )
         .unwrap();
         assert!(callers.contains("functions/auth/verify_token"));
@@ -278,6 +343,7 @@ mod tests {
             "graph",
             &json!({ "relation": "callees", "id": "functions/auth/verify_token" }),
             dir.path(),
+            &cache,
         )
         .unwrap();
         assert!(callees.contains("functions/auth/decode_jwt"));
@@ -290,6 +356,7 @@ mod tests {
             "graph",
             &json!({ "relation": "path", "from": "functions/auth/verify_token", "to": "functions/auth/decode_jwt" }),
             dir.path(),
+            &cache(),
         )
         .unwrap();
         assert_eq!(
@@ -305,6 +372,7 @@ mod tests {
             "graph",
             &json!({ "relation": "explain", "from": "functions/auth/verify_token", "to": "functions/auth/decode_jwt" }),
             dir.path(),
+            &cache(),
         )
         .unwrap();
         assert!(text.starts_with("functions/auth/verify_token"));
@@ -319,6 +387,7 @@ mod tests {
             "graph",
             &json!({ "relation": "callers", "id": "functions/nope" }),
             dir.path(),
+            &cache(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("no concept with id"));
@@ -327,21 +396,27 @@ mod tests {
     #[test]
     fn missing_required_argument_is_a_clear_error() {
         let dir = sample_bundle();
-        let err = call("search", &json!({}), dir.path()).unwrap_err();
+        let err = call("search", &json!({}), dir.path(), &cache()).unwrap_err();
         assert!(err.to_string().contains("missing required argument"));
     }
 
     #[test]
     fn unknown_relation_on_the_graph_tool_is_a_clear_error() {
         let dir = sample_bundle();
-        let err = call("graph", &json!({ "relation": "bogus" }), dir.path()).unwrap_err();
+        let err = call(
+            "graph",
+            &json!({ "relation": "bogus" }),
+            dir.path(),
+            &cache(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("unknown relation `bogus`"));
     }
 
     #[test]
     fn unknown_tool_is_a_clear_error() {
         let dir = sample_bundle();
-        let err = call("not_a_tool", &json!({}), dir.path()).unwrap_err();
+        let err = call("not_a_tool", &json!({}), dir.path(), &cache()).unwrap_err();
         assert!(err.to_string().contains("unknown tool"));
     }
 
@@ -351,8 +426,29 @@ mod tests {
             "graph",
             &json!({ "relation": "api" }),
             Path::new("/nonexistent"),
+            &cache(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("okf-rs generate"));
+    }
+
+    #[test]
+    fn repeated_calls_against_the_same_bundle_reuse_the_cache() {
+        // An end-to-end check (through `call`, not `BundleCache`
+        // directly) that a chatty session -- several tool calls against
+        // an unchanged bundle -- really does only parse once. Complements
+        // `cache::tests`, which checks the cache in isolation.
+        let dir = sample_bundle();
+        let cache = cache();
+        call("coverage", &json!({}), dir.path(), &cache).unwrap();
+        call("graph", &json!({ "relation": "api" }), dir.path(), &cache).unwrap();
+        call(
+            "explore",
+            &json!({ "query": "functions/auth/decode_jwt" }),
+            dir.path(),
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(cache.load_count_for_tests(), 1);
     }
 }

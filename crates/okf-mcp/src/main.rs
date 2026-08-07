@@ -13,16 +13,20 @@
 //! argument, or the current directory), the same way `okf-rs search`/
 //! `validate`/`graph` resolve a bundle: an explicit bundle path wins,
 //! otherwise `okf.toml`'s `output` under the project root, otherwise
-//! `knowledge`. Each tool call re-reads the bundle fresh (via
-//! `okf_parser::read_bundle` or `okf_search::SearchIndex::build`), so it
-//! always reflects the latest `okf-rs generate` run without needing a
-//! restart.
+//! `knowledge`. Concept-consuming tool calls go through a per-process
+//! [`cache::BundleCache`] rather than re-parsing the bundle from scratch
+//! every time — see that module's docs for the freshness guarantee this
+//! still makes: a `generate` run between two calls is always picked up,
+//! without needing a restart, the same as before the cache existed.
+//! `search`/`search_ranked` build their own index straight from the
+//! bundle path and aren't cached.
 //!
 //! `--benchmark` skips the stdio JSON-RPC loop entirely and instead
 //! prints a one-shot local session-level cost report to stdout, then
 //! exits — see [`benchmark`] for what it measures and why.
 
 mod benchmark;
+mod cache;
 mod tools;
 
 use anyhow::Result;
@@ -58,6 +62,7 @@ fn main() -> Result<()> {
     }
 
     let bundle = okf_core::config::resolve_bundle(&project_root, None);
+    let cache = cache::BundleCache::new();
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -81,7 +86,7 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-        if let Some(response) = handle_message(&request, &bundle) {
+        if let Some(response) = handle_message(&request, &bundle, &cache) {
             writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
             stdout.flush()?;
         }
@@ -90,8 +95,14 @@ fn main() -> Result<()> {
 }
 
 /// Dispatches one JSON-RPC message, returning the response to write (or
-/// `None` for notifications, which never get one).
-fn handle_message(request: &Value, bundle: &std::path::Path) -> Option<Value> {
+/// `None` for notifications, which never get one). `cache` amortizes
+/// bundle parsing across calls within this one server process — see the
+/// `cache` module for the freshness guarantee it makes.
+fn handle_message(
+    request: &Value,
+    bundle: &std::path::Path,
+    cache: &cache::BundleCache,
+) -> Option<Value> {
     let method = request.get("method")?.as_str()?;
     let id = request.get("id").cloned();
 
@@ -110,7 +121,7 @@ fn handle_message(request: &Value, bundle: &std::path::Path) -> Option<Value> {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match tools::call(name, &arguments, bundle) {
+            match tools::call(name, &arguments, bundle, cache) {
                 Ok(text) => Ok(json!({
                     "content": [{ "type": "text", "text": text }],
                     "isError": false,
@@ -158,6 +169,7 @@ mod tests {
         let response = handle_message(
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
             std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
         )
         .unwrap();
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
@@ -169,6 +181,7 @@ mod tests {
         let response = handle_message(
             &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
             std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
         );
         assert!(response.is_none());
     }
@@ -178,6 +191,7 @@ mod tests {
         let response = handle_message(
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "bogus" }),
             std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
         )
         .unwrap();
         assert_eq!(response["error"]["code"], -32601);
@@ -185,6 +199,7 @@ mod tests {
         let response = handle_message(
             &json!({ "jsonrpc": "2.0", "method": "notifications/bogus" }),
             std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
         );
         assert!(response.is_none());
     }
@@ -194,6 +209,7 @@ mod tests {
         let response = handle_message(
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
             std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
         )
         .unwrap();
         let names: Vec<&str> = response["result"]["tools"]
@@ -220,6 +236,7 @@ mod tests {
         let response = handle_message(
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
             std::path::Path::new("knowledge"),
+            &cache::BundleCache::new(),
         )
         .unwrap();
         let graph_tool = response["result"]["tools"]
@@ -275,6 +292,7 @@ mod tests {
                 "params": { "name": "search", "arguments": { "query": "verify_token" } },
             }),
             dir.path(),
+            &cache::BundleCache::new(),
         )
         .unwrap();
 
@@ -294,6 +312,7 @@ mod tests {
                 "params": { "name": "graph", "arguments": { "relation": "api" } },
             }),
             std::path::Path::new("/nonexistent/knowledge-bundle"),
+            &cache::BundleCache::new(),
         )
         .unwrap();
 
