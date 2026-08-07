@@ -400,6 +400,22 @@ enum GraphQuery {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+    /// Explain *why* a relationship exists between two concepts: which
+    /// kind it is, and a human-readable reason derived from its
+    /// provenance/confidence (e.g. "resolved via Tree-sitter's
+    /// unambiguous name match" or "resolved by asking rust-analyzer
+    /// which definition this call site resolves to"). Falls back to
+    /// explaining the shortest call path, hop by hop, when there's no
+    /// single direct relationship.
+    Explain {
+        from: String,
+        to: String,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
     /// Report each package's layer in the layered architecture derived
     /// from the package dependency graph (layer 0 = depends on nothing
     /// else in the bundle).
@@ -1255,6 +1271,15 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
         } => {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::graph_path(&bundle, &from, &to))
+        }
+        GraphQuery::Explain {
+            from,
+            to,
+            bundle,
+            project,
+        } => {
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::explain(&bundle, &from, &to))
         }
         GraphQuery::Layers { bundle, project } => {
             let bundle = resolve_query_bundle(bundle, &project);

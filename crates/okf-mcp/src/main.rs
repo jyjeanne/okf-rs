@@ -238,6 +238,7 @@ mod tests {
             "callers",
             "callees",
             "path",
+            "explain",
             "api",
             "cycles",
             "modules",

@@ -948,6 +948,30 @@ fn resolve_link(from_relative: &str, link: &str) -> Option<String> {
     Some(components.join("/"))
 }
 
+/// Splits a concept file's content into per-section chunks, breaking at
+/// every line that starts with a top-level `# Heading` (not `##` or
+/// deeper) — `okf-generator` renders each relation kind as its own such
+/// section (`# Calls`, `# Called by`, `# Imports`, ...), so this mirrors
+/// that structure without needing to know the specific heading names.
+/// Content before the first heading (frontmatter, or a file with no
+/// headings at all) is its own leading section.
+fn split_into_sections(content: &str) -> Vec<&str> {
+    let mut boundaries = vec![0];
+    let mut pos = 0;
+    for line in content.split_inclusive('\n') {
+        if line.starts_with("# ") && pos != 0 {
+            boundaries.push(pos);
+        }
+        pos += line.len();
+    }
+    boundaries.push(content.len());
+    boundaries.dedup();
+    boundaries
+        .windows(2)
+        .map(|w| &content[w[0]..w[1]])
+        .collect()
+}
+
 fn check_links_and_collect(
     files: &[ScannedFile],
     known_paths: &HashSet<&str>,
@@ -956,32 +980,43 @@ fn check_links_and_collect(
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
     for file in files {
         let mut resolved_targets = Vec::new();
-        let mut seen_targets: HashSet<String> = HashSet::new();
-        for link in extract_local_links(&file.content) {
-            match resolve_link(&file.relative, &link) {
-                Some(target) if known_paths.contains(target.as_str()) => {
-                    if !seen_targets.insert(target.clone()) {
+        // "Already linked" is tracked per section (`# Calls`, `# Called
+        // by`, ...), not per whole file: two functions that call each
+        // other legitimately link to the same target twice on one page —
+        // once under `# Calls`, once under `# Called by` — which is two
+        // distinct facts (a mutual-call relationship), not a duplicate
+        // worth warning about. A real duplicate (the same target linked
+        // twice within the *same* section) still warns.
+        for section in split_into_sections(&file.content) {
+            let mut seen_targets: HashSet<String> = HashSet::new();
+            for link in extract_local_links(section) {
+                match resolve_link(&file.relative, &link) {
+                    Some(target) if known_paths.contains(target.as_str()) => {
+                        if !seen_targets.insert(target.clone()) {
+                            report.issues.push(ValidationIssue {
+                                severity: Severity::Warning,
+                                file: file.relative.clone(),
+                                message: format!("redundant link to `{target}` (already linked earlier in this file)"),
+                            });
+                        }
+                        resolved_targets.push(target);
+                    }
+                    Some(target) => {
                         report.issues.push(ValidationIssue {
-                            severity: Severity::Warning,
+                            severity: Severity::Error,
                             file: file.relative.clone(),
-                            message: format!("redundant link to `{target}` (already linked earlier in this file)"),
+                            message: format!(
+                                "dangling link to `{target}` (resolved from `{link}`)"
+                            ),
                         });
                     }
-                    resolved_targets.push(target);
-                }
-                Some(target) => {
-                    report.issues.push(ValidationIssue {
-                        severity: Severity::Error,
-                        file: file.relative.clone(),
-                        message: format!("dangling link to `{target}` (resolved from `{link}`)"),
-                    });
-                }
-                None => {
-                    report.issues.push(ValidationIssue {
-                        severity: Severity::Error,
-                        file: file.relative.clone(),
-                        message: format!("link `{link}` escapes the bundle root"),
-                    });
+                    None => {
+                        report.issues.push(ValidationIssue {
+                            severity: Severity::Error,
+                            file: file.relative.clone(),
+                            message: format!("link `{link}` escapes the bundle root"),
+                        });
+                    }
                 }
             }
         }
@@ -1382,6 +1417,92 @@ mod tests {
             .issues
             .iter()
             .any(|i| { i.severity == Severity::Warning && i.message.contains("redundant link") }));
+    }
+
+    /// Found by real-world benchmarking (August 2026): two functions that
+    /// call each other (`a` calls `b`, `b` calls `a` back) legitimately
+    /// link to the same target twice on one page -- once under `# Calls`,
+    /// once under `# Called by` -- which used to trip the redundant-link
+    /// check even though they're two distinct facts, not a duplicate.
+    #[test]
+    fn mutual_calls_across_different_sections_are_not_flagged_as_redundant() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [a](functions/a.md)\n- [b](functions/b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\n---\n\n# Calls\n\n- [b](b.md)\n\n# Called by\n\n- [b](b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\n---\n\n# Calls\n\n- [a](a.md)\n\n# Called by\n\n- [a](a.md)\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("redundant link")),
+            "a mutual-call pair shouldn't be flagged as a redundant link: {:?}",
+            report.issues
+        );
+    }
+
+    /// The same target linked twice *within one section* is still a real
+    /// duplicate worth flagging -- the section-awareness above narrows
+    /// what counts as "already linked", it doesn't disable the check.
+    #[test]
+    fn a_genuine_duplicate_within_one_section_is_still_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [a](functions/a.md)\n- [b](functions/b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\n---\n\n# Calls\n\n- [b](b.md)\n- [b again](b.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.severity == Severity::Warning && i.message.contains("redundant link")));
+    }
+
+    #[test]
+    fn split_into_sections_breaks_only_on_top_level_headings() {
+        assert_eq!(split_into_sections("no headings at all\n").len(), 1);
+
+        let two = split_into_sections("preamble\n# Calls\n\n- [x](x.md)\n");
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0], "preamble\n");
+        assert!(two[1].starts_with("# Calls"));
+
+        let two_headings =
+            split_into_sections("# Calls\n\n- [x](x.md)\n# Called by\n\n- [y](y.md)\n");
+        assert_eq!(two_headings.len(), 2);
+        assert!(two_headings[0].starts_with("# Calls"));
+        assert!(two_headings[1].starts_with("# Called by"));
+
+        // A "##" subheading is deliberately not a section boundary --
+        // only a top-level "# " heading is, matching what okf-generator
+        // actually renders (one level of heading per relation kind).
+        let with_sub = split_into_sections("# Calls\n\n## Not a real subheading\n- [x](x.md)\n");
+        assert_eq!(with_sub.len(), 1);
     }
 
     #[test]

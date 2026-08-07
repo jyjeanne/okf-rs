@@ -588,6 +588,78 @@ pub fn graph_path(bundle: &Path, from: &str, to: &str) -> Result<String> {
     }
 }
 
+/// Explains *why* a relationship exists between two concepts: which kind
+/// it is, and a human-readable reason derived from its provenance (see
+/// [`okf_parser::Relationship::reason`]) — the "Explainability" roadmap
+/// item, built directly on the edge provenance/confidence it names as
+/// its foundation. Looks for a direct relationship first, checking both
+/// concepts' own relationship lists (a kind like `Calls`/`CalledBy` is
+/// only ever recorded on one side by the extractor that produced it, so
+/// `from`'s list alone isn't guaranteed to have it even when a real edge
+/// exists in the other direction). When there's no single direct edge,
+/// falls back to explaining the shortest call *path* between them, one
+/// hop at a time.
+pub fn explain(bundle: &Path, from: &str, to: &str) -> Result<String> {
+    let concepts = load_concepts(bundle)?;
+    let graph = okf_graph::Graph::build(&concepts);
+    require_concept(&graph, from)?;
+    require_concept(&graph, to)?;
+
+    if let Some(text) = direct_relationship_explanation(&graph, from, to) {
+        return Ok(text);
+    }
+
+    match graph.shortest_call_path(from, to) {
+        Some(steps) if steps.len() >= 2 => Ok(steps
+            .windows(2)
+            .map(|pair| {
+                direct_relationship_explanation(&graph, pair[0], pair[1]).unwrap_or_else(|| {
+                    format!(
+                        "{}\n    |\n    v\n{}\n\nReason: part of the shortest call path, but no single direct relationship recorded between these two specifically.",
+                        pair[0], pair[1]
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")),
+        _ => Ok(format!(
+            "No direct relationship or call path found between `{from}` and `{to}`"
+        )),
+    }
+}
+
+/// Looks for a relationship directly connecting `a` and `b`, in either
+/// direction, and renders it as an explanation if found. Checks `a`'s
+/// own relationships for one targeting `b` first, then `b`'s for one
+/// targeting `a` — the actual direction of whichever edge is found (not
+/// necessarily `a -> b`) is what gets rendered, so e.g. a `CalledBy`
+/// edge only recorded on the callee's page still explains correctly.
+fn direct_relationship_explanation(
+    graph: &okf_graph::Graph<'_>,
+    a: &str,
+    b: &str,
+) -> Option<String> {
+    if let Some(concept) = graph.get(a) {
+        if let Some(rel) = concept.relationships.iter().find(|r| r.target == b) {
+            return Some(render_explanation(a, rel, b));
+        }
+    }
+    if let Some(concept) = graph.get(b) {
+        if let Some(rel) = concept.relationships.iter().find(|r| r.target == a) {
+            return Some(render_explanation(b, rel, a));
+        }
+    }
+    None
+}
+
+fn render_explanation(source: &str, rel: &okf_parser::Relationship, target: &str) -> String {
+    format!(
+        "{source}\n    |\n    {}\n    v\n{target}\n\nReason: {}",
+        rel.kind.label().to_lowercase(),
+        rel.reason()
+    )
+}
+
 /// Each package's position in the layered architecture derived from the
 /// package dependency graph (`okf_arch::layers`) — layer 0 is a package
 /// with no dependency on any other package in the bundle. Unlike
@@ -941,6 +1013,87 @@ mod tests {
             text,
             "functions/auth/verify_token -> functions/auth/decode_jwt"
         );
+    }
+
+    #[test]
+    fn explain_renders_a_direct_edge_with_its_reason() {
+        let dir = sample_bundle();
+        let text = explain(
+            dir.path(),
+            "functions/auth/verify_token",
+            "functions/auth/decode_jwt",
+        )
+        .unwrap();
+        assert!(text.starts_with("functions/auth/verify_token"));
+        assert!(text.contains("calls"));
+        assert!(text.contains("functions/auth/decode_jwt"));
+        assert!(text.contains("Reason:"));
+        assert!(text.contains("Tree-sitter"));
+    }
+
+    #[test]
+    fn explain_works_regardless_of_which_order_the_ids_are_given_in() {
+        let dir = sample_bundle();
+        // Asked in the reverse order, it finds `decode_jwt`'s own
+        // `called_by: verify_token` entry -- a real, correctly-recorded
+        // relationship in its own right (the same underlying fact,
+        // recorded from the other side), rendered in *that* direction
+        // rather than forcing a canonical one that doesn't match what's
+        // actually on either concept's page.
+        let text = explain(
+            dir.path(),
+            "functions/auth/decode_jwt",
+            "functions/auth/verify_token",
+        )
+        .unwrap();
+        assert!(text.starts_with("functions/auth/decode_jwt"));
+        assert!(text.contains("called by"));
+        assert!(text.contains("functions/auth/verify_token"));
+        assert!(text.contains("Reason:"));
+    }
+
+    #[test]
+    fn explain_names_the_real_lsp_server_for_a_semantically_resolved_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - target: functions/b\n      resolved_by: rust-analyzer\n      confidence: semantic\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\n---\n\nbody\n",
+        );
+
+        let text = explain(dir.path(), "functions/a", "functions/b").unwrap();
+        assert!(text.contains("rust-analyzer"));
+        assert!(text.contains("more than one candidate"));
+    }
+
+    #[test]
+    fn explain_reports_clearly_when_there_is_no_relationship_or_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/b.md",
+            "---\ntype: Rust Function\ntitle: b\nresource: src/lib.rs#L2\n---\n\nbody\n",
+        );
+
+        let text = explain(dir.path(), "functions/a", "functions/b").unwrap();
+        assert!(text.contains("No direct relationship or call path found"));
+    }
+
+    #[test]
+    fn explain_unknown_concept_id_is_a_clear_error() {
+        let dir = sample_bundle();
+        let err = explain(dir.path(), "functions/nope", "functions/auth/decode_jwt").unwrap_err();
+        assert!(err.to_string().contains("no concept with id"));
     }
 
     #[test]

@@ -321,6 +321,28 @@ impl Relationship {
             confidence: Confidence::Exact,
         }
     }
+
+    /// A human-readable explanation of how this edge was determined —
+    /// the "Explainability" roadmap item, built directly on the
+    /// `resolved_by`/`confidence` provenance above. Purely derived from
+    /// this relationship's own fields, so the phrasing stays consistent
+    /// everywhere a reason is shown (CLI, MCP) rather than being
+    /// duplicated per caller.
+    pub fn reason(&self) -> String {
+        match (self.resolved_by.as_str(), self.confidence) {
+            ("tree-sitter", Confidence::Exact) => {
+                "Resolved via Tree-sitter's unambiguous, project-wide name match — exactly one candidate in the project shared this name, so no further resolution was needed.".to_string()
+            }
+            (server, Confidence::Semantic) => {
+                format!(
+                    "Resolved by asking {server} which definition this call site actually resolves to, since more than one candidate shared this name and Tree-sitter's own name-matching alone couldn't disambiguate it."
+                )
+            }
+            (resolver, confidence) => {
+                format!("Resolved by {resolver} ({confidence} confidence).")
+            }
+        }
+    }
 }
 
 /// The location of a concept in the source tree.
@@ -464,6 +486,47 @@ impl Concept {
         });
 
         let mut seen: HashMap<String, usize> = HashMap::new();
+        // `.../index.md` is a reserved filename: `okf-generator` writes
+        // one per top-level kind directory (`functions/index.md`,
+        // `modules/index.md`, ...) as a plain navigational listing with
+        // no frontmatter, and the OKF spec names `index.md` generally as
+        // the convention for progressive disclosure. A concept whose own
+        // id happens to end in `/index` — a method literally named
+        // `index` (common for a Rust `impl Index for ...`), or a
+        // module/function literally named `index` (extremely common for
+        // a web framework's entry-point handler) — collides with that
+        // reserved name. Found by real-world benchmarking (August 2026)
+        // against ripgrep: a `HiArgs::index()` method produced a concept
+        // file whose path collided with the `index.md` convention,
+        // rejected by `okf-validator`'s "only the bundle-root index.md
+        // may carry frontmatter" check — confirmed, and reproduced
+        // independently against a small Python fixture too. Nothing in
+        // the current generator actually overwrites a *sibling*
+        // navigation page for a nested directory like `HiArgs/` (only
+        // kind-root directories get one), but the same id shape at a
+        // kind-root itself (a bare top-level function/module literally
+        // named `index`) would collide directly with `functions/index.md`
+        // itself, written *after* concept files in `write_bundle` — the
+        // concept silently overwritten by the generic listing, with
+        // nothing to detect it. Pre-seeding `seen` with one occurrence
+        // for every id ending in `/index` reuses the exact "-2", "-3",
+        // ... bump logic below for this reserved slot, so the first real
+        // `index`-named concept anywhere in the bundle becomes
+        // `.../index-2`, leaving every `.../index.md` itself as the
+        // navigation page it's meant to be. Matched case-insensitively,
+        // same as the duplicate-id check below, since ids become file
+        // paths on filesystems that may not distinguish case either way.
+        for concept in concepts.iter() {
+            if concept
+                .id
+                .rsplit('/')
+                .next()
+                .is_some_and(|last| last.eq_ignore_ascii_case("index"))
+            {
+                seen.entry(concept.id.to_ascii_lowercase()).or_insert(1);
+            }
+        }
+
         for idx in order {
             let count = seen
                 .entry(concepts[idx].id.to_ascii_lowercase())
@@ -473,6 +536,90 @@ impl Concept {
                 concepts[idx].id = format!("{}-{}", concepts[idx].id, count);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod disambiguate_tests {
+    use super::*;
+
+    fn concept(id: &str, file: &str, line: usize) -> Concept {
+        Concept {
+            id: id.to_string(),
+            kind: ConceptKind::Function,
+            language: Language::Rust,
+            name: id.rsplit('/').next().unwrap_or(id).to_string(),
+            qualified_name: id.to_string(),
+            description: None,
+            location: Location {
+                file: file.to_string(),
+                start_line: line,
+                end_line: line,
+            },
+            signature: None,
+            tags: Vec::new(),
+            is_public: true,
+            generated_at: None,
+            relationships: Vec::new(),
+        }
+    }
+
+    /// Found by real-world benchmarking (August 2026) against ripgrep: a
+    /// `HiArgs::index()` method's own concept produced a file at
+    /// `HiArgs/index.md`, colliding with the reserved `index.md`
+    /// navigation-page convention (`okf-validator` rejects it: "only the
+    /// bundle-root index.md may carry frontmatter").
+    #[test]
+    fn a_concept_literally_named_index_is_bumped_to_avoid_the_navigation_page() {
+        let mut concepts = vec![concept("functions/HiArgs/index", "a.rs", 1)];
+        Concept::disambiguate_ids(&mut concepts);
+        assert_eq!(concepts[0].id, "functions/HiArgs/index-2");
+    }
+
+    #[test]
+    fn a_concept_not_named_index_is_left_alone() {
+        let mut concepts = vec![concept("functions/HiArgs/matcher", "a.rs", 1)];
+        Concept::disambiguate_ids(&mut concepts);
+        assert_eq!(concepts[0].id, "functions/HiArgs/matcher");
+    }
+
+    /// Ids become file paths on filesystems that may not distinguish
+    /// case (the same reasoning the genuine-duplicate-id check below
+    /// already applies) -- a concept named `Index` collides with
+    /// `index.md` just as surely as one named `index` would.
+    #[test]
+    fn the_reserved_index_name_is_matched_case_insensitively() {
+        let mut concepts = vec![concept("functions/HiArgs/Index", "a.rs", 1)];
+        Concept::disambiguate_ids(&mut concepts);
+        assert_eq!(concepts[0].id, "functions/HiArgs/Index-2");
+    }
+
+    /// Two concepts genuinely named `index` in the same directory chain
+    /// through the reserved slot correctly: the first becomes `-2` (the
+    /// navigation page itself is the implicit "occurrence 1"), the
+    /// second `-3` -- the existing duplicate-id bump logic, unmodified.
+    #[test]
+    fn two_concepts_both_named_index_chain_past_the_reserved_slot() {
+        let mut concepts = vec![
+            concept("functions/HiArgs/index", "a.rs", 1),
+            concept("functions/HiArgs/index", "a.rs", 5),
+        ];
+        Concept::disambiguate_ids(&mut concepts);
+        assert_eq!(concepts[0].id, "functions/HiArgs/index-2");
+        assert_eq!(concepts[1].id, "functions/HiArgs/index-3");
+    }
+
+    /// `index` in a *different* directory is an unrelated reserved slot
+    /// -- disambiguating one doesn't touch the other.
+    #[test]
+    fn index_collisions_in_different_directories_are_independent() {
+        let mut concepts = vec![
+            concept("functions/HiArgs/index", "a.rs", 1),
+            concept("functions/OtherType/index", "b.rs", 1),
+        ];
+        Concept::disambiguate_ids(&mut concepts);
+        assert_eq!(concepts[0].id, "functions/HiArgs/index-2");
+        assert_eq!(concepts[1].id, "functions/OtherType/index-2");
     }
 }
 
@@ -507,5 +654,46 @@ mod relationship_tests {
         assert_eq!(rel.target_display, "b");
         assert_eq!(rel.resolved_by, "tree-sitter");
         assert_eq!(rel.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn reason_for_a_tree_sitter_resolved_edge_names_the_resolver() {
+        let rel = Relationship::new(RelationKind::Calls, "functions/b", "b");
+        let reason = rel.reason();
+        assert!(reason.contains("Tree-sitter"));
+        assert!(reason.contains("unambiguous"));
+    }
+
+    #[test]
+    fn reason_for_an_lsp_resolved_edge_names_the_real_server() {
+        let rel = Relationship {
+            kind: RelationKind::Calls,
+            target: "functions/b".to_string(),
+            target_display: "b".to_string(),
+            resolved_by: "rust-analyzer".to_string(),
+            confidence: Confidence::Semantic,
+        };
+        let reason = rel.reason();
+        assert!(reason.contains("rust-analyzer"));
+        assert!(reason.contains("more than one candidate"));
+    }
+
+    #[test]
+    fn reason_falls_back_to_a_generic_sentence_for_an_unexpected_combination() {
+        // Not a combination anything in this workspace actually produces
+        // today (every resolver is either "tree-sitter"/Exact or a real
+        // LSP server name/Semantic) -- but a hand-edited bundle could
+        // carry one, and `reason()` should still say something sensible
+        // rather than panic or return an empty string.
+        let rel = Relationship {
+            kind: RelationKind::Calls,
+            target: "functions/b".to_string(),
+            target_display: "b".to_string(),
+            resolved_by: "hand-edited".to_string(),
+            confidence: Confidence::Exact,
+        };
+        let reason = rel.reason();
+        assert!(reason.contains("hand-edited"));
+        assert!(reason.contains("exact"));
     }
 }

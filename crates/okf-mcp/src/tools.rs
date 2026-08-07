@@ -62,18 +62,18 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "graph",
-            "description": "Unified entry point for graph-topology and architecture queries — one tool covering what used to be a dozen-plus single-purpose graph_* tools, to keep the schema this server contributes to every session's system prompt small. Pick a `relation`:\n- callers (needs `id`): concepts that directly call `id`\n- callees (needs `id`): concepts `id` directly calls\n- path (needs `from`, `to`): shortest call path between two concept ids\n- api: the project's public API surface (public functions, methods, and types)\n- cycles: groups of concepts that call each other in a cycle (direct or mutual recursion)\n- modules: cross-module call dependency edges\n- isolated: concepts with no Calls/CalledBy edge in either direction — candidates for dead code or unresolved calls\n- stats: concept-kind breakdown, relationship edge counts by kind, and connected components of the Calls/CalledBy graph\n- layers: each package's layer in the package dependency graph (layer 0 = depends on no other package in the bundle)\n- domains: clusters of packages that depend on each other, directly or transitively\n- communities: package communities from modularity-optimization detection — finer-grained than domains\n- patterns: design patterns (Builder, Singleton, Factory, Visitor) detected via structural/naming heuristics — a signal to review, not a guarantee\n- features: REST endpoints, database models, and event-flow participants detected via naming heuristics (e.g. a *Controller-named type, an emit_*-named function)",
+            "description": "Unified entry point for graph-topology and architecture queries — one tool covering what used to be a dozen-plus single-purpose graph_* tools, to keep the schema this server contributes to every session's system prompt small. Pick a `relation`:\n- callers (needs `id`): concepts that directly call `id`\n- callees (needs `id`): concepts `id` directly calls\n- path (needs `from`, `to`): shortest call path between two concept ids\n- explain (needs `from`, `to`): why a relationship exists between two concepts — the relation kind plus a human-readable reason derived from its provenance (e.g. \"resolved via Tree-sitter's unambiguous name match\", or which language server resolved it); falls back to explaining the shortest call path hop-by-hop when there's no single direct relationship\n- api: the project's public API surface (public functions, methods, and types)\n- cycles: groups of concepts that call each other in a cycle (direct or mutual recursion)\n- modules: cross-module call dependency edges\n- isolated: concepts with no Calls/CalledBy edge in either direction — candidates for dead code or unresolved calls\n- stats: concept-kind breakdown, relationship edge counts by kind, and connected components of the Calls/CalledBy graph\n- layers: each package's layer in the package dependency graph (layer 0 = depends on no other package in the bundle)\n- domains: clusters of packages that depend on each other, directly or transitively\n- communities: package communities from modularity-optimization detection — finer-grained than domains\n- patterns: design patterns (Builder, Singleton, Factory, Visitor) detected via structural/naming heuristics — a signal to review, not a guarantee\n- features: REST endpoints, database models, and event-flow participants detected via naming heuristics (e.g. a *Controller-named type, an emit_*-named function)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "relation": {
                         "type": "string",
-                        "enum": ["callers", "callees", "path", "api", "cycles", "modules", "isolated", "stats", "layers", "domains", "communities", "patterns", "features"],
+                        "enum": ["callers", "callees", "path", "explain", "api", "cycles", "modules", "isolated", "stats", "layers", "domains", "communities", "patterns", "features"],
                         "description": "Which graph query to run",
                     },
                     "id": { "type": "string", "description": "Concept id — required for relation=callers|callees (find it with the search tool)" },
-                    "from": { "type": "string", "description": "Starting concept id — required for relation=path" },
-                    "to": { "type": "string", "description": "Target concept id — required for relation=path" },
+                    "from": { "type": "string", "description": "Starting concept id — required for relation=path|explain" },
+                    "to": { "type": "string", "description": "Target concept id — required for relation=path|explain" },
                 },
                 "required": ["relation"],
             },
@@ -123,6 +123,11 @@ fn graph_relation(bundle: &Path, arguments: &Value) -> Result<String> {
             &arg_str(arguments, "from")?,
             &arg_str(arguments, "to")?,
         ),
+        "explain" => okf_query::explain(
+            bundle,
+            &arg_str(arguments, "from")?,
+            &arg_str(arguments, "to")?,
+        ),
         "api" => okf_query::graph_api(bundle),
         "cycles" => okf_query::graph_cycles(bundle),
         "modules" => okf_query::graph_modules(bundle),
@@ -134,7 +139,7 @@ fn graph_relation(bundle: &Path, arguments: &Value) -> Result<String> {
         "patterns" => okf_query::graph_patterns(bundle),
         "features" => okf_query::graph_features(bundle),
         other => Err(anyhow!(
-            "unknown relation `{other}` for the graph tool — expected one of: callers, callees, path, api, cycles, modules, isolated, stats, layers, domains, communities, patterns, features"
+            "unknown relation `{other}` for the graph tool — expected one of: callers, callees, path, explain, api, cycles, modules, isolated, stats, layers, domains, communities, patterns, features"
         )),
     }
 }
@@ -291,6 +296,20 @@ mod tests {
             text,
             "functions/auth/verify_token -> functions/auth/decode_jwt"
         );
+    }
+
+    #[test]
+    fn graph_explain_renders_the_relation_and_a_reason() {
+        let dir = sample_bundle();
+        let text = call(
+            "graph",
+            &json!({ "relation": "explain", "from": "functions/auth/verify_token", "to": "functions/auth/decode_jwt" }),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(text.starts_with("functions/auth/verify_token"));
+        assert!(text.contains("calls"));
+        assert!(text.contains("Reason:"));
     }
 
     #[test]
