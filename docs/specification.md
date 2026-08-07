@@ -202,6 +202,8 @@ Validate that a generated (or hand-edited) bundle is a conformant OKF bundle bef
 
 Validation is deterministic and fully offline, and is designed to run in CI (e.g. `okf-rs validate --ci`) to fail a pipeline on a broken or stale bundle.
 
+**Caveat: this determinism guarantee covers `validate` itself and the default, tree-sitter-only `generate` path — not a bundle produced with `generate --lsp`.** `--lsp` resolves ambiguous calls by querying a real language server (`rust-analyzer`, `pyright-langserver`, ...), whose answer can depend on that server's index state in the environment it ran in, not on source text alone. A bundle generated with `--lsp` on one machine and regenerated with `generate --no-cache` on a different (e.g. colder) CI runner can legitimately disagree on some `Calls` edges with no underlying source change — and `validate --ci` cannot yet distinguish that from a real regression (see [`ROADMAP.md`'s Phase 2 known limitations](../ROADMAP.md#phase-2--depth--integration-) for the concrete scenario, and the "Record edge provenance"/"Strengthen deterministic-build guarantees" items in the [AI-native platform maturity improvement plan](../ROADMAP.md#improvement-plan--ai-native-platform-maturity-community-feedback) for the planned fix). Until then, generate the bundle CI validates with the same `--lsp`/no-`--lsp` flags, in the same kind of environment, every time.
+
 ---
 
 ### Bundle Diffing
