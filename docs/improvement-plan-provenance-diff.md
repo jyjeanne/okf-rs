@@ -33,7 +33,7 @@ then only phases the genuinely new remainder.
 | CI validation mode | ✅ Shipped | `okf-rs validate --ci`, `generate --check-determinism`, `generate --check-fresh` |
 | **Provenance-aware graph diff** (source vs. resolver vs. semantic change classes) | ❌ Not shipped | `okf_analyzer::diff`'s `relationship_set` *deliberately strips* `resolved_by`/`confidence` before comparing (`crates/okf-analyzer/src/lib.rs:383-389`) — today's diff is provenance-*blind* in both directions: it can't flag a resolver-only change, and a provenance change alone never appears in a diff at all |
 | **`okf-rs diff --ci` policy with source/resolver/metadata classification** | ❌ Not shipped | `okf-rs diff` has no `--ci` flag or exit-code policy today (only `validate --ci` does) |
-| **Artifact-level reproducibility metadata** (generator name/version, source revision) | ❌ Not shipped | `Concept::generated_at` exists but is *always* `None` by deliberate design (the doc comment at `crates/okf-parser/src/lib.rs:417-419` says stamping it "would make the bundle non-reproducible... violating the project's determinism principle") — there is no bundle-root manifest at all |
+| **Artifact-level reproducibility metadata** (generator name/version, source revision) | ❌ Not shipped | `Concept::generated_at` exists but is *always* `None` by deliberate design (see `crates/okf-parser/src/lib.rs`'s doc comment on that field: stamping it "would make the bundle non-reproducible... violating the project's determinism principle") — the bundle-root `index.md`'s existing `okf_version` frontmatter has no generator/revision fields yet |
 | **Specialized-vs-consolidated tool-*selection-accuracy*** benchmark (real model calls) | ❌ Not shipped | The consolidation above was already decided and shipped; nothing measured whether a model actually picks the right `relation` value as reliably as it picked the right tool name before |
 | Golden fixture dataset for provenance/diff/MCP | ❌ Not shipped | No `tests/fixtures/` directory exists in this repo today |
 
@@ -72,8 +72,9 @@ alongside `resolved_by`/`confidence`, the same shape those two already took):
 ```rust
 // crates/okf-parser/src/lib.rs
 pub struct Relationship {
-    pub target: String,
     pub kind: RelationKind,
+    pub target: String,
+    pub target_display: String,       // unchanged
     pub resolved_by: String,          // unchanged
     pub confidence: Confidence,       // unchanged
     pub resolver_version: Option<String>,  // new
@@ -136,12 +137,15 @@ Integration:
 
 ### Objective
 
-Make `okf_analyzer::diff` (and `okf-rs diff`) distinguish three change classes instead of one
-undifferentiated "changed," using data Phase A now makes available.
+Make `okf_analyzer::diff` (and `okf-rs diff`) distinguish source-level, resolver-level, and
+confidence-level relationship changes instead of one undifferentiated "changed," using data
+Phase A now makes available.
 
 ### Why this is the real gap, precisely
 
-`relationship_set` (`crates/okf-analyzer/src/lib.rs:383-389`) already exists specifically to make
+`relationship_set` (`crates/okf-analyzer/src/lib.rs:391-397`, as of Phase A — line numbers here
+drift with every phase that touches these files; treat them as pointers at time of writing, not
+a promise) already exists specifically to make
 `diff` ignore relationship *ordering* — but it does that by projecting each relationship down to
 `(RelationKind, target)`, which also erases `resolved_by`/`confidence`/`resolver_version`
 entirely. That's the right behavior for *today's* `diff` (a plain concept-level added/removed/
@@ -171,22 +175,41 @@ pub enum RelationshipChangeKind {
     /// The resolved target (or relation kind) actually differs — a real
     /// structural rewire, regardless of what produced either side.
     SourceChange,
-    /// Same (kind, target) set; only `resolved_by`/`resolver_version`
-    /// differs (target unchanged, resolver/version changed).
+    /// Same (kind, target) set; `resolved_by` and/or `resolver_version`
+    /// differ, `confidence` does not — the pure "same tool, different
+    /// version" case.
     ResolverChange,
-    /// Same (kind, target) set; only `confidence` differs (e.g. an edge
-    /// tree-sitter left unresolved that `--lsp` then resolved, or vice
-    /// versa across two runs) without a resolver-version change alongside it.
+    /// Same (kind, target) set; `confidence` differs, `resolved_by`/
+    /// `resolver_version` do not — e.g. an edge `--lsp` disambiguation
+    /// touched without changing which server resolved it.
     ConfidenceChange,
+    /// Same (kind, target) set; `resolved_by`/`resolver_version` *and*
+    /// `confidence` both differ together — the case a source-level change
+    /// elsewhere in the project causes (a previously-unambiguous call
+    /// becoming ambiguous, or vice versa, flips a call between
+    /// `tree-sitter`/`exact` and a real resolver/`semantic` even though
+    /// *this* edge's own target never moved). Kept distinct from
+    /// `ResolverChange`/`ConfidenceChange` rather than folded into either
+    /// — a CI policy that only asks "did resolver metadata change" can
+    /// still treat this the same way it treats `ResolverChange` (see
+    /// Phase C), but the classification itself shouldn't hide that two
+    /// fields moved together, not one.
+    ProvenanceChange,
 }
 ```
 
 `ChangedConcept` (already exists at `crates/okf-analyzer/src/lib.rs`) gains a
-`relationship_changes: Vec<(RelationKind, &str /* target */, RelationshipChangeKind)>`-shaped
-field — computed by a new `diff_relationships(before: &Concept, after: &Concept)` helper that
-pairs relationships by `(kind, target)` (the same key `relationship_set` already uses to detect
-presence) and classifies each pair, plus any relationship present on only one side as
-`SourceChange` (an add/remove is unambiguously structural, provenance or not).
+`relationship_changes: Vec<(RelationKind, String /* target */, RelationshipChangeKind)>`-shaped
+field (owned `String`, not a borrowed `&str` — `ChangedConcept`/`DiffReport`/`ImpactReport`/
+`ImpactedConcept` and every consumer of them, `impact()`/`review()`/`explain()`/the CLI/MCP
+rendering, are fully owned and lifetime-free today; a borrowed field here would force a lifetime
+parameter through all of them for no real benefit, since `Relationship::target` is already an
+owned `String` one clone away) — computed by a new `diff_relationships(before: &Concept, after:
+&Concept)` helper that pairs relationships by `(kind, target)` (the same key `relationship_set`
+already uses to detect presence) and classifies each pair, plus any relationship present on only
+one side as `SourceChange` (an add/remove is unambiguously structural, provenance or not).
+`Unchanged` pairs are computed but filtered out before being stored in `relationship_changes` —
+the field only ever holds entries worth reporting.
 
 A concept's overall `ChangeKind` stays exactly as it is today (`Added`/`Removed`/`Changed` —
 `diff`'s existing top-level classification, which callers like `impact()`/`review` already
@@ -215,6 +238,13 @@ right minimal cases:
    pairs (target genuinely differs — this is scenario 3's shape, not scenario 4's, even though the
    resolver version also happens to differ; a diff that reported this as only a resolver change
    would hide a real call-graph rewire).
+6. **Ambiguity newly introduced, same real target** — `Foo -> Bar` (`tree-sitter`/`exact`) becomes
+   `Foo -> Bar` (`rust-analyzer`/`semantic`, some `resolver_version`) — the shape a same-named
+   function being added elsewhere in the project produces: the target didn't move, but the call
+   that used to be unambiguous now needs `--lsp` to resolve. → exactly one `ProvenanceChange` entry
+   for the `(Calls, Bar)` pair — not `ResolverChange` (confidence also moved) and not
+   `ConfidenceChange` (resolved_by also moved). This is the scenario the plan's first draft had no
+   variant for at all.
 
 Plus:
 - Order-independence: reuses the existing `diff_ignores_relationship_order` test's fixture shape,
@@ -228,6 +258,10 @@ Plus:
   `ResolverChange`, never as a remove-then-add pair.
 - A genuine target rewire is always `SourceChange`, even when the resolver/version also happens
   to differ alongside it (scenario 5) — resolver metadata never masks a real structural change.
+- `resolved_by`/`resolver_version` and `confidence` changing *together* on an unchanged target
+  (scenario 6) is always `ProvenanceChange`, never silently absorbed into `ResolverChange` or
+  `ConfidenceChange` — every `(kind, target)` pair present on both sides lands in exactly one of
+  the five variants, with no combination of field changes left unclassified.
 - Every existing `okf_analyzer::diff`/`impact`/`review` test passes unchanged — this phase adds
   detail, it doesn't change what `Added`/`Removed`/`Changed`/blast-radius/risk scoring report.
 
@@ -276,6 +310,32 @@ resolver_changes = "warn"   # "warn" (default) | "fail" | "ignore"
 confidence_changes = "ignore"  # "warn" | "fail" | "ignore" (default)
 ```
 
+`ProvenanceChange` (Phase B) follows `resolver_changes`' policy, not a third setting of its own —
+it's a resolver-provenance change (that it also touches `confidence` doesn't make it less of one),
+and `--ci` users shouldn't need a fourth knob for a combination case.
+
+**Counting unit, spelled out precisely** (the thing the reviewer's own worked example leaves
+implicit): each category counts *edges*, not concepts, and a concept's own addition/removal counts
+as edges too, one per relationship it carries — never as "1" regardless of how many relationships
+that concept has:
+
+- `SOURCE CHANGES` = (every relationship on an added or removed *concept*, since a concept that
+  no longer exists can't have unaffected edges) + (every `RelationshipChangeKind::SourceChange`
+  entry within a `Changed` concept). A concept added/removed with zero relationships of its own
+  still counts as `1` toward `SOURCE CHANGES` — the concept's own existence is the change, not an
+  edge — so the floor per added/removed concept is 1, plus one more per relationship it carries.
+- `RESOLVER CHANGES` = every `RelationshipChangeKind::ResolverChange` **and** `ProvenanceChange`
+  entry within a `Changed` concept (added/removed concepts have no "resolver changed" — either the
+  target changed too, which is `SOURCE CHANGES`' job, or the concept doesn't exist to compare).
+- `CONFIDENCE CHANGES` = every `RelationshipChangeKind::ConfidenceChange` entry within a `Changed`
+  concept.
+
+This means the worked example above (`❌ SOURCE CHANGES: 3`) could be one added concept with two
+relationships (1 + 2 = 3), or three separate single-relationship source rewires across different
+`Changed` concepts, or any other combination summing to 3 — the number is a total, not a count of
+distinct concepts, and the CLI's non-`--ci` human-readable output (unaffected by this phase, see
+below) is where a reader goes to see which.
+
 Added/removed concepts and `RelationshipChangeKind::SourceChange` are **always** failures under
 `--ci` — this isn't configurable, matching the reviewer's own table ("Added source edge → 1",
 non-negotiable) and this project's existing stance that `validate --ci` treats warnings as errors
@@ -323,63 +383,97 @@ already documents and avoids.
 ### The determinism tension, and how this phase resolves it
 
 `Concept::generated_at` exists in the schema today and is **always `None`** — the doc comment at
-`crates/okf-parser/src/lib.rs:417-419` is explicit that stamping it with wall-clock time "would
-make the bundle non-reproducible for identical source, violating the project's determinism
-principle." The reviewer's Phase 8 proposes exactly that field, at the artifact level
-(`generated_at: "2026-08-14T12:00:00Z"`) plus a generator name/version and source revision. Adding
-it naively would break `generate --check-determinism` (two runs a second apart would "disagree")
-and `generate --check-fresh` (every re-run would report staleness from the timestamp alone,
-regardless of whether the source changed) — a real regression on two features this project
-already shipped specifically to *guarantee* determinism.
+`crates/okf-parser/src/lib.rs:427-433` (as of Phase A) is explicit that stamping it with
+wall-clock time "would make the bundle non-reproducible for identical source, violating the
+project's determinism principle." The reviewer's Phase 8 proposes exactly that field, at the
+artifact level (`generated_at: "2026-08-14T12:00:00Z"`) plus a generator name/version and source
+revision. Adding it naively would break `generate --check-determinism` (two runs a second apart
+would "disagree") and `generate --check-fresh` (every re-run would report staleness from the
+timestamp alone, regardless of whether the source changed) — a real regression on two features
+this project already shipped specifically to *guarantee* determinism.
 
-This phase ships the parts that are genuinely reproducible and skips the one that isn't:
+This phase ships the parts that are genuinely reproducible and skips the one that isn't — and
+does it by extending a mechanism that already exists rather than inventing a new one.
+**`okf-generator::write_bundle` already writes an `okf_version` YAML frontmatter block into the
+bundle-root `index.md`** (`crates/okf-generator/src/lib.rs:310-314`), and `okf_validator::
+check_index_frontmatter` (`crates/okf-validator/src/lib.rs:471`) already permits — and is the
+*only* place that permits — an arbitrary YAML mapping there, validating just the `okf_version` key
+and ignoring anything else present. That's precisely artifact-level metadata's natural home,
+already shipped and already validated; a separate `manifest.md` file was this plan's first draft
+and is deliberately **not** what ships, because every other `.md` file in a bundle (anything that
+isn't `index.md`) is required by `okf_validator::check_frontmatter`
+(`crates/okf-validator/src/lib.rs:145`) to carry a recognized concept `type:`, which a
+metadata-only file doesn't have — a `manifest.md` would be a validator error under the very
+tooling this plan wants to keep clean:
 
 ```rust
-// new: crates/okf-generator/src/manifest.rs (or a field on the existing writer)
-pub struct BundleManifest {
-    pub generator_name: String,     // "okf-rs"
-    pub generator_version: String,  // env!("CARGO_PKG_VERSION")
-    pub source_revision: Option<String>,  // `git rev-parse HEAD` if run inside a git repo, else None
-    pub schema_version: String,     // matches whatever the OKF spec's schema-version already is
+// crates/okf-generator/src/lib.rs — extending the existing root-index frontmatter writer
+struct RootIndexFrontmatter {
+    okf_version: &'static str,       // unchanged, already written today
+    generator_name: &'static str,    // new: "okf-rs"
+    generator_version: &'static str, // new: env!("CARGO_PKG_VERSION")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_revision: Option<String>, // new: `git rev-parse HEAD` when known — see below
 }
 ```
 
-Written once, to `<bundle>/manifest.md` (or a new top-level YAML/JSON sidecar, consistent with
-`index.md`'s existing bundle-root-only special status) — deliberately **no `generated_at`
-timestamp field at all**. `generator_version` and `schema_version` are exactly reproducible
-across two runs on identical source; `source_revision` is exactly reproducible given the same
-`HEAD` (and is genuinely useful CI-audit information the reviewer's example also names). A
-timestamp is not reproducible by definition and isn't needed for the two stated use cases
-(auditability, "which okf-rs built this") — CI's own build metadata (job timestamp, commit SHA)
-already covers "when," and duplicating it inside the artifact only invites exactly the
-determinism regression this project has twice now (`--check-determinism`, `--check-fresh`)
-built dedicated tooling to prevent.
+Deliberately **no `generated_at` timestamp field at all**. `generator_version` and `okf_version`
+are exactly reproducible across two runs on identical source; `source_revision` is exactly
+reproducible given the same `HEAD` (and is genuinely useful CI-audit information the reviewer's
+example also names). A timestamp is not reproducible by definition and isn't needed for the two
+stated use cases (auditability, "which okf-rs built this") — CI's own build metadata (job
+timestamp, commit SHA) already covers "when," and duplicating it inside the artifact only invites
+exactly the determinism regression this project has twice now (`--check-determinism`,
+`--check-fresh`) built dedicated tooling to prevent.
+
+**`source_revision`'s "dirty working tree" case needs new logic, not an existing pattern to
+match.** An earlier draft of this phase claimed this "matches `okf-rs diff`'s own existing
+git-optional posture" — checked against the code, that's not accurate: every git interaction
+`diff`/`impact`/`review` make (`crates/okf-cli/src/main.rs:1389-1447`, `WorktreeCheckout`/
+`git_repo_root`) is either "no git repo at all" (a real existing fallback) or a fresh
+`git worktree add --detach <ref>` checkout of a named ref, which is clean by construction — there
+is no "is the working tree dirty" check anywhere in this codebase to match. `generate` (what this
+phase actually instruments) commonly runs against the live working tree, which genuinely can be
+dirty, so this phase needs to add that check itself — `git diff --quiet HEAD` (exit code 0 =
+clean) alongside the existing `git rev-parse HEAD` — rather than pointing at nonexistent
+precedent. `source_revision` is `None` for "not a git repo" (existing precedent) and — the new
+part — the commit SHA is still recorded even when the tree is dirty, since "generated from commit
+`X`, possibly with local modifications" is more useful to a CI reader than silently omitting the
+revision entirely; a bundle generated from a dirty tree is exactly the case CI-audit tooling most
+wants a `source_revision` to still point at *something*.
 
 ### Tests
 
-- `okf-generator`: `BundleManifest` is written and round-trips through a parser the same way
-  `read_bundle` already reconstructs concepts — `generator_version`/`schema_version`/
-  `source_revision` all survive write-then-read.
+- `okf-generator`: the extended root-`index.md` frontmatter round-trips through a parser the same
+  way `read_bundle`/`check_index_frontmatter` already read it back — `okf_version`/
+  `generator_name`/`generator_version`/`source_revision` all survive write-then-read, and
+  `okf-validator` reports no new issues on the result (confirming this doesn't reopen the
+  `manifest.md` collision the design section above ruled out).
 - `okf-cli`: `generate --check-determinism` still reports "Deterministic" on a fixture repo after
-  this phase ships (the manifest is either excluded from the byte-diff, or — the stronger,
-  preferred guarantee — genuinely identical across both runs since nothing in it varies run to
-  run for the same `HEAD`/binary).
+  this phase ships (the root `index.md`'s new fields are either excluded from the byte-diff, or —
+  the stronger, preferred guarantee — genuinely identical across both runs since nothing in them
+  varies run to run for the same `HEAD`/binary).
 - `okf-cli`: two clean-checkout `generate` runs of the same commit, in two separate temp
-  directories, produce byte-identical manifests (not just byte-identical concept files) —
+  directories, produce a byte-identical root `index.md` (not just byte-identical concept files) —
   this is the actual reproducibility claim, tested directly rather than assumed.
-- `source_revision` is `None` (not an error) when run outside a git repository, or against a
-  dirty working tree it can't attribute to one commit (matches `okf-rs diff`'s own existing
-  git-optional posture).
+- `source_revision` is `None` (not an error) only when run outside a git repository — the new
+  `git diff --quiet HEAD` dirty check (see above) still records `HEAD`'s SHA when the tree is
+  dirty, it doesn't fall back to `None`; a dedicated test covers the dirty-but-still-recorded case
+  specifically, since it's the one behavior this phase can't borrow from existing precedent.
 
 ### Acceptance criteria
 
-- The manifest is generated, survives serialization, and its `source_revision` is exactly the
-  commit `generate` actually ran against.
+- The root `index.md`'s frontmatter carries `okf_version` (unchanged) plus the new
+  `generator_name`/`generator_version`/`source_revision`, survives serialization, and
+  `source_revision` is exactly the commit `generate` actually ran against (dirty tree or not).
+- No second bundle-root file is introduced — `check_frontmatter`'s "every non-index `.md` file
+  needs a concept `type:`" rule is never at risk of firing on generated metadata, because there's
+  no new file for it to fire on.
 - `generate --check-determinism` and `generate --check-fresh` are both unaffected — no new false
   positive from this phase, verified directly rather than assumed given the risk called out above.
 - No wall-clock timestamp is added to the bundle anywhere this phase touches — this is a
   deliberate, documented scope cut from the reviewer's proposal, not an oversight, and is called
-  out as such in the manifest module's own doc comment so a future contributor doesn't
+  out as such in the frontmatter-writing code's own doc comment so a future contributor doesn't
   "helpfully" add one back.
 
 ---
@@ -409,8 +503,11 @@ open question below) that:
 1. Defines a fixed set of representative natural-language questions, one per `graph` relation
    (mirroring the reviewer's own examples): "Who calls `Foo`?", "What does `Foo` call?", "What's
    the shortest path from `Foo` to `Bar`?", "Is `Foo` part of the public API?", "Does the call
-   graph have any cycles?", etc. — 13 questions, one per relation the consolidated tool now
-   exposes.
+   graph have any cycles?", etc. — **14** questions, one per relation the consolidated tool exposes
+   today (`callers`, `callees`, `path`, `explain`, `api`, `cycles`, `modules`, `isolated`, `stats`,
+   `layers`, `domains`, `communities`, `patterns`, `features` — see `crates/okf-mcp/src/tools.rs`'s
+   `relation` enum), not 13: `explain` (the "Explainability" roadmap item) shipped *after* the
+   `graph_*` consolidation, so it's a genuinely new relation, not one of the 13 that got merged.
 2. For the **consolidated** design (what's actually shipped): feeds each question, plus the real
    `graph` tool's schema from `tools/list`, to a model and records which `relation` value it
    chose, whether it needed a follow-up/retry, and the final answer's correctness against the
@@ -418,9 +515,15 @@ open question below) that:
 3. For the **specialized** design (reconstructed, not live): feeds the same question against a
    hand-built schema list of the 13 old `graph_*` tool names/descriptions (recoverable from git
    history — `okf-mcp` 0.2.x's `tools/list` output, or the ROADMAP's own enumeration of the old
-   tool names) to the same model, recording which tool name it picked.
+   tool names) to the same model, recording which tool name it picked — **with one explicit
+   carve-out**: `explain` has no historical specialized-tool counterpart to reconstruct (no
+   `graph_explain` ever existed), so the 14th question is scored for the consolidated design only,
+   footnoted as "no specialized-era equivalent" in the report rather than either dropped silently
+   or answered against an invented tool name that would undermine the "reconstructed, not
+   invented" methodology the rest of this phase relies on.
 4. Reports, per design: tool/relation-selection accuracy, number of calls needed to reach a
-   correct final answer, total tokens (schema + call + response), and latency.
+   correct final answer, total tokens (schema + call + response), and latency — 13 comparable
+   questions plus 1 consolidated-only question, not 14 directly comparable ones.
 
 ### Open question this phase should resolve, not assume
 
@@ -551,14 +654,16 @@ Every phase above is additive to an already-optional, already-backward-compatibl
 - Phase B: `RelationshipChangeKind` is new output detail on `ChangedConcept`; nothing about
   `DiffReport`'s existing `added`/`removed`/`changed`/`ChangeKind` shape changes.
 - Phase C: `--ci` is a new, opt-in flag on `okf-rs diff`; bare `okf-rs diff` output is unchanged.
-- Phase D: the manifest is a new file; a bundle without one (every bundle generated before this
-  phase) is still a completely valid bundle to every other command — `read_bundle` never required
-  a manifest to exist, and this phase shouldn't make it start requiring one.
+- Phase D: the new frontmatter fields are additions to the root `index.md`'s existing, already-
+  optional `okf_version` block; a bundle whose root `index.md` predates this phase (no
+  `generator_name`/`generator_version`/`source_revision` keys) is still a completely valid bundle
+  to every other command — `check_index_frontmatter` already tolerates unknown/missing keys there.
 - Phase E/F: new tooling and fixtures, touching nothing existing consumes.
 
 An `okf-rs validate` run against a pre-Phase-A bundle reports exactly what it reports today —
-"absence of provenance/resolver-version/manifest means unknown, never invalid" is already this
-project's established posture (see the existing bare-string-target backward-compatibility path in
+"absence of provenance/resolver-version/reproducibility metadata means unknown, never invalid" is
+already this project's established posture (see the existing bare-string-target
+backward-compatibility path in
 `okf_parser::bundle::parse_relationship_entry`), and every phase here follows it, not just states it.
 
 ---
