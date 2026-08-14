@@ -8,6 +8,10 @@ concrete proposed model, unit tests, and acceptance criteria, plus a cost/benefi
 — because the point of that review was to make this progressively implementable and
 automatically verifiable, not another prose roadmap.
 
+**Delivery status:** tracked in
+[`ROADMAP.md`](../ROADMAP.md#improvement-plan--provenance-depth-graph-diff--mcp-tool-selection).
+Phase A (resolver version) has shipped; Phases B-F are still as proposed below.
+
 ## 0. What's already shipped, and what's actually new here
 
 The reviewer's phases 1-3 and 9 largely restate work this project already delivered in the
@@ -23,7 +27,7 @@ then only phases the genuinely new remainder.
 | Provenance survives serialization/deserialization, backward-compatible | ✅ Shipped | `okf_parser::bundle::parse_relationship_entry` accepts both the old bare-string target and the new `{target, resolved_by, confidence}` mapping — every bundle ever generated stays valid unmodified |
 | Provenance-metadata validation | ✅ Shipped | `okf_validator::check_relationship_provenance` — an unrecognized `confidence` or empty `resolved_by` is a validator error |
 | Resolver identity tracking | ✅ Shipped | `resolved_by` carries the resolver's own binary name (`rust-analyzer`, `pyright-langserver`) for an `--lsp`-resolved edge, `tree-sitter` otherwise |
-| **Resolver *version* tracking** | ❌ Not shipped | `resolved_by` has no accompanying version field — a `rust-analyzer` 1.88 edge and a `rust-analyzer` 1.89 edge are indistinguishable today |
+| **Resolver *version* tracking** | ✅ Shipped (this plan's Phase A) | `Relationship::resolver_version`, from `okf_lsp::LspClient::server_version()` — see `ROADMAP.md` |
 | Consolidate specialized `graph_*` tools | ✅ Shipped | 13 tools collapsed into one `graph(relation=...)` tool, `okf-mcp` 0.3.0 — [`crates/okf-mcp/src/tools.rs`](../crates/okf-mcp/src/tools.rs) |
 | MCP fixed-cost / break-even benchmark | ✅ Shipped | `okf-mcp --benchmark` — schema tokens, naive-vs-MCP token comparison, break-even query count — [`crates/okf-mcp/src/benchmark.rs`](../crates/okf-mcp/src/benchmark.rs) |
 | CI validation mode | ✅ Shipped | `okf-rs validate --ci`, `generate --check-determinism`, `generate --check-fresh` |
@@ -52,7 +56,7 @@ worked example (`rust-analyzer` 1.88 → 1.89 producing the same edge) matters.
 
 ---
 
-## 2. Phase A — Resolver version
+## 2. Phase A — Resolver version ✅ Shipped
 
 ### Objective
 
@@ -568,7 +572,7 @@ table marks ❌, versus how speculative it is.
 
 | # | Item | Effort | Benefit | Risk | Decision |
 |---|---|---|---|---|---|
-| A | Resolver version (`Relationship.resolver_version`) | S | High — the one concrete missing fact behind the reviewer's own worked example; nothing downstream (diff, CI) works without it | Low — one more optional field on a struct that's already grown this way twice | **GO** |
+| A | Resolver version (`Relationship.resolver_version`) | S | High — the one concrete missing fact behind the reviewer's own worked example; nothing downstream (diff, CI) works without it | Low — one more optional field on a struct that's already grown this way twice | **GO** — ✅ shipped |
 | B | Provenance-aware diff classification | M | High — the single biggest named gap; closes both the false-negative (rewire hidden by matching resolver names) and false-positive (invisible resolver-only change) directions at once | Medium — pairing relationships by `(kind, target)` across two snapshots needs care around duplicate targets under different kinds and concepts that both add and remove edges in the same diff; needs the five worked scenarios as real regression tests, not just the happy path | **GO**, sequenced after A (A supplies the data B classifies against) |
 | C | `okf-rs diff --ci` policy | S-M | High — this is what actually makes B usable in a pipeline, matching the reviewer's own CLI example line for line | Low — mirrors `validate --ci`'s already-shipped, already-tested flag pattern; the only new surface is the `okf.toml` `[diff]` section | **GO**, sequenced after B |
 | D | Artifact-level reproducibility metadata (no timestamp) | S | Medium — genuinely useful for CI audit ("which okf-rs, which commit, built this bundle"), but scoped down from the reviewer's ask specifically to avoid the determinism regression a naive implementation would cause | Medium — the risk isn't the feature, it's a future contributor "fixing" the missing timestamp back in; mitigated by testing `--check-determinism`/`--check-fresh` directly against this phase and documenting the cut in the module itself | **GO**, with the no-timestamp scope cut as a hard constraint, not a suggestion |

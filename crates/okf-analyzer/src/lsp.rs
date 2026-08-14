@@ -123,6 +123,7 @@ pub(crate) fn resolve_ambiguous_calls(
                     callee: (*callee_id).to_string(),
                     resolved_by,
                     confidence: Confidence::Semantic,
+                    resolver_version: client.server_version().map(str::to_string),
                 });
             }
         }

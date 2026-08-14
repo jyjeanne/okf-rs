@@ -79,6 +79,12 @@ struct RelationshipEntry {
     target: String,
     resolved_by: String,
     confidence: &'static str,
+    /// The resolver's own reported version, when known — see
+    /// `okf_parser::Relationship::resolver_version`. Omitted (not
+    /// rendered as `resolver_version: null`) for every `tree-sitter` edge
+    /// and any resolver that didn't report one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolver_version: Option<String>,
 }
 
 #[derive(Serialize, Default)]
@@ -130,6 +136,7 @@ fn relationships_frontmatter(concept: &Concept) -> Option<RelationshipsFrontmatt
             target: rel.target.clone(),
             resolved_by: rel.resolved_by.clone(),
             confidence: rel.confidence.as_str(),
+            resolver_version: rel.resolver_version.clone(),
         });
     }
     Some(grouped)
@@ -488,6 +495,42 @@ mod tests {
         );
         assert!(content.contains("resolved_by: tree-sitter"));
         assert!(content.contains("confidence: exact"));
+        assert!(
+            !content.contains("resolver_version"),
+            "a tree-sitter edge has no resolver to version, so the key should be omitted \
+             entirely rather than rendered as `resolver_version: null`"
+        );
+    }
+
+    #[test]
+    fn renders_resolver_version_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut caller = concept(
+            ConceptKind::Function,
+            "verify_token",
+            "auth.verify_token",
+            "src/auth.rs",
+        );
+        let callee = concept(
+            ConceptKind::Function,
+            "decode_jwt",
+            "auth.decode_jwt",
+            "src/auth.rs",
+        );
+        caller.relationships.push(okf_parser::Relationship {
+            kind: RelationKind::Calls,
+            target: callee.id.clone(),
+            target_display: "decode_jwt".to_string(),
+            resolved_by: "rust-analyzer".to_string(),
+            confidence: okf_parser::Confidence::Semantic,
+            resolver_version: Some("1.88.0".to_string()),
+        });
+
+        write_bundle(&[caller, callee], dir.path()).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
+        assert!(content.contains("resolver_version: 1.88.0"));
     }
 
     #[test]
@@ -554,16 +597,18 @@ mod tests {
             callee.id.clone(),
             "decode_jwt",
         ));
-        // A non-default provenance/confidence, as `okf-analyzer` would
-        // build for an `--lsp`-resolved edge -- confirms the round trip
-        // carries the *actual* values through, not just the tree-sitter
-        // defaults every other fixture in this file happens to use.
+        // A non-default provenance/confidence/resolver_version, as
+        // `okf-analyzer` would build for an `--lsp`-resolved edge --
+        // confirms the round trip carries the *actual* values through,
+        // not just the tree-sitter defaults every other fixture in this
+        // file happens to use.
         callee.relationships.push(okf_parser::Relationship {
             kind: RelationKind::CalledBy,
             target: caller.id.clone(),
             target_display: "verify_token".to_string(),
             resolved_by: "rust-analyzer".to_string(),
             confidence: okf_parser::Confidence::Semantic,
+            resolver_version: Some("1.88.0".to_string()),
         });
 
         write_bundle(&[caller.clone(), callee.clone()], dir.path()).unwrap();
@@ -580,6 +625,7 @@ mod tests {
             read_caller.relationships[0].confidence,
             okf_parser::Confidence::Exact
         );
+        assert_eq!(read_caller.relationships[0].resolver_version, None);
 
         let read_callee = read_back.iter().find(|c| c.id == callee.id).unwrap();
         assert_eq!(read_callee.relationships[0].kind, RelationKind::CalledBy);
@@ -588,6 +634,10 @@ mod tests {
         assert_eq!(
             read_callee.relationships[0].confidence,
             okf_parser::Confidence::Semantic
+        );
+        assert_eq!(
+            read_callee.relationships[0].resolver_version.as_deref(),
+            Some("1.88.0")
         );
     }
 

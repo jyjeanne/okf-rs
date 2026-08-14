@@ -159,7 +159,8 @@ fn parse_concept(id: String, content: &str) -> Option<Concept> {
                     continue;
                 };
                 for entry in targets.as_sequence().into_iter().flatten() {
-                    let Some((target, resolved_by, confidence)) = parse_relationship_entry(entry)
+                    let Some((target, resolved_by, confidence, resolver_version)) =
+                        parse_relationship_entry(entry)
                     else {
                         continue;
                     };
@@ -171,6 +172,7 @@ fn parse_concept(id: String, content: &str) -> Option<Concept> {
                         target,
                         resolved_by,
                         confidence,
+                        resolver_version,
                     });
                 }
             }
@@ -205,18 +207,25 @@ fn parse_concept(id: String, content: &str) -> Option<Concept> {
 /// shapes `okf-generator` has ever written: a bare target-id string (every
 /// bundle generated before edge provenance/confidence existed, or a
 /// hand-edited entry someone kept simple), and the current
-/// `{target, resolved_by, confidence}` mapping. Backward-compatible on
-/// purpose — an old bundle doesn't need regenerating just to stay
-/// readable by a newer `okf-rs`, and a missing/unrecognized
-/// `resolved_by`/`confidence` on an otherwise-valid mapping falls back to
-/// the same "produced by Tree-sitter, exact" default a bare string gets,
-/// rather than failing to parse the entry at all.
-fn parse_relationship_entry(entry: &serde_yaml::Value) -> Option<(String, String, Confidence)> {
+/// `{target, resolved_by, confidence, resolver_version}` mapping.
+/// Backward-compatible on purpose — an old bundle doesn't need
+/// regenerating just to stay readable by a newer `okf-rs`, and a
+/// missing/unrecognized `resolved_by`/`confidence` on an otherwise-valid
+/// mapping falls back to the same "produced by Tree-sitter, exact"
+/// default a bare string gets, rather than failing to parse the entry at
+/// all. `resolver_version` is newer still than `resolved_by`/`confidence`
+/// themselves, so it's simply absent (`None`) on every bundle written
+/// before it existed, including ones that already carry the richer
+/// mapping shape.
+fn parse_relationship_entry(
+    entry: &serde_yaml::Value,
+) -> Option<(String, String, Confidence, Option<String>)> {
     if let Some(target) = entry.as_str() {
         return Some((
             target.to_string(),
             "tree-sitter".to_string(),
             Confidence::Exact,
+            None,
         ));
     }
     let mapping = entry.as_mapping()?;
@@ -231,7 +240,11 @@ fn parse_relationship_entry(entry: &serde_yaml::Value) -> Option<(String, String
         .and_then(|v| v.as_str())
         .and_then(Confidence::parse)
         .unwrap_or(Confidence::Exact);
-    Some((target, resolved_by, confidence))
+    let resolver_version = mapping
+        .get("resolver_version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some((target, resolved_by, confidence, resolver_version))
 }
 
 fn parse_signature(body: &str) -> Option<String> {
@@ -319,6 +332,35 @@ mod tests {
             concepts[0].relationships[0].confidence,
             Confidence::Semantic
         );
+    }
+
+    #[test]
+    fn reads_a_resolver_version_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - target: functions/b\n      resolved_by: rust-analyzer\n      confidence: semantic\n      resolver_version: 1.88.0\n---\n\nbody\n",
+        );
+
+        let concepts = read_bundle(dir.path()).unwrap();
+        assert_eq!(
+            concepts[0].relationships[0].resolver_version.as_deref(),
+            Some("1.88.0")
+        );
+    }
+
+    #[test]
+    fn resolver_version_is_none_when_absent_even_on_the_object_shaped_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - target: functions/b\n      resolved_by: rust-analyzer\n      confidence: semantic\n---\n\nbody\n",
+        );
+
+        let concepts = read_bundle(dir.path()).unwrap();
+        assert_eq!(concepts[0].relationships[0].resolver_version, None);
     }
 
     #[test]

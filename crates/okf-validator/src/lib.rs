@@ -731,17 +731,19 @@ fn check_relationship_targets(
     }
 }
 
-/// Validates a `relationships` entry's provenance/confidence metadata,
-/// where present — the "provenance-metadata validation" the CI-validation
-/// roadmap item names, now that edge provenance/confidence actually
-/// exists to validate. A bare-string entry (no metadata at all — any
-/// bundle written before this field existed) is always valid; nothing
-/// here requires the new shape. Only checks a *populated but wrong*
-/// `confidence` (not one of `exact`/`semantic`) or an explicitly *empty*
-/// `resolved_by` — a missing field either way already has a sensible
-/// default applied on read (`okf_parser::bundle::parse_relationship_entry`),
-/// so there's nothing to flag about absence, only about a present value
-/// that can't mean anything.
+/// Validates a `relationships` entry's provenance/confidence/resolver-version
+/// metadata, where present — the "provenance-metadata validation" the
+/// CI-validation roadmap item names, now that edge provenance/confidence
+/// actually exists to validate. A bare-string entry (no metadata at all —
+/// any bundle written before this field existed) is always valid; nothing
+/// here requires the new shape. Checks a *populated but wrong* `confidence`
+/// (not one of `exact`/`semantic`), an explicitly *empty* `resolved_by`
+/// (both errors), and a `resolver_version` set without a real resolver
+/// name alongside it (a warning, not an error — see below). A missing
+/// field either way already has a sensible default applied on read
+/// (`okf_parser::bundle::parse_relationship_entry`), so there's nothing to
+/// flag about absence on its own, only about a present value that can't
+/// mean anything, or a version with nothing to be a version *of*.
 fn check_relationship_provenance(files: &[ScannedFile], report: &mut ValidationReport) {
     for file in files {
         if is_index(&file.relative) {
@@ -790,12 +792,33 @@ fn check_relationship_provenance(files: &[ScannedFile], report: &mut ValidationR
                         });
                     }
                 }
-                if entry_map.get("resolved_by").and_then(|v| v.as_str()) == Some("") {
+                let resolved_by = entry_map.get("resolved_by").and_then(|v| v.as_str());
+                if resolved_by == Some("") {
                     report.issues.push(ValidationIssue {
                         severity: Severity::Error,
                         file: file.relative.clone(),
                         message: format!(
                             "`relationships.{kind}` entry for `{target}` has an empty `resolved_by`"
+                        ),
+                    });
+                }
+                // A `resolver_version` only makes sense alongside a real
+                // resolver: `tree-sitter`'s own unambiguous name match
+                // doesn't have a version to record (see
+                // `okf_parser::Relationship::resolver_version`), so a
+                // version present without `resolved_by` naming an actual
+                // resolver is a real inconsistency worth flagging, the
+                // same posture the `confidence` check above takes toward
+                // a malformed value rather than a missing one.
+                let resolver_version = entry_map.get("resolver_version").and_then(|v| v.as_str());
+                if resolver_version.is_some_and(|v| !v.is_empty())
+                    && matches!(resolved_by, None | Some("") | Some("tree-sitter"))
+                {
+                    report.issues.push(ValidationIssue {
+                        severity: Severity::Warning,
+                        file: file.relative.clone(),
+                        message: format!(
+                            "`relationships.{kind}` entry for `{target}` has a `resolver_version` but no real `resolved_by` (tree-sitter has no version to record)"
                         ),
                     });
                 }
@@ -1368,6 +1391,57 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.message.contains("empty `resolved_by`")));
+    }
+
+    #[test]
+    fn accepts_a_resolver_version_alongside_a_real_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/callee.md",
+            "---\ntype: Rust Function\ntitle: callee\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L5\nrelationships:\n  calls:\n    - target: functions/callee\n      resolved_by: rust-analyzer\n      confidence: semantic\n      resolver_version: 1.88.0\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(!report.has_errors());
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("resolver_version")),
+            "a resolver_version alongside a real resolver name should not be flagged: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn warns_on_a_resolver_version_with_no_real_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [run](functions/run.md)\n");
+        write(
+            dir.path(),
+            "functions/callee.md",
+            "---\ntype: Rust Function\ntitle: callee\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L5\nrelationships:\n  calls:\n    - target: functions/callee\n      resolved_by: tree-sitter\n      confidence: exact\n      resolver_version: 1.88.0\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(!report.has_errors(), "this is a warning, not an error");
+        assert!(report.issues.iter().any(|i| {
+            i.severity == Severity::Warning
+                && i.message.contains("resolver_version")
+                && i.message.contains("functions/callee")
+        }));
     }
 
     #[test]

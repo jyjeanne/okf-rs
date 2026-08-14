@@ -69,6 +69,11 @@ pub(crate) struct ResolvedEdge {
     pub(crate) callee: String,
     pub(crate) resolved_by: String,
     pub(crate) confidence: Confidence,
+    /// The resolver's own reported version, when `resolved_by` names a
+    /// real language server that reported one — see
+    /// `okf_lsp::LspClient::server_version`. Always `None` for a
+    /// `tree-sitter`-resolved edge.
+    pub(crate) resolver_version: Option<String>,
 }
 
 /// Scans and analyzes `project`, producing the full concept + relationship
@@ -237,6 +242,7 @@ pub fn analyze_with_cache_lsp(
                 callee: callee_id,
                 resolved_by: "tree-sitter".to_string(),
                 confidence: Confidence::Exact,
+                resolver_version: None,
             });
         }
     }
@@ -277,6 +283,7 @@ pub fn analyze_with_cache_lsp(
             target_display: callee_name,
             resolved_by: edge.resolved_by.clone(),
             confidence: edge.confidence,
+            resolver_version: edge.resolver_version.clone(),
         });
         concepts[callee_idx].relationships.push(Relationship {
             kind: RelationKind::CalledBy,
@@ -284,6 +291,7 @@ pub fn analyze_with_cache_lsp(
             target_display: caller_name,
             resolved_by: edge.resolved_by,
             confidence: edge.confidence,
+            resolver_version: edge.resolver_version,
         });
     }
 

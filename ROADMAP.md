@@ -11,6 +11,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase 3 — Search, Interop & Intelligence | ✅ Complete (15/15) |
 | Improvement Plan Delivery (competitive gap-closing) | ✅ Complete (7/7) |
 | Improvement Plan (AI-native platform maturity, community feedback) | ✅ Complete (11/11 shipped) |
+| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (1/6) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -250,6 +251,54 @@ Exploratory, not yet scheduled: deterministic semantic analysis, incremental gra
 Every item above should improve at least one of: determinism, transparency, auditability, AI efficiency, developer experience, CI/CD integration, or Git friendliness — the same test the rest of this roadmap has applied since Phase 1.
 
 **Not done here, deliberately:** the reviewer's suggestion to convert this into a GitHub Projects roadmap with milestones and linked issues is a good one, but it's a repository/process change (creating GitHub milestones and issues) rather than a documentation change, so it's left for an explicit follow-up request rather than done as a side effect of recording this feedback.
+
+---
+
+## Improvement Plan — Provenance Depth, Graph Diff & MCP Tool-Selection
+
+The same external reviewer's *second* round of feedback (recorded verbatim in
+[`docs/feedback/2026-08-provenance-graph-diff-review.md`](docs/feedback/2026-08-provenance-graph-diff-review.md)),
+distilled into a codebase-grounded, phased plan in
+[`docs/improvement-plan-provenance-diff.md`](docs/improvement-plan-provenance-diff.md) after a gap
+check against the AI-native platform maturity plan above found most of that review's phases 1-3
+and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracked here.
+
+- [x] ✅ **Phase A — Resolver version.** `Relationship` gains an optional `resolver_version` field,
+  populated from the LSP `initialize` handshake's `serverInfo.version` (`okf_lsp::LspClient::server_version`)
+  and threaded through `okf-analyzer`'s `ResolvedEdge` the same path `resolved_by`/`confidence`
+  already travel. Rendered as `resolver_version: 1.88.0` alongside `resolved_by`/`confidence` in
+  frontmatter, omitted entirely for `tree-sitter` edges or a server that didn't report one — the
+  same optional-field, backward-compatible shape those two fields already established.
+  `okf_validator::check_relationship_provenance` gained a new warning (not an error, matching the
+  rest of that check's severity choices): a `resolver_version` set without a real `resolved_by`
+  alongside it (i.e. on a `tree-sitter` edge) is flagged, since tree-sitter has no version to
+  record. **Deliberately not built**, per the plan's own reasoning: a closed `ProvenanceOrigin`
+  enum (`TreeSitter`/`Lsp`/`Manual`/`Derived`) — `resolved_by` is already a free-form string (a
+  hand-edited bundle can carry `resolved_by: hand-edited` today), and this project already
+  rejected adding confidence-enum variants nothing produces; a new enum with unproduced variants
+  would repeat that mistake.
+- [ ] Phase B — Provenance-aware graph diff (`RelationshipChangeKind::{SourceChange, ResolverChange, ConfidenceChange}`)
+- [ ] Phase C — `okf-rs diff --ci` policy with configurable source/resolver/confidence exit codes
+- [ ] Phase D — Artifact-level reproducibility metadata (generator version, source revision — deliberately no timestamp)
+- [ ] Phase E — Specialized-vs-consolidated MCP tool-*selection-accuracy* benchmark (opt-in, real model calls)
+- [ ] Phase F — `tests/fixtures/` golden dataset
+
+Verified by dogfooding. Unit tests cover the new field end-to-end: `okf-lsp` parses `serverInfo.version`
+from a real `initialize` response and — genuinely exercised in this environment, not skipped —
+`LspClient::server_version()` returns `Some(..)` against a real `rust-analyzer`; `okf-parser`
+round-trips `resolver_version` through `read_bundle` (present, absent, and the pre-existing
+bare-string/missing-field fallback paths all still resolve to `None`); `okf-generator`'s frontmatter
+round-trip test now asserts a real `resolver_version` (not just `resolved_by`/`confidence`) survives
+write-then-read-back; `okf-validator` covers both the new warning and a resolver_version alongside a
+real resolver staying unflagged. End-to-end against this repository's own source via the real
+compiled binary: `okf-rs generate . --lsp` (992 concepts) rendered `resolver_version: 1.94.1
+(e408947 2026-03-25)` — the real installed `rust-analyzer`'s own reported version string, parentheses
+and all — on 444 relationship entries; `okf-rs validate` reported "no issues found" against that
+bundle (confirming the new warning doesn't misfire on real `--lsp` output, where every versioned
+edge does name a real resolver); and, on the plain tree-sitter-only path (no `--lsp`, where this
+field is never populated), `okf-rs generate . --check-determinism` still reported "Deterministic"
+(992 concepts) — confirming this schema addition doesn't regress the determinism guarantee it
+deliberately doesn't touch.
 
 ---
 
