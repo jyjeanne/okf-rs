@@ -10,7 +10,8 @@ automatically verifiable, not another prose roadmap.
 
 **Delivery status:** tracked in
 [`ROADMAP.md`](../ROADMAP.md#improvement-plan--provenance-depth-graph-diff--mcp-tool-selection).
-Phase A (resolver version) has shipped; Phases B-F are still as proposed below.
+Phases A (resolver version) and B (provenance-aware graph diff) have shipped; Phases C-F are still
+as proposed below.
 
 ## 0. What's already shipped, and what's actually new here
 
@@ -31,13 +32,15 @@ then only phases the genuinely new remainder.
 | Consolidate specialized `graph_*` tools | ✅ Shipped | 13 tools collapsed into one `graph(relation=...)` tool, `okf-mcp` 0.3.0 — [`crates/okf-mcp/src/tools.rs`](../crates/okf-mcp/src/tools.rs) |
 | MCP fixed-cost / break-even benchmark | ✅ Shipped | `okf-mcp --benchmark` — schema tokens, naive-vs-MCP token comparison, break-even query count — [`crates/okf-mcp/src/benchmark.rs`](../crates/okf-mcp/src/benchmark.rs) |
 | CI validation mode | ✅ Shipped | `okf-rs validate --ci`, `generate --check-determinism`, `generate --check-fresh` |
-| **Provenance-aware graph diff** (source vs. resolver vs. semantic change classes) | ❌ Not shipped | `okf_analyzer::diff`'s `relationship_set` *deliberately strips* `resolved_by`/`confidence` before comparing (`crates/okf-analyzer/src/lib.rs:383-389`) — today's diff is provenance-*blind* in both directions: it can't flag a resolver-only change, and a provenance change alone never appears in a diff at all |
+| **Provenance-aware graph diff** (source vs. resolver vs. semantic change classes) | ✅ Shipped (this plan's Phase B) | `okf_analyzer::{RelationshipChangeKind, diff_relationships}` — see `ROADMAP.md` |
 | **`okf-rs diff --ci` policy with source/resolver/metadata classification** | ❌ Not shipped | `okf-rs diff` has no `--ci` flag or exit-code policy today (only `validate --ci` does) |
 | **Artifact-level reproducibility metadata** (generator name/version, source revision) | ❌ Not shipped | `Concept::generated_at` exists but is *always* `None` by deliberate design (see `crates/okf-parser/src/lib.rs`'s doc comment on that field: stamping it "would make the bundle non-reproducible... violating the project's determinism principle") — the bundle-root `index.md`'s existing `okf_version` frontmatter has no generator/revision fields yet |
 | **Specialized-vs-consolidated tool-*selection-accuracy*** benchmark (real model calls) | ❌ Not shipped | The consolidation above was already decided and shipped; nothing measured whether a model actually picks the right `relation` value as reliably as it picked the right tool name before |
 | Golden fixture dataset for provenance/diff/MCP | ❌ Not shipped | No `tests/fixtures/` directory exists in this repo today |
 
-Everything below phases only the six ❌ rows. A `ProvenanceOrigin` enum (`TreeSitter`/`Lsp`/
+Everything below phases only the six rows this table originally marked ❌ (two have since shipped
+— see the phase headings below and `ROADMAP.md` for current status). A `ProvenanceOrigin` enum
+(`TreeSitter`/`Lsp`/
 `Manual`/`Derived`) as the reviewer's Phase 1 proposes is **deliberately not built**: `resolved_by`
 is already a free-form string (a hand-edited bundle can carry `resolved_by: hand-edited` today,
 exercised by an existing test at `crates/okf-parser/src/lib.rs:692`), and the ROADMAP already
@@ -133,7 +136,7 @@ Integration:
 
 ---
 
-## 3. Phase B — Provenance-aware graph diff
+## 3. Phase B — Provenance-aware graph diff ✅ Shipped
 
 ### Objective
 
@@ -678,7 +681,7 @@ table marks ❌, versus how speculative it is.
 | # | Item | Effort | Benefit | Risk | Decision |
 |---|---|---|---|---|---|
 | A | Resolver version (`Relationship.resolver_version`) | S | High — the one concrete missing fact behind the reviewer's own worked example; nothing downstream (diff, CI) works without it | Low — one more optional field on a struct that's already grown this way twice | **GO** — ✅ shipped |
-| B | Provenance-aware diff classification | M | High — the single biggest named gap; closes both the false-negative (rewire hidden by matching resolver names) and false-positive (invisible resolver-only change) directions at once | Medium — pairing relationships by `(kind, target)` across two snapshots needs care around duplicate targets under different kinds and concepts that both add and remove edges in the same diff; needs the five worked scenarios as real regression tests, not just the happy path | **GO**, sequenced after A (A supplies the data B classifies against) |
+| B | Provenance-aware diff classification | M | High — the single biggest named gap; closes both the false-negative (rewire hidden by matching resolver names) and false-positive (invisible resolver-only change) directions at once | Medium — pairing relationships by `(kind, target)` across two snapshots needs care around duplicate targets under different kinds and concepts that both add and remove edges in the same diff; needs the six worked scenarios as real regression tests, not just the happy path | **GO**, sequenced after A — ✅ shipped |
 | C | `okf-rs diff --ci` policy | S-M | High — this is what actually makes B usable in a pipeline, matching the reviewer's own CLI example line for line | Low — mirrors `validate --ci`'s already-shipped, already-tested flag pattern; the only new surface is the `okf.toml` `[diff]` section | **GO**, sequenced after B |
 | D | Artifact-level reproducibility metadata (no timestamp) | S | Medium — genuinely useful for CI audit ("which okf-rs, which commit, built this bundle"), but scoped down from the reviewer's ask specifically to avoid the determinism regression a naive implementation would cause | Medium — the risk isn't the feature, it's a future contributor "fixing" the missing timestamp back in; mitigated by testing `--check-determinism`/`--check-fresh` directly against this phase and documenting the cut in the module itself | **GO**, with the no-timestamp scope cut as a hard constraint, not a suggestion |
 | E | Specialized-vs-consolidated tool-*selection* benchmark | M-L | Medium — genuinely validates (or falsifies) a decision already shipped and already justified on schema-size grounds alone; real value is closing that specific "did we trade selection accuracy for schema size and never check" open question | Medium-High — the only item in this plan requiring a live LLM call, breaking this project's until-now-consistent "every benchmark is offline and deterministic" posture; must stay explicitly opt-in/non-CI to avoid becoming a flaky, costly, silently-skipped test | **CONDITIONAL GO** — build the harness and question set (fully testable without a model) first; only wire up a real endpoint call once someone is prepared to own interpreting a non-deterministic result, matching how `--enrich`'s own network dependency was scoped in from day one |

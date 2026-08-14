@@ -11,7 +11,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase 3 — Search, Interop & Intelligence | ✅ Complete (15/15) |
 | Improvement Plan Delivery (competitive gap-closing) | ✅ Complete (7/7) |
 | Improvement Plan (AI-native platform maturity, community feedback) | ✅ Complete (11/11 shipped) |
-| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (1/6) |
+| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (2/6) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -277,7 +277,22 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   hand-edited bundle can carry `resolved_by: hand-edited` today), and this project already
   rejected adding confidence-enum variants nothing produces; a new enum with unproduced variants
   would repeat that mistake.
-- [ ] Phase B — Provenance-aware graph diff (`RelationshipChangeKind::{SourceChange, ResolverChange, ConfidenceChange}`)
+- [x] ✅ **Phase B — Provenance-aware graph diff.** `okf_analyzer::diff` gains a new
+  `RelationshipChangeKind` (`Unchanged`/`SourceChange`/`ResolverChange`/`ConfidenceChange`/
+  `ProvenanceChange`) and a `diff_relationships(before, after)` helper, pairing a concept's
+  relationships by `(kind, target)` and classifying each pair by which provenance fields moved.
+  `ChangedConcept` gains a `relationship_changes` field carrying the non-`Unchanged` pairs — purely
+  additive; `Added`/`Removed`/`Changed` and every existing `impact()`/`review()`/`explain()`
+  consumer are untouched. Closes a real bug the plan's own gap analysis named, in both directions:
+  previously, `diff`'s (kind, target)-only equality check meant a **resolver-version-only change
+  was invisible to `diff` entirely** (the concept never even entered `report.changed`), while a
+  genuine target rewire that also happened to change resolver/version was at risk of being
+  misread as "just the resolver" if a classifier weren't careful to check the target first. Fixed
+  a fifth case the plan's own review caught before this shipped: `resolved_by` **and** `confidence`
+  changing *together* on an unchanged target (the shape a same-named function added elsewhere in
+  the project produces — a previously-unambiguous call becoming ambiguous, newly needing `--lsp`)
+  fits neither `ResolverChange` nor `ConfidenceChange` alone, so it's its own `ProvenanceChange`
+  variant rather than being silently absorbed into one of the other two.
 - [ ] Phase C — `okf-rs diff --ci` policy with configurable source/resolver/confidence exit codes
 - [ ] Phase D — Artifact-level reproducibility metadata (generator version, source revision — deliberately no timestamp)
 - [ ] Phase E — Specialized-vs-consolidated MCP tool-*selection-accuracy* benchmark (opt-in, real model calls)
@@ -299,6 +314,20 @@ edge does name a real resolver); and, on the plain tree-sitter-only path (no `--
 field is never populated), `okf-rs generate . --check-determinism` still reported "Deterministic"
 (992 concepts) — confirming this schema addition doesn't regress the determinism guarantee it
 deliberately doesn't touch.
+
+Phase B verified by dogfooding. `cargo test -p okf-analyzer` covers the plan's six worked
+scenarios directly (added edge, removed edge, a same-resolver target rewire, a resolver-version
+bump, a resolver change that also rewires the target, and the combined resolver+confidence case),
+plus order-independence (`diff_relationships` pairs by key, not position, so a reordered-but-
+identical relationship list still reports empty) and a signature-only change correctly reporting
+an empty `relationship_changes`. One new test asserts the bug-fix directly, not just the
+classification: a concept whose only difference between two snapshots is a `resolver_version` bump
+now correctly appears in `report.changed` at all (`report.changed.len() == 1`), which it did not
+before this phase — the previous (kind, target)-only equality check had no way to see it. The full
+workspace suite (`cargo test --workspace`, `cargo clippy --workspace --all-targets -D warnings`,
+`cargo fmt --check --all`) stayed clean throughout, including every pre-existing `okf-cli` e2e test
+for `diff`/`impact`/`review` against the real compiled binary — confirming the new field is
+additive, not a behavior change, for every existing consumer.
 
 ---
 
