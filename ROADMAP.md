@@ -11,7 +11,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase 3 — Search, Interop & Intelligence | ✅ Complete (15/15) |
 | Improvement Plan Delivery (competitive gap-closing) | ✅ Complete (7/7) |
 | Improvement Plan (AI-native platform maturity, community feedback) | ✅ Complete (11/11 shipped) |
-| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (2/6) |
+| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (3/6) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -293,7 +293,20 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   the project produces — a previously-unambiguous call becoming ambiguous, newly needing `--lsp`)
   fits neither `ResolverChange` nor `ConfidenceChange` alone, so it's its own `ProvenanceChange`
   variant rather than being silently absorbed into one of the other two.
-- [ ] Phase C — `okf-rs diff --ci` policy with configurable source/resolver/confidence exit codes
+- [x] ✅ **Phase C — `okf-rs diff --ci` policy.** A new `--ci` flag classifies a `DiffReport` via
+  `okf_analyzer::ci_summary` into source/resolver/confidence counts and renders them as
+  `❌`/`⚠️`/`ℹ️` lines plus a deterministic exit code, evaluated against a new `okf.toml` `[diff]`
+  section (`okf_core::config::DiffPolicy`: `resolver_changes` defaults to `"warn"`,
+  `confidence_changes` defaults to `"ignore"`; either can be set to `"warn"`/`"fail"`/`"ignore"`).
+  Source-level changes (added/removed concepts, a changed signature, or a
+  `RelationshipChangeKind::SourceChange` pair) are never configurable — always both reported and
+  failure-worthy, mirroring `validate --ci`'s "warnings are real problems by default" posture.
+  `ProvenanceChange` pairs are folded into `resolver_changes`, not a fourth policy knob of their
+  own. Caught and fixed one real gap while implementing the plan's own "counting unit" spec: a
+  pure signature-only change (no relationship difference at all) wasn't counted by the plan's
+  original formula, which would have let a CI run silently pass a PR that only changed a
+  function's signature — `ci_summary` now counts a `Changed` concept's `before_signature !=
+  after_signature` as a source change in its own right, independent of `relationship_changes`.
 - [ ] Phase D — Artifact-level reproducibility metadata (generator version, source revision — deliberately no timestamp)
 - [ ] Phase E — Specialized-vs-consolidated MCP tool-*selection-accuracy* benchmark (opt-in, real model calls)
 - [ ] Phase F — `tests/fixtures/` golden dataset
@@ -328,6 +341,28 @@ workspace suite (`cargo test --workspace`, `cargo clippy --workspace --all-targe
 `cargo fmt --check --all`) stayed clean throughout, including every pre-existing `okf-cli` e2e test
 for `diff`/`impact`/`review` against the real compiled binary — confirming the new field is
 additive, not a behavior change, for every existing consumer.
+
+Phase C verified two ways. `render_ci_report` — the pure rendering/policy-evaluation function
+`cmd_diff_ci` is a thin wrapper over, the same split `render_review_markdown`/`cmd_review` already
+established — is covered by 12 unit tests reproducing the plan's full exit-code table (no changes,
+metadata-only, resolver-only at both `"warn"` and `"fail"`, added/removed/rewired source edges,
+mixed source+resolver, and a dedicated test confirming a `ProvenanceChange`-derived count follows
+`resolver_changes`' policy rather than `confidence_changes`') entirely with synthetic `CiSummary`
+data — deliberately so, since a genuine resolver-*version* difference needs two different
+installed `rust-analyzer` binaries, which neither this environment nor CI can guarantee, and
+`okf-rs diff`'s underlying two-ref analysis doesn't run `--lsp` at all regardless (a pre-existing
+limitation this phase didn't introduce or attempt to fix). End-to-end, three new `okf-cli` e2e
+tests run the real compiled binary: a source-level change (an added/removed function) fails `--ci`
+with `❌ SOURCE CHANGES: 2` and `exit code: 1`; a ref diffed against itself exits `0` with `No
+changes between...`; and a project with a hand-written `okf.toml` `[diff]` section still loads and
+runs correctly (confirming the config-loading path doesn't error just because the file exists),
+though it can't exercise the resolver/confidence *gating* itself for the same `--lsp` reason.
+Dogfooded against this repository's own real git history via the real binary: `okf-rs diff
+717b445 97474f6 . --ci` (the release-v0.4.0 commit against this plan's own Phase A+B commit)
+correctly reports `❌ SOURCE CHANGES: 57` and exits `1`; the same ref against itself reports `No
+changes...` and exits `0`; and the pre-existing non-`--ci` `okf-rs diff` output is confirmed
+byte-for-byte unaffected by this phase. Full workspace `cargo test`/`clippy -D warnings`/`fmt
+--check` stayed clean throughout.
 
 ---
 

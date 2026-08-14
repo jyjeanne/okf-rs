@@ -488,6 +488,148 @@ fn standalone_binary_diff_reports_added_and_removed_concepts() {
     assert!(stdout_of(&no_diff).contains("No concept-level changes"));
 }
 
+/// `okf-rs diff --ci` against the same two commits `diff` (no `--ci`)
+/// already covers above: added/removed concepts are always source-level
+/// changes, so `--ci` must exit non-zero and report them under
+/// `❌ SOURCE CHANGES`, while a ref diffed against itself must exit zero.
+/// The resolver-change/confidence-change branches of the exit-code table
+/// (`docs/improvement-plan-provenance-diff.md`'s Phase C) aren't
+/// reachable this way — they need a real `--lsp`-resolved edge, and
+/// `okf-rs diff`'s underlying two-ref analysis doesn't run `--lsp` at
+/// all (a pre-existing limitation, not new to this test) — those are
+/// covered directly against `render_ci_report` in `okf-cli`'s own
+/// `diff_ci_tests` instead, with synthetic `CiSummary` data.
+#[test]
+fn standalone_binary_diff_ci_reports_source_changes_and_fails_the_exit_code() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("diff-ci-repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    let rev_parse_head = || {
+        String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    };
+
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "okf-rs e2e tests"]);
+    git(&["config", "user.email", "e2e@example.invalid"]);
+    git(&["config", "commit.gpgsign", "false"]);
+
+    fs::write(repo.join("src/lib.rs"), "pub fn foo() -> i32 {\n    1\n}\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c1"]);
+    let c1 = rev_parse_head();
+
+    fs::write(repo.join("src/lib.rs"), "pub fn bar() -> i32 {\n    2\n}\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c2"]);
+    let c2 = rev_parse_head();
+
+    let ci = run(&repo, &["diff", &c1, &c2, ".", "--ci"]);
+    assert!(
+        !ci.status.success(),
+        "a source-level change must fail --ci\nstdout: {}\nstderr: {}",
+        stdout_of(&ci),
+        stderr_of(&ci)
+    );
+    let ci_out = stdout_of(&ci);
+    assert!(ci_out.contains("❌ SOURCE CHANGES: 2"), "{ci_out}");
+    assert!(ci_out.contains("exit code: 1"), "{ci_out}");
+
+    // No changes between a ref and itself: --ci exits 0.
+    let ci_no_op = run(&repo, &["diff", &c2, &c2, ".", "--ci"]);
+    assert_success(&ci_no_op, &["diff --ci (no-op)"]);
+    let ci_no_op_out = stdout_of(&ci_no_op);
+    assert!(
+        ci_no_op_out.contains("No changes between"),
+        "{ci_no_op_out}"
+    );
+    assert!(ci_no_op_out.contains("exit code: 0"), "{ci_no_op_out}");
+}
+
+/// `--ci` still works end-to-end when the project has an `okf.toml` with
+/// a `[diff]` policy — confirms the config-loading path
+/// (`okf_core::config::load`) doesn't error or get skipped just because
+/// the file exists, even though this fixture can't exercise the
+/// resolver/confidence *gating* itself (see the test above for why).
+#[test]
+fn standalone_binary_diff_ci_loads_a_configured_diff_policy_without_erroring() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("diff-ci-config-repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    let rev_parse_head = || {
+        String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    };
+
+    fs::write(
+        repo.join("okf.toml"),
+        "output = \"knowledge\"\n\n[diff]\nresolver_changes = \"fail\"\nconfidence_changes = \"warn\"\n",
+    )
+    .unwrap();
+
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "okf-rs e2e tests"]);
+    git(&["config", "user.email", "e2e@example.invalid"]);
+    git(&["config", "commit.gpgsign", "false"]);
+
+    fs::write(repo.join("src/lib.rs"), "pub fn foo() -> i32 {\n    1\n}\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c1"]);
+    let c1 = rev_parse_head();
+
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn foo() -> i32 {\n    1\n}\n\npub fn bar() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c2"]);
+    let c2 = rev_parse_head();
+
+    let ci = run(&repo, &["diff", &c1, &c2, ".", "--ci"]);
+    assert!(
+        !ci.status.success(),
+        "a source change fails regardless of the configured resolver/confidence policy"
+    );
+    assert!(stdout_of(&ci).contains("❌ SOURCE CHANGES: 1"));
+}
+
 /// `okf-rs impact` extends `diff`'s concept-level added/removed/changed
 /// list with blast radius (transitive callers) and structural
 /// criticality. Two commits where only `callee`'s signature changes

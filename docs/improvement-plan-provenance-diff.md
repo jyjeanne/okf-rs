@@ -10,8 +10,8 @@ automatically verifiable, not another prose roadmap.
 
 **Delivery status:** tracked in
 [`ROADMAP.md`](../ROADMAP.md#improvement-plan--provenance-depth-graph-diff--mcp-tool-selection).
-Phases A (resolver version) and B (provenance-aware graph diff) have shipped; Phases C-F are still
-as proposed below.
+Phases A (resolver version), B (provenance-aware graph diff), and C (`diff --ci` policy) have
+shipped; Phases D-F are still as proposed below.
 
 ## 0. What's already shipped, and what's actually new here
 
@@ -33,7 +33,7 @@ then only phases the genuinely new remainder.
 | MCP fixed-cost / break-even benchmark | ✅ Shipped | `okf-mcp --benchmark` — schema tokens, naive-vs-MCP token comparison, break-even query count — [`crates/okf-mcp/src/benchmark.rs`](../crates/okf-mcp/src/benchmark.rs) |
 | CI validation mode | ✅ Shipped | `okf-rs validate --ci`, `generate --check-determinism`, `generate --check-fresh` |
 | **Provenance-aware graph diff** (source vs. resolver vs. semantic change classes) | ✅ Shipped (this plan's Phase B) | `okf_analyzer::{RelationshipChangeKind, diff_relationships}` — see `ROADMAP.md` |
-| **`okf-rs diff --ci` policy with source/resolver/metadata classification** | ❌ Not shipped | `okf-rs diff` has no `--ci` flag or exit-code policy today (only `validate --ci` does) |
+| **`okf-rs diff --ci` policy with source/resolver/metadata classification** | ✅ Shipped (this plan's Phase C) | `okf-rs diff --ci`, `okf_analyzer::ci_summary`, `okf_core::config::DiffPolicy` — see `ROADMAP.md` |
 | **Artifact-level reproducibility metadata** (generator name/version, source revision) | ❌ Not shipped | `Concept::generated_at` exists but is *always* `None` by deliberate design (see `crates/okf-parser/src/lib.rs`'s doc comment on that field: stamping it "would make the bundle non-reproducible... violating the project's determinism principle") — the bundle-root `index.md`'s existing `okf_version` frontmatter has no generator/revision fields yet |
 | **Specialized-vs-consolidated tool-*selection-accuracy*** benchmark (real model calls) | ❌ Not shipped | The consolidation above was already decided and shipped; nothing measured whether a model actually picks the right `relation` value as reliably as it picked the right tool name before |
 | Golden fixture dataset for provenance/diff/MCP | ❌ Not shipped | No `tests/fixtures/` directory exists in this repo today |
@@ -270,7 +270,7 @@ Plus:
 
 ---
 
-## 4. Phase C — `okf-rs diff --ci` policy
+## 4. Phase C — `okf-rs diff --ci` policy ✅ Shipped
 
 ### Objective
 
@@ -322,21 +322,25 @@ implicit): each category counts *edges*, not concepts, and a concept's own addit
 as edges too, one per relationship it carries — never as "1" regardless of how many relationships
 that concept has:
 
-- `SOURCE CHANGES` = (every relationship on an added or removed *concept*, since a concept that
-  no longer exists can't have unaffected edges) + (every `RelationshipChangeKind::SourceChange`
-  entry within a `Changed` concept). A concept added/removed with zero relationships of its own
-  still counts as `1` toward `SOURCE CHANGES` — the concept's own existence is the change, not an
-  edge — so the floor per added/removed concept is 1, plus one more per relationship it carries.
+- `SOURCE CHANGES` = (for each added/removed *concept*, `max(1, relationships.len())` — a concept
+  with no relationships of its own still counts as `1`, since its own existence is the change and
+  there's no edge count to fall back on; a concept with `N ≥ 1` relationships counts as `N`, not
+  `N + 1`) + (every `Changed` concept whose signature differs, counted as `1` — **implemented, not
+  in the original spec**: a pure signature-only change has no relationship difference at all, so
+  it was invisible to the formula as first drafted here, which would have let `--ci` silently pass
+  a PR that only changed a function's signature; `okf_analyzer::ci_summary` closes this) + (every
+  `RelationshipChangeKind::SourceChange` entry within a `Changed` concept).
 - `RESOLVER CHANGES` = every `RelationshipChangeKind::ResolverChange` **and** `ProvenanceChange`
   entry within a `Changed` concept (added/removed concepts have no "resolver changed" — either the
   target changed too, which is `SOURCE CHANGES`' job, or the concept doesn't exist to compare).
 - `CONFIDENCE CHANGES` = every `RelationshipChangeKind::ConfidenceChange` entry within a `Changed`
   concept.
 
-This means the worked example above (`❌ SOURCE CHANGES: 3`) could be one added concept with two
-relationships (1 + 2 = 3), or three separate single-relationship source rewires across different
-`Changed` concepts, or any other combination summing to 3 — the number is a total, not a count of
-distinct concepts, and the CLI's non-`--ci` human-readable output (unaffected by this phase, see
+This means the worked example above (`❌ SOURCE CHANGES: 3`) could be one added concept with three
+relationships (3, from the `max(1, N)` rule), or a signature change on one `Changed` concept (1)
+plus a two-relationship source rewire on another (2), or any other combination summing to 3 — the
+number is a total, not a count of distinct concepts, and the CLI's non-`--ci` human-readable
+output (unaffected by this phase, see
 below) is where a reader goes to see which.
 
 Added/removed concepts and `RelationshipChangeKind::SourceChange` are **always** failures under
@@ -682,7 +686,7 @@ table marks ❌, versus how speculative it is.
 |---|---|---|---|---|---|
 | A | Resolver version (`Relationship.resolver_version`) | S | High — the one concrete missing fact behind the reviewer's own worked example; nothing downstream (diff, CI) works without it | Low — one more optional field on a struct that's already grown this way twice | **GO** — ✅ shipped |
 | B | Provenance-aware diff classification | M | High — the single biggest named gap; closes both the false-negative (rewire hidden by matching resolver names) and false-positive (invisible resolver-only change) directions at once | Medium — pairing relationships by `(kind, target)` across two snapshots needs care around duplicate targets under different kinds and concepts that both add and remove edges in the same diff; needs the six worked scenarios as real regression tests, not just the happy path | **GO**, sequenced after A — ✅ shipped |
-| C | `okf-rs diff --ci` policy | S-M | High — this is what actually makes B usable in a pipeline, matching the reviewer's own CLI example line for line | Low — mirrors `validate --ci`'s already-shipped, already-tested flag pattern; the only new surface is the `okf.toml` `[diff]` section | **GO**, sequenced after B |
+| C | `okf-rs diff --ci` policy | S-M | High — this is what actually makes B usable in a pipeline, matching the reviewer's own CLI example line for line | Low — mirrors `validate --ci`'s already-shipped, already-tested flag pattern; the only new surface is the `okf.toml` `[diff]` section | **GO**, sequenced after B — ✅ shipped |
 | D | Artifact-level reproducibility metadata (no timestamp) | S | Medium — genuinely useful for CI audit ("which okf-rs, which commit, built this bundle"), but scoped down from the reviewer's ask specifically to avoid the determinism regression a naive implementation would cause | Medium — the risk isn't the feature, it's a future contributor "fixing" the missing timestamp back in; mitigated by testing `--check-determinism`/`--check-fresh` directly against this phase and documenting the cut in the module itself | **GO**, with the no-timestamp scope cut as a hard constraint, not a suggestion |
 | E | Specialized-vs-consolidated tool-*selection* benchmark | M-L | Medium — genuinely validates (or falsifies) a decision already shipped and already justified on schema-size grounds alone; real value is closing that specific "did we trade selection accuracy for schema size and never check" open question | Medium-High — the only item in this plan requiring a live LLM call, breaking this project's until-now-consistent "every benchmark is offline and deterministic" posture; must stay explicitly opt-in/non-CI to avoid becoming a flaky, costly, silently-skipped test | **CONDITIONAL GO** — build the harness and question set (fully testable without a model) first; only wire up a real endpoint call once someone is prepared to own interpreting a non-deterministic result, matching how `--enrich`'s own network dependency was scoped in from day one |
 | F | Golden fixture dataset | S | Low-Medium — organizational, not a new capability; mainly pays for itself by giving Phases B/C's own tests a less ad hoc home | Low — pure relocation/addition, no behavior change | **GO**, opportunistically alongside B/C rather than as a blocking prerequisite |

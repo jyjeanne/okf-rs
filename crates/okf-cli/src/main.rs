@@ -262,6 +262,14 @@ enum Command {
         /// Project directory to diff, relative to the git repository root.
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Provenance-aware CI mode: classifies changes as source, resolver,
+        /// or confidence, and exits non-zero on any source-level change
+        /// (always) or resolver/confidence-level change (per `okf.toml`'s
+        /// `[diff]` policy — resolver changes warn by default, confidence
+        /// changes are ignored by default; either can be set to "fail" or
+        /// "ignore"/"warn" respectively).
+        #[arg(long)]
+        ci: bool,
     },
     /// Renders the same change-impact analysis as `impact`, but as a
     /// Markdown report meant to be posted as a pull-request comment (a
@@ -600,7 +608,8 @@ fn run(command: Command) -> Result<ExitCode> {
             from_ref,
             to_ref,
             path,
-        } => cmd_diff(&from_ref, &to_ref, &path),
+            ci,
+        } => cmd_diff(&from_ref, &to_ref, &path, ci),
         Command::Impact {
             from_ref,
             to_ref,
@@ -1479,10 +1488,14 @@ fn analyze_two_refs(
     Ok((from_result, to_result))
 }
 
-fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<ExitCode> {
+fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path, ci: bool) -> Result<ExitCode> {
     let (from_result, to_result) = analyze_two_refs(path, from_ref, to_ref)?;
 
     let report = okf_analyzer::diff(&from_result.concepts, &to_result.concepts);
+
+    if ci {
+        return cmd_diff_ci(&report, path, from_ref, to_ref);
+    }
 
     if report.is_empty() {
         println!("No concept-level changes between {from_ref} and {to_ref}");
@@ -1517,6 +1530,92 @@ fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<Exit
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// `okf-rs diff --ci`: classifies `report` into source/resolver/confidence
+/// counts (`okf_analyzer::ci_summary`), evaluates them against `okf.toml`'s
+/// `[diff]` policy (`okf_core::config::DiffPolicy`), and prints/returns
+/// what `render_ci_report` computed. All the actual logic lives in that
+/// pure function; this is just its CLI glue (load config, print, turn a
+/// bool into a process `ExitCode`) — see `render_ci_report`'s own docs.
+fn cmd_diff_ci(
+    report: &okf_analyzer::DiffReport,
+    path: &std::path::Path,
+    from_ref: &str,
+    to_ref: &str,
+) -> Result<ExitCode> {
+    let policy = okf_core::config::load(path).diff;
+    let summary = okf_analyzer::ci_summary(report);
+    let (text, failed) = render_ci_report(&summary, policy, from_ref, to_ref);
+    println!("{text}");
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Renders an `okf_analyzer::CiSummary` against a `DiffPolicy` as
+/// `okf-rs diff --ci`'s report text, and says whether it should fail the
+/// exit code — pure data-in, data-out, so the full exit-code table
+/// (`docs/improvement-plan-provenance-diff.md`'s Phase C) is directly
+/// unit-testable without a real git repository or language server,
+/// the same reason `render_review_markdown` is split out from `cmd_review`.
+///
+/// Source changes are never configurable — always reported (❌) and
+/// always failure-worthy. Resolver/confidence changes are reported with
+/// whichever icon their policy implies (❌ `"fail"`, ⚠️ `"warn"`, ℹ️
+/// `"ignore"`) and fail the exit code only under `"fail"`.
+fn render_ci_report(
+    summary: &okf_analyzer::CiSummary,
+    policy: okf_core::config::DiffPolicy,
+    from_ref: &str,
+    to_ref: &str,
+) -> (String, bool) {
+    if summary.is_empty() {
+        return (
+            format!("No changes between {from_ref} and {to_ref}\n\nexit code: 0"),
+            false,
+        );
+    }
+
+    let mut lines = Vec::new();
+    // Source changes are never configurable -- always both reported and
+    // failure-worthy.
+    let mut failed = summary.source_changes > 0;
+    if summary.source_changes > 0 {
+        lines.push(format!("❌ SOURCE CHANGES: {}", summary.source_changes));
+    }
+    if summary.resolver_changes > 0 {
+        let (icon, fails) = policy_icon(policy.resolver_changes);
+        failed |= fails;
+        lines.push(format!(
+            "{icon} RESOLVER CHANGES: {}",
+            summary.resolver_changes
+        ));
+    }
+    if summary.confidence_changes > 0 {
+        let (icon, fails) = policy_icon(policy.confidence_changes);
+        failed |= fails;
+        lines.push(format!(
+            "{icon} CONFIDENCE CHANGES: {}",
+            summary.confidence_changes
+        ));
+    }
+    lines.push(String::new());
+    lines.push(format!("exit code: {}", if failed { 1 } else { 0 }));
+
+    (lines.join("\n"), failed)
+}
+
+/// The icon a `--ci` category line renders with (❌ fail, ⚠️ warn, ℹ️
+/// ignore), and whether that action should fail the exit code.
+fn policy_icon(action: okf_core::config::PolicyAction) -> (&'static str, bool) {
+    match action {
+        okf_core::config::PolicyAction::Fail => ("❌", true),
+        okf_core::config::PolicyAction::Warn => ("⚠️ ", false),
+        okf_core::config::PolicyAction::Ignore => ("ℹ️ ", false),
+    }
 }
 
 fn cmd_impact(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<ExitCode> {
@@ -1712,6 +1811,188 @@ mod review_tests {
         };
         let markdown = render_review_markdown(&report, "main", "feature");
         assert!(markdown.contains("2 concept(s) changed, affecting 1 other concept(s)"));
+    }
+}
+
+/// Covers `okf-rs diff --ci`'s full exit-code table
+/// (`docs/improvement-plan-provenance-diff.md`'s Phase C) directly against
+/// `render_ci_report`, entirely without a real git repository or language
+/// server — a synthetic `CiSummary` plays the role two real `--lsp`
+/// analyses would otherwise need to produce (in particular, a genuine
+/// resolver-*version* difference needs two different installed
+/// `rust-analyzer` binaries, which this environment — and CI — has no way
+/// to guarantee; the classification logic that turns real relationship
+/// pairs into these counts is `okf-analyzer`'s own job, and is tested
+/// there against real provenance data).
+#[cfg(test)]
+mod diff_ci_tests {
+    use super::*;
+    use okf_analyzer::CiSummary;
+    use okf_core::config::{DiffPolicy, PolicyAction};
+
+    #[test]
+    fn no_changes_exits_zero() {
+        let (text, failed) =
+            render_ci_report(&CiSummary::default(), DiffPolicy::default(), "a", "b");
+        assert!(!failed);
+        assert!(text.contains("No changes between a and b"));
+        assert!(text.contains("exit code: 0"));
+    }
+
+    #[test]
+    fn metadata_only_change_with_default_policy_exits_zero() {
+        let summary = CiSummary {
+            confidence_changes: 2,
+            ..Default::default()
+        };
+        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(!failed);
+        assert!(text.contains("ℹ️"));
+        assert!(text.contains("CONFIDENCE CHANGES: 2"));
+        assert!(text.contains("exit code: 0"));
+    }
+
+    #[test]
+    fn resolver_only_change_with_default_policy_warns_but_exits_zero() {
+        let summary = CiSummary {
+            resolver_changes: 4,
+            ..Default::default()
+        };
+        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(!failed);
+        assert!(text.contains("⚠️"));
+        assert!(text.contains("RESOLVER CHANGES: 4"));
+        assert!(text.contains("exit code: 0"));
+    }
+
+    #[test]
+    fn added_source_edge_exits_one() {
+        let summary = CiSummary {
+            source_changes: 1,
+            ..Default::default()
+        };
+        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(failed);
+        assert!(text.contains("❌ SOURCE CHANGES: 1"));
+        assert!(text.contains("exit code: 1"));
+    }
+
+    #[test]
+    fn removed_source_edge_exits_one() {
+        // Same shape as an addition -- `CiSummary` doesn't distinguish
+        // add vs. remove in the count itself (only which relationship
+        // pair changed matters, not which direction), so this is the
+        // same case as `added_source_edge_exits_one` from this
+        // function's point of view; `okf-analyzer`'s own tests cover
+        // that both directions really do produce a `SourceChange`.
+        let summary = CiSummary {
+            source_changes: 1,
+            ..Default::default()
+        };
+        let (_, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(failed);
+    }
+
+    #[test]
+    fn semantic_target_change_exits_one() {
+        // A rewired target is two `SourceChange` entries (the removed
+        // pair, the added pair) -- see
+        // `okf_analyzer::diff_relationships`'s own scenario-3/5 tests.
+        let summary = CiSummary {
+            source_changes: 2,
+            ..Default::default()
+        };
+        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(failed);
+        assert!(text.contains("SOURCE CHANGES: 2"));
+    }
+
+    #[test]
+    fn mixed_source_and_resolver_changes_exits_one() {
+        let summary = CiSummary {
+            source_changes: 1,
+            resolver_changes: 1,
+            ..Default::default()
+        };
+        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(
+            failed,
+            "a source change fails regardless of the resolver change's own policy"
+        );
+        assert!(text.contains("❌ SOURCE CHANGES: 1"));
+        assert!(text.contains("RESOLVER CHANGES: 1"));
+    }
+
+    #[test]
+    fn resolver_only_change_fails_when_policy_is_fail() {
+        let summary = CiSummary {
+            resolver_changes: 4,
+            ..Default::default()
+        };
+        let policy = DiffPolicy {
+            resolver_changes: PolicyAction::Fail,
+            confidence_changes: PolicyAction::Ignore,
+        };
+        let (text, failed) = render_ci_report(&summary, policy, "a", "b");
+        assert!(failed);
+        assert!(text.contains("❌"));
+        assert!(text.contains("RESOLVER CHANGES: 4"));
+        assert!(text.contains("exit code: 1"));
+    }
+
+    #[test]
+    fn resolver_ignore_policy_still_reports_but_never_fails() {
+        let summary = CiSummary {
+            resolver_changes: 3,
+            ..Default::default()
+        };
+        let policy = DiffPolicy {
+            resolver_changes: PolicyAction::Ignore,
+            confidence_changes: PolicyAction::Ignore,
+        };
+        let (text, failed) = render_ci_report(&summary, policy, "a", "b");
+        assert!(!failed);
+        assert!(text.contains("ℹ️"));
+        assert!(text.contains("RESOLVER CHANGES: 3"));
+    }
+
+    #[test]
+    fn confidence_fail_policy_fails_the_exit_code() {
+        let summary = CiSummary {
+            confidence_changes: 2,
+            ..Default::default()
+        };
+        let policy = DiffPolicy {
+            resolver_changes: PolicyAction::Warn,
+            confidence_changes: PolicyAction::Fail,
+        };
+        let (text, failed) = render_ci_report(&summary, policy, "a", "b");
+        assert!(failed);
+        assert!(text.contains("❌"));
+        assert!(text.contains("exit code: 1"));
+    }
+
+    #[test]
+    fn provenance_change_is_reported_and_gated_as_a_resolver_change_not_confidence() {
+        // A ProvenanceChange (resolved_by/resolver_version *and*
+        // confidence both moved) is folded into `resolver_changes` by
+        // `okf_analyzer::ci_summary`, so it follows `resolver_changes`'
+        // policy, not `confidence_changes` -- this test locks in that
+        // routing decision at the CLI-policy level, distinct from
+        // `okf-analyzer`'s own test verifying the classification itself.
+        let summary = CiSummary {
+            resolver_changes: 1,
+            ..Default::default()
+        };
+        let policy = DiffPolicy {
+            resolver_changes: PolicyAction::Fail,
+            confidence_changes: PolicyAction::Warn,
+        };
+        let (_, failed) = render_ci_report(&summary, policy, "a", "b");
+        assert!(
+            failed,
+            "resolver_changes = \"fail\" should gate a ProvenanceChange-derived count too"
+        );
     }
 }
 
