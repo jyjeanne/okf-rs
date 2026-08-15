@@ -10,8 +10,8 @@ automatically verifiable, not another prose roadmap.
 
 **Delivery status:** tracked in
 [`ROADMAP.md`](../ROADMAP.md#improvement-plan--provenance-depth-graph-diff--mcp-tool-selection).
-Phases A (resolver version), B (provenance-aware graph diff), and C (`diff --ci` policy) have
-shipped; Phases D-F are still as proposed below.
+Phases A (resolver version), B (provenance-aware graph diff), C (`diff --ci` policy), and D
+(reproducibility metadata) have shipped; Phases E-F are still as proposed below.
 
 ## 0. What's already shipped, and what's actually new here
 
@@ -34,7 +34,7 @@ then only phases the genuinely new remainder.
 | CI validation mode | ✅ Shipped | `okf-rs validate --ci`, `generate --check-determinism`, `generate --check-fresh` |
 | **Provenance-aware graph diff** (source vs. resolver vs. semantic change classes) | ✅ Shipped (this plan's Phase B) | `okf_analyzer::{RelationshipChangeKind, diff_relationships}` — see `ROADMAP.md` |
 | **`okf-rs diff --ci` policy with source/resolver/metadata classification** | ✅ Shipped (this plan's Phase C) | `okf-rs diff --ci`, `okf_analyzer::ci_summary`, `okf_core::config::DiffPolicy` — see `ROADMAP.md` |
-| **Artifact-level reproducibility metadata** (generator name/version, source revision) | ❌ Not shipped | `Concept::generated_at` exists but is *always* `None` by deliberate design (see `crates/okf-parser/src/lib.rs`'s doc comment on that field: stamping it "would make the bundle non-reproducible... violating the project's determinism principle") — the bundle-root `index.md`'s existing `okf_version` frontmatter has no generator/revision fields yet |
+| **Artifact-level reproducibility metadata** (generator name/version, source revision) | ✅ Shipped (this plan's Phase D) | `okf_core::git::head_revision`, `okf_generator::write_root_index`'s `generator_name`/`generator_version`/`source_revision` — see `ROADMAP.md` |
 | **Specialized-vs-consolidated tool-*selection-accuracy*** benchmark (real model calls) | ❌ Not shipped | The consolidation above was already decided and shipped; nothing measured whether a model actually picks the right `relation` value as reliably as it picked the right tool name before |
 | Golden fixture dataset for provenance/diff/MCP | ❌ Not shipped | No `tests/fixtures/` directory exists in this repo today |
 
@@ -379,7 +379,7 @@ ignore on confidence-only) — the absence of config is a valid, tested state, n
 
 ---
 
-## 5. Phase D — Artifact-level reproducibility metadata
+## 5. Phase D — Artifact-level reproducibility metadata ✅ Shipped
 
 ### Objective
 
@@ -687,7 +687,7 @@ table marks ❌, versus how speculative it is.
 | A | Resolver version (`Relationship.resolver_version`) | S | High — the one concrete missing fact behind the reviewer's own worked example; nothing downstream (diff, CI) works without it | Low — one more optional field on a struct that's already grown this way twice | **GO** — ✅ shipped |
 | B | Provenance-aware diff classification | M | High — the single biggest named gap; closes both the false-negative (rewire hidden by matching resolver names) and false-positive (invisible resolver-only change) directions at once | Medium — pairing relationships by `(kind, target)` across two snapshots needs care around duplicate targets under different kinds and concepts that both add and remove edges in the same diff; needs the six worked scenarios as real regression tests, not just the happy path | **GO**, sequenced after A — ✅ shipped |
 | C | `okf-rs diff --ci` policy | S-M | High — this is what actually makes B usable in a pipeline, matching the reviewer's own CLI example line for line | Low — mirrors `validate --ci`'s already-shipped, already-tested flag pattern; the only new surface is the `okf.toml` `[diff]` section | **GO**, sequenced after B — ✅ shipped |
-| D | Artifact-level reproducibility metadata (no timestamp) | S | Medium — genuinely useful for CI audit ("which okf-rs, which commit, built this bundle"), but scoped down from the reviewer's ask specifically to avoid the determinism regression a naive implementation would cause | Medium — the risk isn't the feature, it's a future contributor "fixing" the missing timestamp back in; mitigated by testing `--check-determinism`/`--check-fresh` directly against this phase and documenting the cut in the module itself | **GO**, with the no-timestamp scope cut as a hard constraint, not a suggestion |
+| D | Artifact-level reproducibility metadata (no timestamp) | S | Medium — genuinely useful for CI audit ("which okf-rs, which commit, built this bundle"), but scoped down from the reviewer's ask specifically to avoid the determinism regression a naive implementation would cause | Medium — the risk isn't the feature, it's a future contributor "fixing" the missing timestamp back in; mitigated by testing `--check-determinism`/`--check-fresh` directly against this phase and documenting the cut in the module itself | **GO**, with the no-timestamp scope cut as a hard constraint, not a suggestion — ✅ shipped |
 | E | Specialized-vs-consolidated tool-*selection* benchmark | M-L | Medium — genuinely validates (or falsifies) a decision already shipped and already justified on schema-size grounds alone; real value is closing that specific "did we trade selection accuracy for schema size and never check" open question | Medium-High — the only item in this plan requiring a live LLM call, breaking this project's until-now-consistent "every benchmark is offline and deterministic" posture; must stay explicitly opt-in/non-CI to avoid becoming a flaky, costly, silently-skipped test | **CONDITIONAL GO** — build the harness and question set (fully testable without a model) first; only wire up a real endpoint call once someone is prepared to own interpreting a non-deterministic result, matching how `--enrich`'s own network dependency was scoped in from day one |
 | F | Golden fixture dataset | S | Low-Medium — organizational, not a new capability; mainly pays for itself by giving Phases B/C's own tests a less ad hoc home | Low — pure relocation/addition, no behavior change | **GO**, opportunistically alongside B/C rather than as a blocking prerequisite |
 

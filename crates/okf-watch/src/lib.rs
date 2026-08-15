@@ -116,7 +116,8 @@ fn regenerate_once(
     let project = okf_core::Project::load(project_root)
         .with_context(|| format!("failed to scan {}", project_root.display()))?;
     let (result, stats) = okf_analyzer::analyze_with_cache(&project, cache)?;
-    okf_generator::write_bundle(&result.concepts, bundle_output)?;
+    let source_revision = okf_core::git::head_revision(project_root);
+    okf_generator::write_bundle(&result.concepts, bundle_output, source_revision.as_deref())?;
     cache.save(cache_path)?;
 
     let ids: BTreeSet<String> = result.concepts.iter().map(|c| c.id.clone()).collect();

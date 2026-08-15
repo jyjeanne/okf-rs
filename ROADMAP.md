@@ -11,7 +11,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase 3 — Search, Interop & Intelligence | ✅ Complete (15/15) |
 | Improvement Plan Delivery (competitive gap-closing) | ✅ Complete (7/7) |
 | Improvement Plan (AI-native platform maturity, community feedback) | ✅ Complete (11/11 shipped) |
-| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (3/6) |
+| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (4/6) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -307,7 +307,24 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   original formula, which would have let a CI run silently pass a PR that only changed a
   function's signature — `ci_summary` now counts a `Changed` concept's `before_signature !=
   after_signature` as a source change in its own right, independent of `relationship_changes`.
-- [ ] Phase D — Artifact-level reproducibility metadata (generator version, source revision — deliberately no timestamp)
+- [x] ✅ **Phase D — Artifact-level reproducibility metadata.** The bundle-root `index.md`'s existing
+  `okf_version` frontmatter (already the one place OKF permits frontmatter on an `index.md`) gains
+  `generator_name`/`generator_version` (always populated — `"okf-rs"`/the crate's own compile-time
+  version) and `source_revision` (the commit `HEAD` pointed to when `generate` ran — new
+  `okf_core::git::head_revision`, best-effort, `None` outside a git repo). Deliberately **no
+  `generated_at` timestamp** — a new `manifest.md` file was this plan's first draft and is
+  deliberately *not* what shipped (see the plan doc's own correction): every other `.md` file in a
+  bundle is required to carry a recognized concept `type:`, which metadata has none of, so a
+  separate file would be a validator error under this project's own tooling. Extending the
+  existing, already-permitted root frontmatter avoids that entirely. Caught and fixed a real
+  regression risk while implementing: naively embedding `source_revision` would make `generate
+  --check-fresh` report false staleness whenever `HEAD` moves for a reason that never touches the
+  analyzed source tree (a README edit, say) — `source_revision` describes *which commit produced
+  this artifact*, not *whether the analyzed content matches*, and conflating the two would break
+  `--check-fresh`'s own contract. Fixed by having `okf-cli`'s `diff_dirs` normalize
+  (`strip_source_revision_line`) that one line out of the root `index.md` comparison
+  `--check-determinism`/`--check-fresh` both use, before diffing — the artifact still records its
+  real provenance; the *staleness check* just doesn't conflate that with content drift.
 - [ ] Phase E — Specialized-vs-consolidated MCP tool-*selection-accuracy* benchmark (opt-in, real model calls)
 - [ ] Phase F — `tests/fixtures/` golden dataset
 
@@ -363,6 +380,32 @@ correctly reports `❌ SOURCE CHANGES: 57` and exits `1`; the same ref against i
 changes...` and exits `0`; and the pre-existing non-`--ci` `okf-rs diff` output is confirmed
 byte-for-byte unaffected by this phase. Full workspace `cargo test`/`clippy -D warnings`/`fmt
 --check` stayed clean throughout.
+
+Phase D verified two ways. Unit tests cover the new `okf_core::git` module directly (`None`
+outside a git repository, the real `HEAD` SHA inside one, `None` in a freshly initialized repo
+with no commits yet, and — the deliberate non-behavior — the SHA is still returned when the
+working tree is dirty, not withheld); `okf-generator`'s root-index tests cover
+`generator_name`/`generator_version` always being present, `source_revision` omitted entirely
+when `None` (never rendered as `source_revision: null`), and rendered correctly when given;
+`okf-cli`'s `strip_source_revision_line`/`diff_dirs` tests cover the normalization directly — two
+root `index.md` files differing *only* in `source_revision` report no diff, while a real content
+difference in the same file (e.g. a changed "Contains N" count) still gets caught, confirming the
+normalization strips exactly one line, not the file's ability to be diffed at all. End-to-end
+against real git repositories via the compiled binary: `okf-rs generate` records the actual
+current `HEAD` SHA in the bundle root (`generate` inside a fresh repo at a known commit, comparing
+the bundle's `source_revision` against `git rev-parse HEAD` run independently); and the regression
+test this phase's own design doc flagged as the real risk — commit the source, generate, commit
+the bundle, then commit an unrelated file (`README.md`) that never touches `src/` at all, moving
+`HEAD` one commit past what the committed bundle recorded — confirms `generate --check-fresh`
+still reports "Up to date," not a false "Stale." Dogfooded against this repository's own source
+via the real binary: `okf-rs generate .` (1062 concepts) rendered `source_revision:
+"5989f246c4c50e13bc4bd0a6769c04816e773e43"` — exactly this repository's real `HEAD` at generation
+time, confirmed by an independent `git rev-parse HEAD`; `okf-rs validate` reported "no issues
+found"; and both `generate --check-determinism` and `generate --check-fresh` (run immediately
+after) reported clean, confirming this phase doesn't regress either guarantee on a real, non-toy
+codebase. Full workspace `cargo test`/`clippy -D warnings`/`fmt --check` stayed clean throughout
+(one pre-existing, environment-timing-dependent real-`rust-analyzer` test flaked and passed on
+retry in isolation, unrelated to this phase — the same flake already noted on this PR's CI).
 
 ---
 

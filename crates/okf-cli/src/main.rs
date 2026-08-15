@@ -791,7 +791,8 @@ fn cmd_generate(
         None
     };
 
-    okf_generator::write_bundle(&result.concepts, &output)?;
+    let source_revision = okf_core::git::head_revision(&project.root);
+    okf_generator::write_bundle(&result.concepts, &output, source_revision.as_deref())?;
     if !no_cache {
         cache.save(&cache_path)?;
     }
@@ -867,8 +868,10 @@ fn cmd_check_determinism(
 
     let run1 = ScratchDir::new("determinism-run1");
     let run2 = ScratchDir::new("determinism-run2");
-    okf_generator::write_bundle(&result1.concepts, run1.path())?;
-    okf_generator::write_bundle(&result2.concepts, run2.path())?;
+    // No source_revision: this is a throwaway comparison between two
+    // in-process analyses, not a real generate -- see write_bundle's docs.
+    okf_generator::write_bundle(&result1.concepts, run1.path(), None)?;
+    okf_generator::write_bundle(&result2.concepts, run2.path(), None)?;
 
     let diffs = diff_dirs(run1.path(), run2.path(), "run 1", "run 2")?;
     if diffs.is_empty() {
@@ -934,7 +937,11 @@ fn cmd_check_fresh(
     }
 
     let fresh = ScratchDir::new("check-fresh");
-    okf_generator::write_bundle(&result.concepts, fresh.path())?;
+    // No source_revision here either: `diff_dirs` already normalizes it
+    // out of the root index.md comparison below (see its own docs for
+    // why), so what's passed on this side is moot -- `None` avoids an
+    // unnecessary git shell-out for a throwaway write.
+    okf_generator::write_bundle(&result.concepts, fresh.path(), None)?;
 
     let diffs = diff_dirs(
         &existing,
@@ -1045,10 +1052,40 @@ fn collect_files(
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            out.insert(relative, std::fs::read(&path)?);
+            let content = std::fs::read(&path)?;
+            let content = if relative == "index.md" {
+                strip_source_revision_line(&content)
+            } else {
+                content
+            };
+            out.insert(relative, content);
         }
     }
     Ok(())
+}
+
+/// Strips a `source_revision: ...` line from the bundle-root `index.md`'s
+/// frontmatter before `diff_dirs` compares it, both for
+/// `--check-determinism` (comparing two in-process analyses of the same
+/// `HEAD` — harmless either way, since both sides would agree regardless)
+/// and, the case this actually matters for, `--check-fresh` (comparing a
+/// fresh regenerate against the real, already-committed bundle on disk):
+/// without this, a commit that moves `HEAD` without touching the analyzed
+/// source tree at all (a README edit, say) would make `--check-fresh`
+/// report false staleness purely from this one line differing, never
+/// from real content drift — see `okf-generator::write_root_index`'s own
+/// docs for the fuller reasoning. Line-based rather than a full
+/// YAML-aware strip, since this only ever needs to recognize the exact
+/// shape `write_root_index` itself writes.
+fn strip_source_revision_line(content: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return content.to_vec();
+    };
+    text.lines()
+        .filter(|line| !line.starts_with("source_revision:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
 }
 
 /// Resolves `--enrich-*` flags, falling back to the matching
@@ -2074,6 +2111,83 @@ mod determinism_tests {
         let diffs = diff_dirs(a.path(), b.path(), "run 1", "run 2").unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(diffs[0].contains("functions/nested/f.md"));
+    }
+
+    #[test]
+    fn strip_source_revision_line_removes_only_that_line() {
+        let input = b"---\nokf_version: \"0.2\"\ngenerator_name: \"okf-rs\"\ngenerator_version: \"0.4.0\"\nsource_revision: \"abc123\"\n---\n\n# Knowledge Base\n";
+        let stripped = strip_source_revision_line(input);
+        let stripped = String::from_utf8(stripped).unwrap();
+        assert!(!stripped.contains("source_revision"));
+        assert!(stripped.contains("generator_version: \"0.4.0\""));
+        assert!(stripped.contains("# Knowledge Base"));
+    }
+
+    #[test]
+    fn strip_source_revision_line_is_a_no_op_without_one() {
+        let input = b"---\nokf_version: \"0.2\"\n---\n\n# Knowledge Base\n";
+        let stripped = strip_source_revision_line(input);
+        assert_eq!(
+            String::from_utf8(stripped).unwrap(),
+            "---\nokf_version: \"0.2\"\n---\n\n# Knowledge Base"
+        );
+    }
+
+    /// The regression test for the false-staleness risk this phase's own
+    /// design doc calls out: two root `index.md` files differing *only*
+    /// in `source_revision` (the shape `--check-fresh` sees whenever
+    /// `HEAD` has moved since the committed bundle was generated, even if
+    /// the analyzed source itself didn't change) must report no diff.
+    #[test]
+    fn diff_dirs_ignores_a_source_revision_only_difference_in_the_root_index() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(
+            a.path().join("index.md"),
+            "---\nokf_version: \"0.2\"\ngenerator_name: \"okf-rs\"\ngenerator_version: \"0.4.0\"\nsource_revision: \"aaaaaaa\"\n---\n\n# Knowledge Base\n",
+        )
+        .unwrap();
+        fs::write(
+            b.path().join("index.md"),
+            "---\nokf_version: \"0.2\"\ngenerator_name: \"okf-rs\"\ngenerator_version: \"0.4.0\"\nsource_revision: \"bbbbbbb\"\n---\n\n# Knowledge Base\n",
+        )
+        .unwrap();
+
+        assert!(
+            diff_dirs(
+                a.path(),
+                b.path(),
+                "the committed bundle",
+                "a fresh regenerate"
+            )
+            .unwrap()
+            .is_empty(),
+            "a source_revision-only difference must not be reported as staleness"
+        );
+    }
+
+    /// The complementary case: a *real* content difference in the root
+    /// index (not just `source_revision`) must still be caught —
+    /// normalization strips one specific line, not the whole file's
+    /// ability to be diffed.
+    #[test]
+    fn diff_dirs_still_catches_a_real_root_index_content_difference() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(
+            a.path().join("index.md"),
+            "---\nokf_version: \"0.2\"\n---\n\n# Knowledge Base\n\n- [Functions](functions/index.md) (1)\n",
+        )
+        .unwrap();
+        fs::write(
+            b.path().join("index.md"),
+            "---\nokf_version: \"0.2\"\n---\n\n# Knowledge Base\n\n- [Functions](functions/index.md) (2)\n",
+        )
+        .unwrap();
+
+        let diffs = diff_dirs(a.path(), b.path(), "a", "b").unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].contains("index.md"));
     }
 
     #[test]

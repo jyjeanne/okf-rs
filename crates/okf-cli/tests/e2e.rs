@@ -1010,6 +1010,112 @@ fn standalone_binary_check_fresh_fails_clearly_with_no_existing_bundle() {
     );
 }
 
+/// `okf-rs generate` inside a real git repository stamps the bundle
+/// root's reproducibility metadata with the actual current `HEAD` —
+/// `docs/improvement-plan-provenance-diff.md`'s Phase D.
+#[test]
+fn standalone_binary_generate_records_the_real_source_revision_in_a_git_repo() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&project)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "okf-rs e2e tests"]);
+    git(&["config", "user.email", "e2e@example.invalid"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c1"]);
+    let head = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&project)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let generate = run(&project, &["generate", "."]);
+    assert_success(&generate, &["generate"]);
+
+    let root_index = fs::read_to_string(project.join("knowledge/index.md")).unwrap();
+    assert!(
+        root_index.contains(&format!("source_revision: \"{head}\"")),
+        "expected the real HEAD ({head}) in the root index: {root_index}"
+    );
+    assert!(root_index.contains("generator_name: \"okf-rs\""));
+}
+
+/// The regression test for the false-staleness risk `--check-fresh`'s own
+/// design specifically guards against: a commit that moves `HEAD` without
+/// touching the analyzed source tree at all (adding an unrelated file
+/// outside `src/`) must not make an otherwise up-to-date bundle newly
+/// report as stale, even though the bundle's own recorded
+/// `source_revision` is now genuinely one commit behind `HEAD`.
+#[test]
+fn standalone_binary_check_fresh_ignores_an_unrelated_commit_moving_head() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&project)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "okf-rs e2e tests"]);
+    git(&["config", "user.email", "e2e@example.invalid"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c1"]);
+
+    let generate = run(&project, &["generate", "."]);
+    assert_success(&generate, &["generate"]);
+    // Commit the bundle too, so it's genuinely "already committed at this
+    // HEAD" the way a real project would have it.
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c2: commit the bundle"]);
+
+    // Move HEAD with a commit that never touches src/ at all.
+    fs::write(project.join("README.md"), "unrelated docs change\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "c3: unrelated docs change"]);
+
+    let check = run(&project, &["generate", ".", "--check-fresh"]);
+    assert_success(&check, &["generate --check-fresh"]);
+    let out = stdout_of(&check);
+    assert!(
+        out.contains("Up to date"),
+        "an unrelated commit moving HEAD must not be reported as staleness: {out}"
+    );
+}
+
 /// `--check-fresh --enrich` is rejected up front, for the same reason as
 /// `--check-determinism --enrich`: comparing against a freshly analyzed
 /// (unenriched) bundle would flag every AI-written description as

@@ -7,6 +7,7 @@ use okf_parser::Language;
 use std::path::{Path, PathBuf};
 
 pub mod config;
+pub mod git;
 
 /// A single recognized source file within a [`Project`].
 #[derive(Debug, Clone, PartialEq, Eq)]
