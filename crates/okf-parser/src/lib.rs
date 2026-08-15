@@ -299,6 +299,18 @@ pub struct Relationship {
     /// has *some* resolver, even the plain structural ones.
     pub resolved_by: String,
     pub confidence: Confidence,
+    /// The resolver's own reported version (LSP's `serverInfo.version`),
+    /// when `resolved_by` names a real language server and that server
+    /// reported one — `1.88.0` for a `rust-analyzer`-resolved edge, for
+    /// instance. `None` for every `tree-sitter` edge (nothing to version:
+    /// Tree-sitter's own unambiguous name match doesn't depend on a
+    /// resolver release) and for a server that didn't report a version in
+    /// its `initialize` response (the LSP spec doesn't require one).
+    /// Lets two edges naming the same resolver at different versions be
+    /// told apart without re-running the resolver to find out — see
+    /// `okf_analyzer::diff`'s `RelationshipChangeKind::ResolverChange`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver_version: Option<String>,
 }
 
 impl Relationship {
@@ -319,6 +331,7 @@ impl Relationship {
             target_display: target_display.into(),
             resolved_by: "tree-sitter".to_string(),
             confidence: Confidence::Exact,
+            resolver_version: None,
         }
     }
 
@@ -672,6 +685,7 @@ mod relationship_tests {
             target_display: "b".to_string(),
             resolved_by: "rust-analyzer".to_string(),
             confidence: Confidence::Semantic,
+            resolver_version: Some("1.88.0".to_string()),
         };
         let reason = rel.reason();
         assert!(reason.contains("rust-analyzer"));
@@ -691,6 +705,7 @@ mod relationship_tests {
             target_display: "b".to_string(),
             resolved_by: "hand-edited".to_string(),
             confidence: Confidence::Exact,
+            resolver_version: None,
         };
         let reason = rel.reason();
         assert!(reason.contains("hand-edited"));

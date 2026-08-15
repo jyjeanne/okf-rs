@@ -69,6 +69,11 @@ pub(crate) struct ResolvedEdge {
     pub(crate) callee: String,
     pub(crate) resolved_by: String,
     pub(crate) confidence: Confidence,
+    /// The resolver's own reported version, when `resolved_by` names a
+    /// real language server that reported one — see
+    /// `okf_lsp::LspClient::server_version`. Always `None` for a
+    /// `tree-sitter`-resolved edge.
+    pub(crate) resolver_version: Option<String>,
 }
 
 /// Scans and analyzes `project`, producing the full concept + relationship
@@ -237,6 +242,7 @@ pub fn analyze_with_cache_lsp(
                 callee: callee_id,
                 resolved_by: "tree-sitter".to_string(),
                 confidence: Confidence::Exact,
+                resolver_version: None,
             });
         }
     }
@@ -277,6 +283,7 @@ pub fn analyze_with_cache_lsp(
             target_display: callee_name,
             resolved_by: edge.resolved_by.clone(),
             confidence: edge.confidence,
+            resolver_version: edge.resolver_version.clone(),
         });
         concepts[callee_idx].relationships.push(Relationship {
             kind: RelationKind::CalledBy,
@@ -284,6 +291,7 @@ pub fn analyze_with_cache_lsp(
             target_display: caller_name,
             resolved_by: edge.resolved_by,
             confidence: edge.confidence,
+            resolver_version: edge.resolver_version,
         });
     }
 
@@ -316,6 +324,51 @@ pub struct ChangedConcept {
     pub kind: ConceptKind,
     pub before_signature: Option<String>,
     pub after_signature: Option<String>,
+    /// Per-relationship detail behind this concept's `Changed` status,
+    /// one entry per `(kind, target)` pair that actually differs between
+    /// `before`/`after` — see [`diff_relationships`] and
+    /// [`RelationshipChangeKind`]. Empty when the concept's relationships
+    /// are identical (a signature-only change), never includes a pair
+    /// classified [`RelationshipChangeKind::Unchanged`]. Purely additive
+    /// detail: nothing about `id`/`kind`/`before_signature`/
+    /// `after_signature` above, or the top-level `ChangeKind` a caller
+    /// sees this concept under, depends on it.
+    pub relationship_changes: Vec<(RelationKind, String, RelationshipChangeKind)>,
+}
+
+/// How one `(kind, target)` relationship pair changed between two
+/// snapshots of the same concept — the provenance-aware detail
+/// `okf-rs diff --ci` (see `ROADMAP.md`) classifies as a source-level
+/// failure, a resolver-level warning, or a confidence-level note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationshipChangeKind {
+    /// Same `(kind, target)` pair on both sides, with identical
+    /// `resolved_by`/`confidence`/`resolver_version` too — no change at
+    /// all. Computed but never stored in [`ChangedConcept::relationship_changes`];
+    /// only reachable by calling [`diff_relationships`] directly.
+    Unchanged,
+    /// The pair exists on only one side (added or removed), or the
+    /// target/kind itself differs — a real structural rewire, regardless
+    /// of what produced either side. Always a `--ci` failure.
+    SourceChange,
+    /// Same `(kind, target)` pair on both sides; `resolved_by` and/or
+    /// `resolver_version` differ, `confidence` does not — the pure "same
+    /// tool, different version" case (or a different resolver entirely,
+    /// still at the same confidence level).
+    ResolverChange,
+    /// Same `(kind, target)` pair on both sides; `confidence` differs,
+    /// `resolved_by`/`resolver_version` do not.
+    ConfidenceChange,
+    /// Same `(kind, target)` pair on both sides; `resolved_by`/
+    /// `resolver_version` *and* `confidence` both differ together — the
+    /// shape a source-level change *elsewhere* in the project produces
+    /// (a previously-unambiguous call becoming ambiguous, or vice versa,
+    /// flips a call between `tree-sitter`/`exact` and a real
+    /// resolver/`semantic` even though this edge's own target never
+    /// moved). Deliberately distinct from `ResolverChange`/
+    /// `ConfidenceChange` rather than folded into either — two fields
+    /// moved together, not one.
+    ProvenanceChange,
 }
 
 /// The result of comparing two analyzed snapshots of the same project
@@ -359,14 +412,23 @@ pub fn diff(before: &[Concept], after: &[Concept]) -> DiffReport {
         let Some(&before_concept) = before_by_id.get(concept.id.as_str()) else {
             continue;
         };
-        if before_concept.signature != concept.signature
-            || relationship_set(before_concept) != relationship_set(concept)
-        {
+        let relationship_changes = diff_relationships(before_concept, concept);
+        // A provenance-only change (e.g. a resolver-version bump with the
+        // same target) previously went undetected entirely: comparing
+        // just the (kind, target) *set* — this project's earlier
+        // determinism-focused equality check — can't see it, since that
+        // set is identical on both sides. `diff_relationships` sees it
+        // (a non-`Unchanged` classification for that pair), so gating on
+        // its emptiness rather than a separate set-equality check is what
+        // actually closes that gap, not just what classifies it once
+        // caught.
+        if before_concept.signature != concept.signature || !relationship_changes.is_empty() {
             report.changed.push(ChangedConcept {
                 id: concept.id.clone(),
                 kind: concept.kind,
                 before_signature: before_concept.signature.clone(),
                 after_signature: concept.signature.clone(),
+                relationship_changes,
             });
         }
     }
@@ -377,15 +439,142 @@ pub fn diff(before: &[Concept], after: &[Concept]) -> DiffReport {
     report
 }
 
-/// A comparable, order-independent view of a concept's relationships, so
-/// `diff` treats two relationship lists as equal regardless of extraction
-/// order.
-fn relationship_set(concept: &Concept) -> std::collections::BTreeSet<(RelationKind, &str)> {
-    concept
-        .relationships
-        .iter()
-        .map(|r| (r.kind, r.target.as_str()))
-        .collect()
+/// The three counts `okf-rs diff --ci` (see `ROADMAP.md`) classifies a
+/// [`DiffReport`] into and evaluates against `okf.toml`'s `[diff]`
+/// policy. Pure aggregation with no policy awareness of its own — an
+/// exit code is a `--ci`-flag concern, computed by the caller from these
+/// counts plus its own `okf_core::config::DiffPolicy` (this crate doesn't
+/// depend on `okf-core`'s config module, and doesn't need to: the same
+/// counts could just as easily drive a different policy, or none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CiSummary {
+    /// A concept added or removed (counted as `relationships.len()`, or
+    /// `1` for a concept with none — its own existence is the change),
+    /// a `Changed` concept's signature differing, or a
+    /// [`RelationshipChangeKind::SourceChange`] relationship pair.
+    /// Always CI-failure-worthy — never gated by policy.
+    pub source_changes: usize,
+    /// [`RelationshipChangeKind::ResolverChange`] and
+    /// [`RelationshipChangeKind::ProvenanceChange`] pairs — "the resolver
+    /// that produced this edge changed identity and/or version" (a
+    /// `ProvenanceChange` also touches confidence, but it's still
+    /// fundamentally a resolver-provenance change, not a second category
+    /// of its own — see `docs/improvement-plan-provenance-diff.md`).
+    pub resolver_changes: usize,
+    /// [`RelationshipChangeKind::ConfidenceChange`] pairs — same
+    /// resolver/version, same target, only the confidence level differs.
+    pub confidence_changes: usize,
+}
+
+impl CiSummary {
+    /// No changes in any category — `okf-rs diff --ci` reports "no
+    /// changes" and always exits `0` in this case, regardless of policy.
+    pub fn is_empty(&self) -> bool {
+        self.source_changes == 0 && self.resolver_changes == 0 && self.confidence_changes == 0
+    }
+}
+
+/// Reduces a [`DiffReport`] to the three counts [`CiSummary`] holds.
+pub fn ci_summary(report: &DiffReport) -> CiSummary {
+    let mut summary = CiSummary::default();
+
+    for concept in report.added.iter().chain(report.removed.iter()) {
+        // A concept with no relationships of its own still counts as 1:
+        // the concept's own existence is the change, not an edge.
+        summary.source_changes += concept.relationships.len().max(1);
+    }
+    for changed in &report.changed {
+        if changed.before_signature != changed.after_signature {
+            summary.source_changes += 1;
+        }
+        for (_, _, kind) in &changed.relationship_changes {
+            match kind {
+                RelationshipChangeKind::SourceChange => summary.source_changes += 1,
+                RelationshipChangeKind::ResolverChange
+                | RelationshipChangeKind::ProvenanceChange => summary.resolver_changes += 1,
+                RelationshipChangeKind::ConfidenceChange => summary.confidence_changes += 1,
+                // Never actually stored in `relationship_changes` (see
+                // `diff_relationships`), but matched explicitly rather
+                // than wildcarded so a future variant can't silently
+                // fall through uncounted.
+                RelationshipChangeKind::Unchanged => {}
+            }
+        }
+    }
+    summary
+}
+
+/// Classifies how each `(kind, target)` relationship pair differs between
+/// two snapshots of the same concept — see [`RelationshipChangeKind`].
+/// Order-independent (relationships are paired by key, not position, so
+/// `diff` still treats a reordered-but-otherwise-identical relationship
+/// list as unchanged) and duplicate-tolerant (a concept calling the same
+/// target from multiple call sites collapses to one pair, first
+/// occurrence wins — the same convention
+/// `okf-generator::unique_by_kind_and_target` establishes for rendering).
+/// Only pairs that actually changed are returned —
+/// [`RelationshipChangeKind::Unchanged`] pairs are computed internally
+/// but filtered out, so two concepts with identical relationships (a
+/// signature-only change, say) yield an empty `Vec`. Sorted by
+/// `(kind, target)` for deterministic output.
+pub fn diff_relationships(
+    before: &Concept,
+    after: &Concept,
+) -> Vec<(RelationKind, String, RelationshipChangeKind)> {
+    let before_by_key = dedup_relationships(&before.relationships);
+    let after_by_key = dedup_relationships(&after.relationships);
+
+    let keys: std::collections::BTreeSet<(RelationKind, &str)> = before_by_key
+        .keys()
+        .chain(after_by_key.keys())
+        .copied()
+        .collect();
+
+    let mut changes = Vec::new();
+    for key in keys {
+        let change = match (before_by_key.get(&key), after_by_key.get(&key)) {
+            (Some(b), Some(a)) => classify_provenance_change(b, a),
+            // Present on only one side: the pair itself was added or
+            // removed — a real structural change regardless of what
+            // produced either side.
+            _ => RelationshipChangeKind::SourceChange,
+        };
+        if change != RelationshipChangeKind::Unchanged {
+            changes.push((key.0, key.1.to_string(), change));
+        }
+    }
+    changes
+}
+
+/// Reduces `relationships` to one representative per distinct
+/// `(kind, target)` pair (first occurrence wins), keyed for lookup by
+/// [`diff_relationships`].
+fn dedup_relationships(
+    relationships: &[Relationship],
+) -> HashMap<(RelationKind, &str), &Relationship> {
+    let mut map = HashMap::new();
+    for rel in relationships {
+        map.entry((rel.kind, rel.target.as_str())).or_insert(rel);
+    }
+    map
+}
+
+/// Classifies a same-`(kind, target)` pair present on both sides by which
+/// provenance fields actually moved — see [`RelationshipChangeKind`]'s
+/// variants for what each combination means.
+fn classify_provenance_change(
+    before: &Relationship,
+    after: &Relationship,
+) -> RelationshipChangeKind {
+    let resolver_changed = before.resolved_by != after.resolved_by
+        || before.resolver_version != after.resolver_version;
+    let confidence_changed = before.confidence != after.confidence;
+    match (resolver_changed, confidence_changed) {
+        (false, false) => RelationshipChangeKind::Unchanged,
+        (true, false) => RelationshipChangeKind::ResolverChange,
+        (false, true) => RelationshipChangeKind::ConfidenceChange,
+        (true, true) => RelationshipChangeKind::ProvenanceChange,
+    }
 }
 
 /// How a concept changed between two analyzed snapshots — see [`impact`].
@@ -1044,6 +1233,568 @@ mod tests {
             report.is_empty(),
             "reordered relationships should not count as a change"
         );
+    }
+
+    /// Builds a `Relationship` with explicit provenance, for the
+    /// `RelationshipChangeKind` scenarios below — `Relationship::new`
+    /// always gives the tree-sitter/exact/no-version default, which isn't
+    /// enough to construct an `--lsp`-resolved edge.
+    fn provenance_relationship(
+        kind: RelationKind,
+        target: &str,
+        resolved_by: &str,
+        confidence: Confidence,
+        resolver_version: Option<&str>,
+    ) -> Relationship {
+        Relationship {
+            kind,
+            target: target.to_string(),
+            target_display: target.to_string(),
+            resolved_by: resolved_by.to_string(),
+            confidence,
+            resolver_version: resolver_version.map(str::to_string),
+        }
+    }
+
+    /// Scenario 1 (added edge): `A -> B` becomes `A -> B, A -> C`.
+    #[test]
+    fn diff_relationships_flags_an_added_edge_as_source_change() {
+        let mut before = make_concept("functions/a", "fn a()");
+        before
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/b", "b"));
+
+        let mut after = before.clone();
+        after
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/c", "c"));
+
+        let changes = diff_relationships(&before, &after);
+        assert_eq!(
+            changes,
+            vec![(
+                RelationKind::Calls,
+                "functions/c".to_string(),
+                RelationshipChangeKind::SourceChange
+            )]
+        );
+    }
+
+    /// Scenario 2 (removed edge): inverse of scenario 1.
+    #[test]
+    fn diff_relationships_flags_a_removed_edge_as_source_change() {
+        let mut before = make_concept("functions/a", "fn a()");
+        before
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/b", "b"));
+        before
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/c", "c"));
+
+        let mut after = before.clone();
+        after.relationships.retain(|r| r.target != "functions/c");
+
+        let changes = diff_relationships(&before, &after);
+        assert_eq!(
+            changes,
+            vec![(
+                RelationKind::Calls,
+                "functions/c".to_string(),
+                RelationshipChangeKind::SourceChange
+            )]
+        );
+    }
+
+    /// Scenario 3 (source-level rewire, same resolver): `Foo -> Bar`
+    /// (tree-sitter) becomes `Foo -> Baz` (tree-sitter) — two independent
+    /// `SourceChange` entries, never conflated into one "resolver
+    /// changed" report, since the target genuinely changed.
+    #[test]
+    fn diff_relationships_a_rewired_target_is_two_source_changes_not_a_resolver_change() {
+        let mut before = make_concept("functions/foo", "fn foo()");
+        before.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "functions/bar",
+            "bar",
+        ));
+
+        let mut after = make_concept("functions/foo", "fn foo()");
+        after.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "functions/baz",
+            "baz",
+        ));
+
+        let mut changes = diff_relationships(&before, &after);
+        changes.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            changes,
+            vec![
+                (
+                    RelationKind::Calls,
+                    "functions/bar".to_string(),
+                    RelationshipChangeKind::SourceChange
+                ),
+                (
+                    RelationKind::Calls,
+                    "functions/baz".to_string(),
+                    RelationshipChangeKind::SourceChange
+                ),
+            ]
+        );
+    }
+
+    /// Scenario 4 (resolver-only change): `Foo -> Bar` (`rust-analyzer`
+    /// 1.88) becomes `Foo -> Bar` (`rust-analyzer` 1.89) — exactly one
+    /// `ResolverChange` entry, not a remove+add pair. This is the case
+    /// that was invisible to `diff` entirely before this phase: the
+    /// (kind, target) set never changes, so nothing before
+    /// `diff_relationships` existed would have even noticed.
+    #[test]
+    fn diff_relationships_flags_a_resolver_version_bump_as_resolver_change() {
+        let mut before = make_concept("functions/foo", "fn foo()");
+        before.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/bar",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.88.0"),
+        ));
+
+        let mut after = make_concept("functions/foo", "fn foo()");
+        after.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/bar",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.89.0"),
+        ));
+
+        let changes = diff_relationships(&before, &after);
+        assert_eq!(
+            changes,
+            vec![(
+                RelationKind::Calls,
+                "functions/bar".to_string(),
+                RelationshipChangeKind::ResolverChange
+            )]
+        );
+
+        // And the top-level `diff` gate now actually catches this --
+        // previously the (kind, target)-only equality check meant this
+        // concept never made it into `report.changed` at all.
+        let report = diff(&[before], &[after]);
+        assert_eq!(report.changed.len(), 1);
+        assert_eq!(report.changed[0].id, "functions/foo");
+        assert_eq!(report.changed[0].relationship_changes.len(), 1);
+    }
+
+    /// Scenario 5 (resolver changes which target resolves): `Foo -> Bar`
+    /// (`rust-analyzer` 1.88) becomes `Foo -> Baz` (`rust-analyzer`
+    /// 1.89) — `SourceChange` for both the removed `Bar` and added `Baz`
+    /// pairs, even though the resolver version also happens to differ; a
+    /// diff that reported this as only a resolver change would hide a
+    /// real call-graph rewire.
+    #[test]
+    fn diff_relationships_a_resolver_change_that_also_rewires_the_target_is_source_change() {
+        let mut before = make_concept("functions/foo", "fn foo()");
+        before.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/bar",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.88.0"),
+        ));
+
+        let mut after = make_concept("functions/foo", "fn foo()");
+        after.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/baz",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.89.0"),
+        ));
+
+        let mut changes = diff_relationships(&before, &after);
+        changes.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            changes,
+            vec![
+                (
+                    RelationKind::Calls,
+                    "functions/bar".to_string(),
+                    RelationshipChangeKind::SourceChange
+                ),
+                (
+                    RelationKind::Calls,
+                    "functions/baz".to_string(),
+                    RelationshipChangeKind::SourceChange
+                ),
+            ]
+        );
+    }
+
+    /// Scenario 6 (ambiguity newly introduced, same real target):
+    /// `Foo -> Bar` (`tree-sitter`/`exact`) becomes `Foo -> Bar`
+    /// (`rust-analyzer`/`semantic`) — the shape a same-named function
+    /// added elsewhere in the project produces: the target didn't move,
+    /// but the call that used to be unambiguous now needs `--lsp` to
+    /// resolve. Neither `ResolverChange` (confidence also moved) nor
+    /// `ConfidenceChange` (resolved_by also moved) fits -- this is
+    /// `ProvenanceChange`.
+    #[test]
+    fn diff_relationships_flags_a_combined_resolver_and_confidence_change_as_provenance_change() {
+        let mut before = make_concept("functions/foo", "fn foo()");
+        before.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "functions/bar",
+            "bar",
+        ));
+
+        let mut after = make_concept("functions/foo", "fn foo()");
+        after.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/bar",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.88.0"),
+        ));
+
+        let changes = diff_relationships(&before, &after);
+        assert_eq!(
+            changes,
+            vec![(
+                RelationKind::Calls,
+                "functions/bar".to_string(),
+                RelationshipChangeKind::ProvenanceChange
+            )]
+        );
+    }
+
+    #[test]
+    fn diff_relationships_is_order_independent() {
+        let mut before = make_concept("functions/a", "fn a()");
+        before
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/x", "x"));
+        before
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/y", "y"));
+
+        let mut after = make_concept("functions/a", "fn a()");
+        after
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/y", "y"));
+        after
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/x", "x"));
+
+        assert!(diff_relationships(&before, &after).is_empty());
+    }
+
+    #[test]
+    fn a_signature_only_change_reports_empty_relationship_changes() {
+        let mut before = make_concept("functions/a", "fn a()");
+        before
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/b", "b"));
+
+        let mut after = make_concept("functions/a", "fn a(x: i32)");
+        after
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/b", "b"));
+
+        let report = diff(&[before], &[after]);
+        assert_eq!(report.changed.len(), 1);
+        assert!(report.changed[0].relationship_changes.is_empty());
+    }
+
+    #[test]
+    fn ci_summary_is_empty_for_no_changes() {
+        let concepts = vec![make_concept("functions/a", "fn a()")];
+        let report = diff(&concepts, &concepts.clone());
+        assert!(ci_summary(&report).is_empty());
+    }
+
+    #[test]
+    fn ci_summary_counts_a_signature_only_change_as_a_source_change() {
+        // A pure signature change (no relationship difference at all)
+        // is unambiguously source-level and must not slip through
+        // uncounted just because `relationship_changes` is empty.
+        let before = make_concept("functions/a", "fn a()");
+        let after = make_concept("functions/a", "fn a(x: i32)");
+
+        let report = diff(&[before], &[after]);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 1);
+        assert_eq!(summary.resolver_changes, 0);
+        assert_eq!(summary.confidence_changes, 0);
+    }
+
+    #[test]
+    fn ci_summary_counts_an_added_edge_as_one_source_change() {
+        let before = make_concept("functions/a", "fn a()");
+        let mut after = before.clone();
+        after
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/b", "b"));
+
+        let report = diff(&[before], &[after]);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 1);
+        assert_eq!(summary.resolver_changes, 0);
+    }
+
+    #[test]
+    fn ci_summary_counts_a_removed_edge_as_one_source_change() {
+        let mut before = make_concept("functions/a", "fn a()");
+        before
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/b", "b"));
+        let after = make_concept("functions/a", "fn a()");
+
+        let report = diff(&[before], &[after]);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 1);
+    }
+
+    #[test]
+    fn ci_summary_counts_a_target_rewire_as_two_source_changes() {
+        let mut before = make_concept("functions/foo", "fn foo()");
+        before.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "functions/bar",
+            "bar",
+        ));
+        let mut after = make_concept("functions/foo", "fn foo()");
+        after.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "functions/baz",
+            "baz",
+        ));
+
+        let report = diff(&[before], &[after]);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 2);
+        assert_eq!(summary.resolver_changes, 0);
+    }
+
+    #[test]
+    fn ci_summary_counts_a_resolver_only_change_without_any_source_changes() {
+        let mut before = make_concept("functions/foo", "fn foo()");
+        before.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/bar",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.88.0"),
+        ));
+        let mut after = make_concept("functions/foo", "fn foo()");
+        after.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/bar",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.89.0"),
+        ));
+
+        let report = diff(&[before], &[after]);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 0);
+        assert_eq!(summary.resolver_changes, 1);
+        assert_eq!(summary.confidence_changes, 0);
+    }
+
+    #[test]
+    fn ci_summary_a_combined_resolver_and_confidence_change_counts_as_resolver_not_confidence() {
+        let mut before = make_concept("functions/foo", "fn foo()");
+        before.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "functions/bar",
+            "bar",
+        ));
+        let mut after = make_concept("functions/foo", "fn foo()");
+        after.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/bar",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.88.0"),
+        ));
+
+        let report = diff(&[before], &[after]);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 0);
+        assert_eq!(
+            summary.resolver_changes, 1,
+            "ProvenanceChange counts as resolver_changes"
+        );
+        assert_eq!(summary.confidence_changes, 0);
+    }
+
+    #[test]
+    fn ci_summary_mixed_source_and_resolver_changes_both_count() {
+        let mut before = make_concept("functions/foo", "fn foo()");
+        before.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/bar",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.88.0"),
+        ));
+        before
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/x", "x"));
+
+        let mut after = make_concept("functions/foo", "fn foo()");
+        after.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/bar",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.89.0"),
+        ));
+        // functions/x is gone -- a real source-level removal.
+
+        let report = diff(&[before], &[after]);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 1);
+        assert_eq!(summary.resolver_changes, 1);
+    }
+
+    /// This repository's root, derived from `okf-analyzer`'s own manifest
+    /// directory — the same technique `okf-cli`'s e2e tests and
+    /// `okf-parser`'s golden-fixture test use to find `tests/fixtures/`
+    /// regardless of `cargo test`'s working directory.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/okf-analyzer should be two levels below the repo root")
+            .to_path_buf()
+    }
+
+    /// Phase F's golden diff fixtures (`tests/fixtures/diff/*/{before,after}`
+    /// — see `docs/improvement-plan-provenance-diff.md`), each round-tripped
+    /// through the real `okf_parser::read_bundle` path (not the in-memory
+    /// `Concept` literals every other test in this file builds by hand) and
+    /// classified by the real `diff`/`ci_summary` pipeline. This is the
+    /// grep target the guard test right below checks against — every
+    /// subdirectory name here must also appear in this function.
+    #[test]
+    fn golden_diff_fixtures_classify_correctly_through_read_bundle() {
+        let fixtures = repo_root().join("tests/fixtures/diff");
+        let load = |scenario: &str, side: &str| {
+            okf_parser::read_bundle(&fixtures.join(scenario).join(side)).unwrap()
+        };
+
+        // unchanged: byte-identical before/after -- no changes at all.
+        let before = load("unchanged", "before");
+        let after = load("unchanged", "after");
+        let report = diff(&before, &after);
+        assert!(report.is_empty());
+        assert!(ci_summary(&report).is_empty());
+
+        // added-edge: a relationship added to an existing concept.
+        let before = load("added-edge", "before");
+        let after = load("added-edge", "after");
+        let report = diff(&before, &after);
+        assert_eq!(report.changed.len(), 1);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 1);
+        assert_eq!(summary.resolver_changes, 0);
+        assert_eq!(summary.confidence_changes, 0);
+
+        // removed-edge: the inverse of added-edge.
+        let before = load("removed-edge", "before");
+        let after = load("removed-edge", "after");
+        let report = diff(&before, &after);
+        assert_eq!(report.changed.len(), 1);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 1);
+
+        // resolver-change: same target, resolver_version bumps 1.88 -> 1.89.
+        let before = load("resolver-change", "before");
+        let after = load("resolver-change", "after");
+        let report = diff(&before, &after);
+        assert_eq!(report.changed.len(), 1);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 0);
+        assert_eq!(summary.resolver_changes, 1);
+
+        // semantic-change: the target itself is rewired (bar -> baz), even
+        // though the resolver version also happens to differ -- this must
+        // stay a source change, not get absorbed into a resolver change.
+        let before = load("semantic-change", "before");
+        let after = load("semantic-change", "after");
+        let report = diff(&before, &after);
+        assert_eq!(report.changed.len(), 1);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 2);
+        assert_eq!(summary.resolver_changes, 0);
+    }
+
+    /// Guards against a fixture directory silently going stale: every
+    /// subdirectory under `tests/fixtures/diff/` must be named in the
+    /// test above, the same "grep-based, not a runtime check" enforcement
+    /// `docs/improvement-plan-provenance-diff.md`'s Phase F specifies —
+    /// an unused fixture is worse than none, since nothing else would
+    /// catch it silently drifting out of sync with what it claims to
+    /// demonstrate.
+    #[test]
+    fn every_diff_fixture_subdirectory_is_referenced_by_a_test() {
+        let fixtures = repo_root().join("tests/fixtures/diff");
+        let this_file = std::fs::read_to_string(file!())
+            .or_else(|_| {
+                std::fs::read_to_string(repo_root().join("crates/okf-analyzer/src/lib.rs"))
+            })
+            .expect("should be able to read this file's own source to grep it");
+
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&fixtures).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                this_file.contains(&format!("\"{name}\"")),
+                "tests/fixtures/diff/{name} exists but no test in this file references it by name -- \
+                 add it to golden_diff_fixtures_classify_correctly_through_read_bundle"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 5,
+            "expected exactly the 5 scenarios docs/improvement-plan-provenance-diff.md's Phase F names"
+        );
+    }
+
+    #[test]
+    fn ci_summary_an_added_concept_with_no_relationships_still_counts_as_one_source_change() {
+        let before: Vec<Concept> = vec![];
+        let after = vec![make_concept("functions/new", "fn new()")];
+
+        let report = diff(&before, &after);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 1);
+    }
+
+    #[test]
+    fn ci_summary_an_added_concept_with_relationships_counts_one_per_relationship() {
+        let before: Vec<Concept> = vec![];
+        let mut new_concept = make_concept("functions/new", "fn new()");
+        new_concept
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/a", "a"));
+        new_concept
+            .relationships
+            .push(Relationship::new(RelationKind::Calls, "functions/b", "b"));
+        let after = vec![new_concept];
+
+        let report = diff(&before, &after);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 2);
     }
 
     fn concept_with_edges(

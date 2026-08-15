@@ -11,6 +11,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase 3 — Search, Interop & Intelligence | ✅ Complete (15/15) |
 | Improvement Plan Delivery (competitive gap-closing) | ✅ Complete (7/7) |
 | Improvement Plan (AI-native platform maturity, community feedback) | ✅ Complete (11/11 shipped) |
+| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (5/6 shipped, 1 partial) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -250,6 +251,225 @@ Exploratory, not yet scheduled: deterministic semantic analysis, incremental gra
 Every item above should improve at least one of: determinism, transparency, auditability, AI efficiency, developer experience, CI/CD integration, or Git friendliness — the same test the rest of this roadmap has applied since Phase 1.
 
 **Not done here, deliberately:** the reviewer's suggestion to convert this into a GitHub Projects roadmap with milestones and linked issues is a good one, but it's a repository/process change (creating GitHub milestones and issues) rather than a documentation change, so it's left for an explicit follow-up request rather than done as a side effect of recording this feedback.
+
+---
+
+## Improvement Plan — Provenance Depth, Graph Diff & MCP Tool-Selection
+
+The same external reviewer's *second* round of feedback (recorded verbatim in
+[`docs/feedback/2026-08-provenance-graph-diff-review.md`](docs/feedback/2026-08-provenance-graph-diff-review.md)),
+distilled into a codebase-grounded, phased plan in
+[`docs/improvement-plan-provenance-diff.md`](docs/improvement-plan-provenance-diff.md) after a gap
+check against the AI-native platform maturity plan above found most of that review's phases 1-3
+and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracked here.
+
+- [x] ✅ **Phase A — Resolver version.** `Relationship` gains an optional `resolver_version` field,
+  populated from the LSP `initialize` handshake's `serverInfo.version` (`okf_lsp::LspClient::server_version`)
+  and threaded through `okf-analyzer`'s `ResolvedEdge` the same path `resolved_by`/`confidence`
+  already travel. Rendered as `resolver_version: 1.88.0` alongside `resolved_by`/`confidence` in
+  frontmatter, omitted entirely for `tree-sitter` edges or a server that didn't report one — the
+  same optional-field, backward-compatible shape those two fields already established.
+  `okf_validator::check_relationship_provenance` gained a new warning (not an error, matching the
+  rest of that check's severity choices): a `resolver_version` set without a real `resolved_by`
+  alongside it (i.e. on a `tree-sitter` edge) is flagged, since tree-sitter has no version to
+  record. **Deliberately not built**, per the plan's own reasoning: a closed `ProvenanceOrigin`
+  enum (`TreeSitter`/`Lsp`/`Manual`/`Derived`) — `resolved_by` is already a free-form string (a
+  hand-edited bundle can carry `resolved_by: hand-edited` today), and this project already
+  rejected adding confidence-enum variants nothing produces; a new enum with unproduced variants
+  would repeat that mistake.
+- [x] ✅ **Phase B — Provenance-aware graph diff.** `okf_analyzer::diff` gains a new
+  `RelationshipChangeKind` (`Unchanged`/`SourceChange`/`ResolverChange`/`ConfidenceChange`/
+  `ProvenanceChange`) and a `diff_relationships(before, after)` helper, pairing a concept's
+  relationships by `(kind, target)` and classifying each pair by which provenance fields moved.
+  `ChangedConcept` gains a `relationship_changes` field carrying the non-`Unchanged` pairs — purely
+  additive; `Added`/`Removed`/`Changed` and every existing `impact()`/`review()`/`explain()`
+  consumer are untouched. Closes a real bug the plan's own gap analysis named, in both directions:
+  previously, `diff`'s (kind, target)-only equality check meant a **resolver-version-only change
+  was invisible to `diff` entirely** (the concept never even entered `report.changed`), while a
+  genuine target rewire that also happened to change resolver/version was at risk of being
+  misread as "just the resolver" if a classifier weren't careful to check the target first. Fixed
+  a fifth case the plan's own review caught before this shipped: `resolved_by` **and** `confidence`
+  changing *together* on an unchanged target (the shape a same-named function added elsewhere in
+  the project produces — a previously-unambiguous call becoming ambiguous, newly needing `--lsp`)
+  fits neither `ResolverChange` nor `ConfidenceChange` alone, so it's its own `ProvenanceChange`
+  variant rather than being silently absorbed into one of the other two.
+- [x] ✅ **Phase C — `okf-rs diff --ci` policy.** A new `--ci` flag classifies a `DiffReport` via
+  `okf_analyzer::ci_summary` into source/resolver/confidence counts and renders them as
+  `❌`/`⚠️`/`ℹ️` lines plus a deterministic exit code, evaluated against a new `okf.toml` `[diff]`
+  section (`okf_core::config::DiffPolicy`: `resolver_changes` defaults to `"warn"`,
+  `confidence_changes` defaults to `"ignore"`; either can be set to `"warn"`/`"fail"`/`"ignore"`).
+  Source-level changes (added/removed concepts, a changed signature, or a
+  `RelationshipChangeKind::SourceChange` pair) are never configurable — always both reported and
+  failure-worthy, mirroring `validate --ci`'s "warnings are real problems by default" posture.
+  `ProvenanceChange` pairs are folded into `resolver_changes`, not a fourth policy knob of their
+  own. Caught and fixed one real gap while implementing the plan's own "counting unit" spec: a
+  pure signature-only change (no relationship difference at all) wasn't counted by the plan's
+  original formula, which would have let a CI run silently pass a PR that only changed a
+  function's signature — `ci_summary` now counts a `Changed` concept's `before_signature !=
+  after_signature` as a source change in its own right, independent of `relationship_changes`.
+- [x] ✅ **Phase D — Artifact-level reproducibility metadata.** The bundle-root `index.md`'s existing
+  `okf_version` frontmatter (already the one place OKF permits frontmatter on an `index.md`) gains
+  `generator_name`/`generator_version` (always populated — `"okf-rs"`/the crate's own compile-time
+  version) and `source_revision` (the commit `HEAD` pointed to when `generate` ran — new
+  `okf_core::git::head_revision`, best-effort, `None` outside a git repo). Deliberately **no
+  `generated_at` timestamp** — a new `manifest.md` file was this plan's first draft and is
+  deliberately *not* what shipped (see the plan doc's own correction): every other `.md` file in a
+  bundle is required to carry a recognized concept `type:`, which metadata has none of, so a
+  separate file would be a validator error under this project's own tooling. Extending the
+  existing, already-permitted root frontmatter avoids that entirely. Caught and fixed a real
+  regression risk while implementing: naively embedding `source_revision` would make `generate
+  --check-fresh` report false staleness whenever `HEAD` moves for a reason that never touches the
+  analyzed source tree (a README edit, say) — `source_revision` describes *which commit produced
+  this artifact*, not *whether the analyzed content matches*, and conflating the two would break
+  `--check-fresh`'s own contract. Fixed by having `okf-cli`'s `diff_dirs` normalize
+  (`strip_source_revision_line`) that one line out of the root `index.md` comparison
+  `--check-determinism`/`--check-fresh` both use, before diffing — the artifact still records its
+  real provenance; the *staleness check* just doesn't conflate that with content drift.
+- [x] 🚧 **Phase E — Specialized-vs-consolidated MCP tool-*selection* benchmark harness.** A new
+  `okf-mcp` module (`tool_selection_benchmark`) ships the fully offline, model-free half the
+  plan's own review called for building first: a fixed 14-question set (one per `graph` relation),
+  each with a known-correct answer verified directly against a real fixture bundle through the
+  actual `tools::call` dispatch — no model involved, matching every other benchmark in this
+  codebase's offline-and-deterministic posture. The pre-0.3.0 specialized-tool-name mapping
+  (`graph_<relation>`) is reconstructed for comparison, with the one documented exception
+  (`explain`, which postdates the consolidation and has no specialized-era counterpart) scored
+  against the consolidated design only, never a dropped or invented one. **Not done, deliberately:**
+  wiring an actual model endpoint to run this question set live — the only way to get real
+  tool-selection-accuracy/token/latency numbers the plan's Phase E asks for. Every other benchmark
+  in this codebase is offline and deterministic; a live call breaks that posture, costs real
+  money, and — per the plan's own "CONDITIONAL GO" verdict on this item — needs someone to
+  explicitly own interpreting a non-deterministic result and pick a model/endpoint before it's
+  wired in, not a decision to bake in silently. A half-built CLI flag that dumps the question set
+  without ever calling a model would be more misleading than leaving it unbuilt, so nothing here
+  pretends to benchmark anything yet.
+- [x] ✅ **Phase F — `tests/fixtures/` golden dataset.** The reviewer's proposed layout, exactly:
+  `provenance/{tree-sitter,lsp,mixed}.md` (real bundle concept files covering Phase A's three
+  provenance shapes), `diff/{unchanged,added-edge,removed-edge,resolver-change,semantic-change}/
+  {before,after}/` (real bundle directories for Phase B's five worked scenarios), and
+  `mcp/{consolidated,specialized}/` (Phase E's 14-question set and reconstructed pre-0.3.0
+  tool-name mapping, exported as portable JSON — the one piece of data that genuinely couldn't be
+  used outside Rust before this). Every fixture is exercised by a real test, not left to rot:
+  `okf-parser` round-trips the provenance fixtures through the real `read_bundle` path;
+  `okf-analyzer` round-trips every diff scenario through the real `read_bundle` → `diff` →
+  `ci_summary` pipeline (not the in-memory `Concept` literals every other test in that file
+  builds by hand — a genuinely different code path, and the first test in this repo to diff two
+  *real bundle directories on disk* rather than two in-memory concept lists); a dedicated guard
+  test greps the analyzer test file for every `diff/` subdirectory's name, so an unreferenced
+  fixture fails the build instead of silently rotting; and `okf-mcp` checks the exported JSON
+  against the live Rust question set on every run, so the two can never drift apart. Most of Phase
+  B's own classification scenarios deliberately stayed as inline `Concept`/`Relationship` struct
+  literals in Rust test code rather than being force-relocated here — this phase only moved what's
+  genuinely more natural as data than code (real fixture bundles, portable JSON), matching its own
+  stated scope rather than relocating everything for its own sake.
+
+Verified by dogfooding. Unit tests cover the new field end-to-end: `okf-lsp` parses `serverInfo.version`
+from a real `initialize` response and — genuinely exercised in this environment, not skipped —
+`LspClient::server_version()` returns `Some(..)` against a real `rust-analyzer`; `okf-parser`
+round-trips `resolver_version` through `read_bundle` (present, absent, and the pre-existing
+bare-string/missing-field fallback paths all still resolve to `None`); `okf-generator`'s frontmatter
+round-trip test now asserts a real `resolver_version` (not just `resolved_by`/`confidence`) survives
+write-then-read-back; `okf-validator` covers both the new warning and a resolver_version alongside a
+real resolver staying unflagged. End-to-end against this repository's own source via the real
+compiled binary: `okf-rs generate . --lsp` (992 concepts) rendered `resolver_version: 1.94.1
+(e408947 2026-03-25)` — the real installed `rust-analyzer`'s own reported version string, parentheses
+and all — on 444 relationship entries; `okf-rs validate` reported "no issues found" against that
+bundle (confirming the new warning doesn't misfire on real `--lsp` output, where every versioned
+edge does name a real resolver); and, on the plain tree-sitter-only path (no `--lsp`, where this
+field is never populated), `okf-rs generate . --check-determinism` still reported "Deterministic"
+(992 concepts) — confirming this schema addition doesn't regress the determinism guarantee it
+deliberately doesn't touch.
+
+Phase B verified by dogfooding. `cargo test -p okf-analyzer` covers the plan's six worked
+scenarios directly (added edge, removed edge, a same-resolver target rewire, a resolver-version
+bump, a resolver change that also rewires the target, and the combined resolver+confidence case),
+plus order-independence (`diff_relationships` pairs by key, not position, so a reordered-but-
+identical relationship list still reports empty) and a signature-only change correctly reporting
+an empty `relationship_changes`. One new test asserts the bug-fix directly, not just the
+classification: a concept whose only difference between two snapshots is a `resolver_version` bump
+now correctly appears in `report.changed` at all (`report.changed.len() == 1`), which it did not
+before this phase — the previous (kind, target)-only equality check had no way to see it. The full
+workspace suite (`cargo test --workspace`, `cargo clippy --workspace --all-targets -D warnings`,
+`cargo fmt --check --all`) stayed clean throughout, including every pre-existing `okf-cli` e2e test
+for `diff`/`impact`/`review` against the real compiled binary — confirming the new field is
+additive, not a behavior change, for every existing consumer.
+
+Phase C verified two ways. `render_ci_report` — the pure rendering/policy-evaluation function
+`cmd_diff_ci` is a thin wrapper over, the same split `render_review_markdown`/`cmd_review` already
+established — is covered by 12 unit tests reproducing the plan's full exit-code table (no changes,
+metadata-only, resolver-only at both `"warn"` and `"fail"`, added/removed/rewired source edges,
+mixed source+resolver, and a dedicated test confirming a `ProvenanceChange`-derived count follows
+`resolver_changes`' policy rather than `confidence_changes`') entirely with synthetic `CiSummary`
+data — deliberately so, since a genuine resolver-*version* difference needs two different
+installed `rust-analyzer` binaries, which neither this environment nor CI can guarantee, and
+`okf-rs diff`'s underlying two-ref analysis doesn't run `--lsp` at all regardless (a pre-existing
+limitation this phase didn't introduce or attempt to fix). End-to-end, three new `okf-cli` e2e
+tests run the real compiled binary: a source-level change (an added/removed function) fails `--ci`
+with `❌ SOURCE CHANGES: 2` and `exit code: 1`; a ref diffed against itself exits `0` with `No
+changes between...`; and a project with a hand-written `okf.toml` `[diff]` section still loads and
+runs correctly (confirming the config-loading path doesn't error just because the file exists),
+though it can't exercise the resolver/confidence *gating* itself for the same `--lsp` reason.
+Dogfooded against this repository's own real git history via the real binary: `okf-rs diff
+717b445 97474f6 . --ci` (the release-v0.4.0 commit against this plan's own Phase A+B commit)
+correctly reports `❌ SOURCE CHANGES: 57` and exits `1`; the same ref against itself reports `No
+changes...` and exits `0`; and the pre-existing non-`--ci` `okf-rs diff` output is confirmed
+byte-for-byte unaffected by this phase. Full workspace `cargo test`/`clippy -D warnings`/`fmt
+--check` stayed clean throughout.
+
+Phase D verified two ways. Unit tests cover the new `okf_core::git` module directly (`None`
+outside a git repository, the real `HEAD` SHA inside one, `None` in a freshly initialized repo
+with no commits yet, and — the deliberate non-behavior — the SHA is still returned when the
+working tree is dirty, not withheld); `okf-generator`'s root-index tests cover
+`generator_name`/`generator_version` always being present, `source_revision` omitted entirely
+when `None` (never rendered as `source_revision: null`), and rendered correctly when given;
+`okf-cli`'s `strip_source_revision_line`/`diff_dirs` tests cover the normalization directly — two
+root `index.md` files differing *only* in `source_revision` report no diff, while a real content
+difference in the same file (e.g. a changed "Contains N" count) still gets caught, confirming the
+normalization strips exactly one line, not the file's ability to be diffed at all. End-to-end
+against real git repositories via the compiled binary: `okf-rs generate` records the actual
+current `HEAD` SHA in the bundle root (`generate` inside a fresh repo at a known commit, comparing
+the bundle's `source_revision` against `git rev-parse HEAD` run independently); and the regression
+test this phase's own design doc flagged as the real risk — commit the source, generate, commit
+the bundle, then commit an unrelated file (`README.md`) that never touches `src/` at all, moving
+`HEAD` one commit past what the committed bundle recorded — confirms `generate --check-fresh`
+still reports "Up to date," not a false "Stale." Dogfooded against this repository's own source
+via the real binary: `okf-rs generate .` (1062 concepts) rendered `source_revision:
+"5989f246c4c50e13bc4bd0a6769c04816e773e43"` — exactly this repository's real `HEAD` at generation
+time, confirmed by an independent `git rev-parse HEAD`; `okf-rs validate` reported "no issues
+found"; and both `generate --check-determinism` and `generate --check-fresh` (run immediately
+after) reported clean, confirming this phase doesn't regress either guarantee on a real, non-toy
+codebase. Full workspace `cargo test`/`clippy -D warnings`/`fmt --check` stayed clean throughout
+(one pre-existing, environment-timing-dependent real-`rust-analyzer` test flaked and passed on
+retry in isolation, unrelated to this phase — the same flake already noted on this PR's CI).
+
+Phase E's harness verified by dogfooding — through the real MCP tool dispatch, not a shortcut
+around it. `every_question_s_expected_answer_is_correct_against_the_fixture` calls
+`tools::call("graph", ...)` — the same function the real `okf-mcp` stdio server dispatches every
+`tools/call` request through — for all 14 questions against the fixture bundle, and passed on the
+first run: every one of the fixture's deliberately-varied shapes (a real cross-package call for
+`callers`/`callees`/`path`/`explain`/`api`/`modules`/`layers`/`domains`/`communities`, a genuine
+two-function call cycle for `cycles`, a call-free concept for `isolated`, a `*Builder`/
+`*Controller`-shaped pair for `patterns`/`features`) produced exactly the claimed answer. A
+second test cross-checks the question set's 14 relations against the `graph` tool's own live
+schema (`tools::list()`), not a hardcoded copy of it, so the question set can't silently drift out
+of sync with what `graph` actually exposes if a relation is ever added or renamed. Full workspace
+`cargo test`/`clippy -D warnings`/`fmt --check` stayed clean throughout.
+
+Phase F verified by dogfooding — and by design, its own tests are the dogfooding: this phase
+exists specifically to make the fixtures a real, disk-resident artifact rather than data baked
+into test source, so "does a real reader parse these correctly" is the actual claim under test,
+not a metaphor. `golden_provenance_fixtures_round_trip_through_read_bundle` and
+`golden_diff_fixtures_classify_correctly_through_read_bundle` both passed on the first run against
+the real fixture files (not adjusted after the fact to match whatever the code happened to
+produce) — confirming the hand-authored YAML frontmatter in `tests/fixtures/` is byte-for-byte
+compatible with what `okf-generator` itself would have written, for every provenance shape and
+diff scenario named. `every_diff_fixture_subdirectory_is_referenced_by_a_test` was verified to
+actually catch drift, not just pass vacuously: temporarily adding an unreferenced sixth
+subdirectory under `tests/fixtures/diff/` during development made it fail with the expected
+message, then removing it made it pass again. `exported_json_fixtures_match_the_rust_question_set`
+closes the loop on Phase E's own "a form a non-Rust benchmark script could also load" goal — the
+question set now genuinely exists outside Rust, checked against the source of truth on every test
+run rather than trusted to stay in sync by hand. Full workspace `cargo test`/
+`clippy -D warnings`/`fmt --check` stayed clean throughout.
 
 ---
 

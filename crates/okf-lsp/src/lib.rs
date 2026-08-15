@@ -125,6 +125,14 @@ pub struct LspClient {
     project_root: PathBuf,
     language: Language,
     opened: std::collections::HashSet<String>,
+    /// The server's own reported version, captured from `initialize`'s
+    /// `serverInfo.version` (per the LSP spec) — `None` if the server
+    /// didn't include a `serverInfo` object at all, which the spec
+    /// doesn't require. Threaded through to every edge this client
+    /// resolves, so `resolved_by: rust-analyzer` edges from two different
+    /// installed versions are distinguishable — see
+    /// [`LspClient::server_version`].
+    server_version: Option<String>,
 }
 
 impl LspClient {
@@ -179,6 +187,7 @@ impl LspClient {
             project_root: project_root.to_path_buf(),
             language,
             opened: std::collections::HashSet::new(),
+            server_version: None,
         };
         client.initialize()?;
         Ok(Some(client))
@@ -194,9 +203,19 @@ impl LspClient {
                 "capabilities": {},
             }),
         )?;
-        self.read_response(id)?;
+        let result = self.read_response(id)?;
+        self.server_version = parse_server_version(&result);
         self.notify("initialized", json!({}))?;
         Ok(())
+    }
+
+    /// The language server's own reported version, if it included one in
+    /// its `initialize` response — e.g. `1.88.0` for a real
+    /// `rust-analyzer`. `None` before `initialize()` has run, or if the
+    /// server never reported `serverInfo` (the LSP spec makes it
+    /// optional).
+    pub fn server_version(&self) -> Option<&str> {
+        self.server_version.as_deref()
     }
 
     /// Opens `relative_path` (relative to the project root this client
@@ -403,6 +422,20 @@ fn relativize(project_root: &Path, uri: &str) -> String {
         .unwrap_or(path)
 }
 
+/// Extracts `serverInfo.version` from an `initialize` response, per the
+/// LSP spec's optional `InitializeResult.serverInfo` field. `None` for a
+/// response with no `serverInfo`, or one whose `version` isn't a string
+/// (a spec-conformant server omits the field entirely rather than sending
+/// a non-string value, but this stays lenient rather than erroring on a
+/// server that doesn't).
+fn parse_server_version(result: &Value) -> Option<String> {
+    result
+        .get("serverInfo")?
+        .get("version")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Extracts `(uri, start_line)` pairs from a `textDocument/definition`
 /// response, which per the LSP spec may be `null`, a single `Location`,
 /// an array of `Location`s, or an array of `LocationLink`s.
@@ -455,6 +488,32 @@ mod tests {
         // than a fixed expectation -- it just proves `is_available`
         // doesn't panic and returns a real, checkable answer either way.
         let _ = is_available(Language::Rust);
+    }
+
+    #[test]
+    fn parse_server_version_reads_server_info_version() {
+        let result = json!({
+            "capabilities": {},
+            "serverInfo": { "name": "rust-analyzer", "version": "1.88.0" },
+        });
+        assert_eq!(parse_server_version(&result), Some("1.88.0".to_string()));
+    }
+
+    #[test]
+    fn parse_server_version_is_none_without_server_info() {
+        // The LSP spec makes `serverInfo` optional -- a spec-conformant
+        // server that omits it entirely shouldn't be treated as an error.
+        let result = json!({ "capabilities": {} });
+        assert_eq!(parse_server_version(&result), None);
+    }
+
+    #[test]
+    fn parse_server_version_is_none_when_version_is_missing_or_not_a_string() {
+        let no_version = json!({ "serverInfo": { "name": "rust-analyzer" } });
+        assert_eq!(parse_server_version(&no_version), None);
+
+        let wrong_type = json!({ "serverInfo": { "name": "x", "version": 188 } });
+        assert_eq!(parse_server_version(&wrong_type), None);
     }
 
     #[test]
@@ -587,6 +646,10 @@ mod tests {
         let mut client = LspClient::start(Language::Rust, dir.path())
             .unwrap()
             .expect("rust-analyzer should be available");
+        assert!(
+            client.server_version().is_some(),
+            "a real rust-analyzer reports serverInfo.version"
+        );
         let uri = client.ensure_open("src/lib.rs", source).unwrap();
 
         // Position of "callee" inside "callee()" on line 1 (0-based).

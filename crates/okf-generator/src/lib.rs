@@ -26,6 +26,11 @@ pub use agents::write_agent_entrypoints;
 /// may carry one).
 const OKF_SPEC_VERSION: &str = "0.2";
 
+/// The generator identity declared alongside `okf_version` in the bundle
+/// root's `index.md` — see [`write_root_index`]'s reproducibility-metadata
+/// docs.
+const GENERATOR_NAME: &str = "okf-rs";
+
 /// The actor identity `okf-rs` fills into every concept's `generated.by`
 /// (spec §7's `<producer>/<version>` convention), since the producer of a
 /// generated bundle is always `okf-rs` itself.
@@ -79,6 +84,12 @@ struct RelationshipEntry {
     target: String,
     resolved_by: String,
     confidence: &'static str,
+    /// The resolver's own reported version, when known — see
+    /// `okf_parser::Relationship::resolver_version`. Omitted (not
+    /// rendered as `resolver_version: null`) for every `tree-sitter` edge
+    /// and any resolver that didn't report one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolver_version: Option<String>,
 }
 
 #[derive(Serialize, Default)]
@@ -130,6 +141,7 @@ fn relationships_frontmatter(concept: &Concept) -> Option<RelationshipsFrontmatt
             target: rel.target.clone(),
             resolved_by: rel.resolved_by.clone(),
             confidence: rel.confidence.as_str(),
+            resolver_version: rel.resolver_version.clone(),
         });
     }
     Some(grouped)
@@ -166,7 +178,20 @@ fn unique_by_kind_and_target<'a>(
 /// case-insensitive, so two ids differing only by case (e.g. `Run` vs.
 /// `run`) would still collide on disk even though a case-sensitive check
 /// wouldn't catch it.
-pub fn write_bundle(concepts: &[Concept], output_dir: &Path) -> Result<()> {
+///
+/// `source_revision` is the commit this bundle was generated from
+/// (`okf_core::git::head_revision`, typically), embedded into the bundle
+/// root's reproducibility metadata (see [`write_root_index`]); pass
+/// `None` when it's genuinely unknown (no git repository) or,
+/// deliberately, from a throwaway comparison write that shouldn't claim
+/// real provenance (`okf-rs generate --check-determinism`/`--check-fresh`'s
+/// own scratch writes — see `okf-cli`'s `cmd_check_determinism`/
+/// `cmd_check_fresh`).
+pub fn write_bundle(
+    concepts: &[Concept],
+    output_dir: &Path,
+    source_revision: Option<&str>,
+) -> Result<()> {
     let mut concepts = concepts.to_vec();
     Concept::disambiguate_ids(&mut concepts);
     let concepts = concepts.as_slice();
@@ -200,7 +225,7 @@ pub fn write_bundle(concepts: &[Concept], output_dir: &Path) -> Result<()> {
         write_dir_index(output_dir, dir, entries)?;
     }
 
-    write_root_index(output_dir, &by_dir)?;
+    write_root_index(output_dir, &by_dir, source_revision)?;
 
     Ok(())
 }
@@ -299,12 +324,40 @@ fn write_dir_index(output_dir: &Path, dir: &str, entries: &[&Concept]) -> Result
     Ok(())
 }
 
-fn write_root_index(output_dir: &Path, by_dir: &BTreeMap<&str, Vec<&Concept>>) -> Result<()> {
-    // A bundle-root `index.md` is the one place OKF permits frontmatter on
-    // an index file (spec §8/§12), used here to declare the spec version
-    // the bundle targets.
-    let mut content =
-        format!("---\nokf_version: \"{OKF_SPEC_VERSION}\"\n---\n\n# Knowledge Base\n\n");
+/// Writes the bundle-root `index.md` — the one place OKF permits
+/// frontmatter on an index file (spec §8/§12). Alongside the spec version
+/// the bundle targets (`okf_version`, unchanged since before
+/// reproducibility metadata existed), this now also declares the
+/// generator identity/version and, when known, the source commit —
+/// "reproducibility metadata," the artifact answering "which okf-rs,
+/// from which commit, produced this" without needing anything outside
+/// the bundle itself. Deliberately **no wall-clock timestamp**: unlike
+/// `generator_name`/`generator_version`/`source_revision` (all exactly
+/// reproducible given the same binary and `HEAD`), a timestamp is not
+/// reproducible by definition and would make `generate
+/// --check-determinism` fail on every single run — the same reasoning
+/// that already keeps `Concept::generated_at` unpopulated everywhere in
+/// this codebase. `source_revision` is further excluded from both
+/// `--check-determinism`'s and `--check-fresh`'s own comparisons (see
+/// `okf-cli`'s `diff_dirs`/`normalize_for_comparison`) for a related but
+/// distinct reason: those checks ask "does re-analyzing the source
+/// produce the same concepts," and a commit that moves `HEAD` without
+/// touching the analyzed source tree at all (a README edit, say) would
+/// otherwise make `--check-fresh` report false staleness purely from
+/// this one line, never from real content drift.
+fn write_root_index(
+    output_dir: &Path,
+    by_dir: &BTreeMap<&str, Vec<&Concept>>,
+    source_revision: Option<&str>,
+) -> Result<()> {
+    let mut content = format!(
+        "---\nokf_version: \"{OKF_SPEC_VERSION}\"\ngenerator_name: \"{GENERATOR_NAME}\"\ngenerator_version: \"{}\"\n",
+        env!("CARGO_PKG_VERSION"),
+    );
+    if let Some(revision) = source_revision {
+        content.push_str(&format!("source_revision: \"{revision}\"\n"));
+    }
+    content.push_str("---\n\n# Knowledge Base\n\n");
     for (dir, entries) in by_dir {
         content.push_str(&format!(
             "- [{}]({}/index.md) ({})\n",
@@ -372,7 +425,7 @@ mod tests {
         ));
 
         let concepts = vec![module, caller, callee];
-        write_bundle(&concepts, dir.path()).unwrap();
+        write_bundle(&concepts, dir.path(), None).unwrap();
 
         assert!(dir.path().join("index.md").exists());
         assert!(dir.path().join("modules/index.md").exists());
@@ -395,6 +448,56 @@ mod tests {
     }
 
     #[test]
+    fn root_index_always_carries_generator_identity_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bundle(
+            &[concept(ConceptKind::Module, "m", "m", "src/m.rs")],
+            dir.path(),
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.path().join("index.md")).unwrap();
+        assert!(content.contains("okf_version: \"0.2\""));
+        assert!(content.contains("generator_name: \"okf-rs\""));
+        assert!(content.contains(&format!(
+            "generator_version: \"{}\"",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+
+    #[test]
+    fn root_index_omits_source_revision_when_none() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bundle(
+            &[concept(ConceptKind::Module, "m", "m", "src/m.rs")],
+            dir.path(),
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.path().join("index.md")).unwrap();
+        assert!(
+            !content.contains("source_revision"),
+            "an unknown source revision should be omitted, not rendered as null: {content}"
+        );
+    }
+
+    #[test]
+    fn root_index_renders_source_revision_when_given() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bundle(
+            &[concept(ConceptKind::Module, "m", "m", "src/m.rs")],
+            dir.path(),
+            Some("abc123def456"),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.path().join("index.md")).unwrap();
+        assert!(content.contains("source_revision: \"abc123def456\""));
+    }
+
+    #[test]
     fn disambiguates_duplicate_ids_instead_of_overwriting() {
         // Two same-named, same-file concepts — e.g. Rust's
         // `#[cfg(feature = "x")]` / `#[cfg(not(feature = "x"))]` stub
@@ -403,7 +506,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = concept(ConceptKind::Function, "run", "run", "src/a.rs");
         let b = concept(ConceptKind::Function, "run", "run", "src/a.rs");
-        write_bundle(&[a, b], dir.path()).unwrap();
+        write_bundle(&[a, b], dir.path(), None).unwrap();
 
         assert!(dir.path().join("functions/run.md").exists());
         assert!(dir.path().join("functions/run-2.md").exists());
@@ -417,7 +520,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = concept(ConceptKind::Function, "Run", "Run", "src/a.rs");
         let b = concept(ConceptKind::Function, "run", "run", "src/b.rs");
-        write_bundle(&[a, b], dir.path()).unwrap();
+        write_bundle(&[a, b], dir.path(), None).unwrap();
 
         assert!(dir.path().join("functions/Run.md").exists());
         assert!(dir.path().join("functions/run-2.md").exists());
@@ -434,7 +537,7 @@ mod tests {
         earlier.location.start_line = 10;
 
         // Passed in reverse of source order.
-        write_bundle(&[later, earlier], dir.path()).unwrap();
+        write_bundle(&[later, earlier], dir.path(), None).unwrap();
 
         let first_content = fs::read_to_string(dir.path().join("functions/run.md")).unwrap();
         assert!(first_content.contains("#L10"));
@@ -449,7 +552,7 @@ mod tests {
         let mut private = concept(ConceptKind::Function, "helper", "helper", "src/a.rs");
         private.is_public = false;
 
-        write_bundle(&[public, private], dir.path()).unwrap();
+        write_bundle(&[public, private], dir.path(), None).unwrap();
 
         let public_content = fs::read_to_string(dir.path().join("functions/run.md")).unwrap();
         assert!(!public_content.contains("visibility"));
@@ -479,7 +582,7 @@ mod tests {
             "decode_jwt",
         ));
 
-        write_bundle(&[caller, callee], dir.path()).unwrap();
+        write_bundle(&[caller, callee], dir.path(), None).unwrap();
 
         let content =
             fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
@@ -488,6 +591,42 @@ mod tests {
         );
         assert!(content.contains("resolved_by: tree-sitter"));
         assert!(content.contains("confidence: exact"));
+        assert!(
+            !content.contains("resolver_version"),
+            "a tree-sitter edge has no resolver to version, so the key should be omitted \
+             entirely rather than rendered as `resolver_version: null`"
+        );
+    }
+
+    #[test]
+    fn renders_resolver_version_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut caller = concept(
+            ConceptKind::Function,
+            "verify_token",
+            "auth.verify_token",
+            "src/auth.rs",
+        );
+        let callee = concept(
+            ConceptKind::Function,
+            "decode_jwt",
+            "auth.decode_jwt",
+            "src/auth.rs",
+        );
+        caller.relationships.push(okf_parser::Relationship {
+            kind: RelationKind::Calls,
+            target: callee.id.clone(),
+            target_display: "decode_jwt".to_string(),
+            resolved_by: "rust-analyzer".to_string(),
+            confidence: okf_parser::Confidence::Semantic,
+            resolver_version: Some("1.88.0".to_string()),
+        });
+
+        write_bundle(&[caller, callee], dir.path(), None).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
+        assert!(content.contains("resolver_version: 1.88.0"));
     }
 
     #[test]
@@ -518,7 +657,7 @@ mod tests {
             ));
         }
 
-        write_bundle(&[caller, callee], dir.path()).unwrap();
+        write_bundle(&[caller, callee], dir.path(), None).unwrap();
 
         let content =
             fs::read_to_string(dir.path().join("functions/auth/verify_token.md")).unwrap();
@@ -554,19 +693,21 @@ mod tests {
             callee.id.clone(),
             "decode_jwt",
         ));
-        // A non-default provenance/confidence, as `okf-analyzer` would
-        // build for an `--lsp`-resolved edge -- confirms the round trip
-        // carries the *actual* values through, not just the tree-sitter
-        // defaults every other fixture in this file happens to use.
+        // A non-default provenance/confidence/resolver_version, as
+        // `okf-analyzer` would build for an `--lsp`-resolved edge --
+        // confirms the round trip carries the *actual* values through,
+        // not just the tree-sitter defaults every other fixture in this
+        // file happens to use.
         callee.relationships.push(okf_parser::Relationship {
             kind: RelationKind::CalledBy,
             target: caller.id.clone(),
             target_display: "verify_token".to_string(),
             resolved_by: "rust-analyzer".to_string(),
             confidence: okf_parser::Confidence::Semantic,
+            resolver_version: Some("1.88.0".to_string()),
         });
 
-        write_bundle(&[caller.clone(), callee.clone()], dir.path()).unwrap();
+        write_bundle(&[caller.clone(), callee.clone()], dir.path(), None).unwrap();
         let read_back = okf_parser::read_bundle(dir.path()).unwrap();
 
         assert_eq!(read_back.len(), 2);
@@ -580,6 +721,7 @@ mod tests {
             read_caller.relationships[0].confidence,
             okf_parser::Confidence::Exact
         );
+        assert_eq!(read_caller.relationships[0].resolver_version, None);
 
         let read_callee = read_back.iter().find(|c| c.id == callee.id).unwrap();
         assert_eq!(read_callee.relationships[0].kind, RelationKind::CalledBy);
@@ -589,13 +731,17 @@ mod tests {
             read_callee.relationships[0].confidence,
             okf_parser::Confidence::Semantic
         );
+        assert_eq!(
+            read_callee.relationships[0].resolver_version.as_deref(),
+            Some("1.88.0")
+        );
     }
 
     #[test]
     fn omits_relationships_field_when_concept_has_none() {
         let dir = tempfile::tempdir().unwrap();
         let solo = concept(ConceptKind::Function, "run", "run", "src/a.rs");
-        write_bundle(&[solo], dir.path()).unwrap();
+        write_bundle(&[solo], dir.path(), None).unwrap();
 
         let content = fs::read_to_string(dir.path().join("functions/run.md")).unwrap();
         assert!(!content.contains("relationships"));
@@ -612,7 +758,7 @@ mod tests {
             "demo",
         ));
 
-        write_bundle(&[package.clone(), module.clone()], dir.path()).unwrap();
+        write_bundle(&[package.clone(), module.clone()], dir.path(), None).unwrap();
 
         let package_content = fs::read_to_string(dir.path().join("packages/demo.md")).unwrap();
         assert!(package_content.contains("# Contains"));

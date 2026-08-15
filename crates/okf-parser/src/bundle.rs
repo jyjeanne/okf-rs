@@ -159,7 +159,8 @@ fn parse_concept(id: String, content: &str) -> Option<Concept> {
                     continue;
                 };
                 for entry in targets.as_sequence().into_iter().flatten() {
-                    let Some((target, resolved_by, confidence)) = parse_relationship_entry(entry)
+                    let Some((target, resolved_by, confidence, resolver_version)) =
+                        parse_relationship_entry(entry)
                     else {
                         continue;
                     };
@@ -171,6 +172,7 @@ fn parse_concept(id: String, content: &str) -> Option<Concept> {
                         target,
                         resolved_by,
                         confidence,
+                        resolver_version,
                     });
                 }
             }
@@ -205,18 +207,25 @@ fn parse_concept(id: String, content: &str) -> Option<Concept> {
 /// shapes `okf-generator` has ever written: a bare target-id string (every
 /// bundle generated before edge provenance/confidence existed, or a
 /// hand-edited entry someone kept simple), and the current
-/// `{target, resolved_by, confidence}` mapping. Backward-compatible on
-/// purpose — an old bundle doesn't need regenerating just to stay
-/// readable by a newer `okf-rs`, and a missing/unrecognized
-/// `resolved_by`/`confidence` on an otherwise-valid mapping falls back to
-/// the same "produced by Tree-sitter, exact" default a bare string gets,
-/// rather than failing to parse the entry at all.
-fn parse_relationship_entry(entry: &serde_yaml::Value) -> Option<(String, String, Confidence)> {
+/// `{target, resolved_by, confidence, resolver_version}` mapping.
+/// Backward-compatible on purpose — an old bundle doesn't need
+/// regenerating just to stay readable by a newer `okf-rs`, and a
+/// missing/unrecognized `resolved_by`/`confidence` on an otherwise-valid
+/// mapping falls back to the same "produced by Tree-sitter, exact"
+/// default a bare string gets, rather than failing to parse the entry at
+/// all. `resolver_version` is newer still than `resolved_by`/`confidence`
+/// themselves, so it's simply absent (`None`) on every bundle written
+/// before it existed, including ones that already carry the richer
+/// mapping shape.
+fn parse_relationship_entry(
+    entry: &serde_yaml::Value,
+) -> Option<(String, String, Confidence, Option<String>)> {
     if let Some(target) = entry.as_str() {
         return Some((
             target.to_string(),
             "tree-sitter".to_string(),
             Confidence::Exact,
+            None,
         ));
     }
     let mapping = entry.as_mapping()?;
@@ -231,7 +240,11 @@ fn parse_relationship_entry(entry: &serde_yaml::Value) -> Option<(String, String
         .and_then(|v| v.as_str())
         .and_then(Confidence::parse)
         .unwrap_or(Confidence::Exact);
-    Some((target, resolved_by, confidence))
+    let resolver_version = mapping
+        .get("resolver_version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some((target, resolved_by, confidence, resolver_version))
 }
 
 fn parse_signature(body: &str) -> Option<String> {
@@ -322,6 +335,35 @@ mod tests {
     }
 
     #[test]
+    fn reads_a_resolver_version_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - target: functions/b\n      resolved_by: rust-analyzer\n      confidence: semantic\n      resolver_version: 1.88.0\n---\n\nbody\n",
+        );
+
+        let concepts = read_bundle(dir.path()).unwrap();
+        assert_eq!(
+            concepts[0].relationships[0].resolver_version.as_deref(),
+            Some("1.88.0")
+        );
+    }
+
+    #[test]
+    fn resolver_version_is_none_when_absent_even_on_the_object_shaped_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "functions/a.md",
+            "---\ntype: Rust Function\ntitle: a\nresource: src/lib.rs#L1\nrelationships:\n  calls:\n    - target: functions/b\n      resolved_by: rust-analyzer\n      confidence: semantic\n---\n\nbody\n",
+        );
+
+        let concepts = read_bundle(dir.path()).unwrap();
+        assert_eq!(concepts[0].relationships[0].resolver_version, None);
+    }
+
+    #[test]
     fn an_object_shaped_entry_missing_or_invalid_provenance_falls_back_to_the_default() {
         let dir = tempfile::tempdir().unwrap();
         write(
@@ -382,5 +424,66 @@ mod tests {
             concepts[0].relationships[0].target_display,
             "external/std-collections-hashmap"
         );
+    }
+
+    /// This repository's root, derived from `okf-parser`'s own manifest
+    /// directory (`<repo>/crates/okf-parser`) — the same technique
+    /// `okf-cli`'s e2e tests use to find `tests/fixtures/` at the repo
+    /// root regardless of `cargo test`'s working directory.
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/okf-parser should be two levels below the repo root")
+            .to_path_buf()
+    }
+
+    /// Phase F's golden provenance fixtures
+    /// (`tests/fixtures/provenance/*.md` — see
+    /// `docs/improvement-plan-provenance-diff.md`): each file is read
+    /// through the real `read_bundle` path and its provenance fields
+    /// checked directly, so these fixtures are exercised by a real test
+    /// rather than sitting unused.
+    #[test]
+    fn golden_provenance_fixtures_round_trip_through_read_bundle() {
+        let fixtures = repo_root().join("tests/fixtures/provenance");
+        let concepts = read_bundle(&fixtures).unwrap();
+        assert_eq!(
+            concepts.len(),
+            3,
+            "expected tree-sitter.md, lsp.md, mixed.md"
+        );
+
+        let tree_sitter = concepts.iter().find(|c| c.id == "tree-sitter").unwrap();
+        assert_eq!(tree_sitter.relationships.len(), 1);
+        assert_eq!(tree_sitter.relationships[0].resolved_by, "tree-sitter");
+        assert_eq!(tree_sitter.relationships[0].confidence, Confidence::Exact);
+        assert_eq!(tree_sitter.relationships[0].resolver_version, None);
+
+        let lsp = concepts.iter().find(|c| c.id == "lsp").unwrap();
+        assert_eq!(lsp.relationships.len(), 1);
+        assert_eq!(lsp.relationships[0].resolved_by, "rust-analyzer");
+        assert_eq!(lsp.relationships[0].confidence, Confidence::Semantic);
+        assert_eq!(
+            lsp.relationships[0].resolver_version.as_deref(),
+            Some("1.88.0")
+        );
+
+        let mixed = concepts.iter().find(|c| c.id == "mixed").unwrap();
+        assert_eq!(mixed.relationships.len(), 2);
+        let tree_sitter_edge = mixed
+            .relationships
+            .iter()
+            .find(|r| r.resolved_by == "tree-sitter")
+            .unwrap();
+        assert_eq!(tree_sitter_edge.confidence, Confidence::Exact);
+        assert_eq!(tree_sitter_edge.resolver_version, None);
+        let lsp_edge = mixed
+            .relationships
+            .iter()
+            .find(|r| r.resolved_by == "rust-analyzer")
+            .unwrap();
+        assert_eq!(lsp_edge.confidence, Confidence::Semantic);
+        assert_eq!(lsp_edge.resolver_version.as_deref(), Some("1.88.0"));
     }
 }

@@ -27,6 +27,7 @@
 
 mod benchmark;
 mod cache;
+mod tool_selection_benchmark;
 mod tools;
 
 use anyhow::Result;

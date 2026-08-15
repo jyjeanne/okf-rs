@@ -262,6 +262,14 @@ enum Command {
         /// Project directory to diff, relative to the git repository root.
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Provenance-aware CI mode: classifies changes as source, resolver,
+        /// or confidence, and exits non-zero on any source-level change
+        /// (always) or resolver/confidence-level change (per `okf.toml`'s
+        /// `[diff]` policy — resolver changes warn by default, confidence
+        /// changes are ignored by default; either can be set to "fail" or
+        /// "ignore"/"warn" respectively).
+        #[arg(long)]
+        ci: bool,
     },
     /// Renders the same change-impact analysis as `impact`, but as a
     /// Markdown report meant to be posted as a pull-request comment (a
@@ -600,7 +608,8 @@ fn run(command: Command) -> Result<ExitCode> {
             from_ref,
             to_ref,
             path,
-        } => cmd_diff(&from_ref, &to_ref, &path),
+            ci,
+        } => cmd_diff(&from_ref, &to_ref, &path, ci),
         Command::Impact {
             from_ref,
             to_ref,
@@ -782,7 +791,8 @@ fn cmd_generate(
         None
     };
 
-    okf_generator::write_bundle(&result.concepts, &output)?;
+    let source_revision = okf_core::git::head_revision(&project.root);
+    okf_generator::write_bundle(&result.concepts, &output, source_revision.as_deref())?;
     if !no_cache {
         cache.save(&cache_path)?;
     }
@@ -858,8 +868,10 @@ fn cmd_check_determinism(
 
     let run1 = ScratchDir::new("determinism-run1");
     let run2 = ScratchDir::new("determinism-run2");
-    okf_generator::write_bundle(&result1.concepts, run1.path())?;
-    okf_generator::write_bundle(&result2.concepts, run2.path())?;
+    // No source_revision: this is a throwaway comparison between two
+    // in-process analyses, not a real generate -- see write_bundle's docs.
+    okf_generator::write_bundle(&result1.concepts, run1.path(), None)?;
+    okf_generator::write_bundle(&result2.concepts, run2.path(), None)?;
 
     let diffs = diff_dirs(run1.path(), run2.path(), "run 1", "run 2")?;
     if diffs.is_empty() {
@@ -925,7 +937,11 @@ fn cmd_check_fresh(
     }
 
     let fresh = ScratchDir::new("check-fresh");
-    okf_generator::write_bundle(&result.concepts, fresh.path())?;
+    // No source_revision here either: `diff_dirs` already normalizes it
+    // out of the root index.md comparison below (see its own docs for
+    // why), so what's passed on this side is moot -- `None` avoids an
+    // unnecessary git shell-out for a throwaway write.
+    okf_generator::write_bundle(&result.concepts, fresh.path(), None)?;
 
     let diffs = diff_dirs(
         &existing,
@@ -1036,10 +1052,40 @@ fn collect_files(
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            out.insert(relative, std::fs::read(&path)?);
+            let content = std::fs::read(&path)?;
+            let content = if relative == "index.md" {
+                strip_source_revision_line(&content)
+            } else {
+                content
+            };
+            out.insert(relative, content);
         }
     }
     Ok(())
+}
+
+/// Strips a `source_revision: ...` line from the bundle-root `index.md`'s
+/// frontmatter before `diff_dirs` compares it, both for
+/// `--check-determinism` (comparing two in-process analyses of the same
+/// `HEAD` — harmless either way, since both sides would agree regardless)
+/// and, the case this actually matters for, `--check-fresh` (comparing a
+/// fresh regenerate against the real, already-committed bundle on disk):
+/// without this, a commit that moves `HEAD` without touching the analyzed
+/// source tree at all (a README edit, say) would make `--check-fresh`
+/// report false staleness purely from this one line differing, never
+/// from real content drift — see `okf-generator::write_root_index`'s own
+/// docs for the fuller reasoning. Line-based rather than a full
+/// YAML-aware strip, since this only ever needs to recognize the exact
+/// shape `write_root_index` itself writes.
+fn strip_source_revision_line(content: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return content.to_vec();
+    };
+    text.lines()
+        .filter(|line| !line.starts_with("source_revision:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
 }
 
 /// Resolves `--enrich-*` flags, falling back to the matching
@@ -1479,10 +1525,14 @@ fn analyze_two_refs(
     Ok((from_result, to_result))
 }
 
-fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<ExitCode> {
+fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path, ci: bool) -> Result<ExitCode> {
     let (from_result, to_result) = analyze_two_refs(path, from_ref, to_ref)?;
 
     let report = okf_analyzer::diff(&from_result.concepts, &to_result.concepts);
+
+    if ci {
+        return cmd_diff_ci(&report, path, from_ref, to_ref);
+    }
 
     if report.is_empty() {
         println!("No concept-level changes between {from_ref} and {to_ref}");
@@ -1517,6 +1567,92 @@ fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<Exit
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// `okf-rs diff --ci`: classifies `report` into source/resolver/confidence
+/// counts (`okf_analyzer::ci_summary`), evaluates them against `okf.toml`'s
+/// `[diff]` policy (`okf_core::config::DiffPolicy`), and prints/returns
+/// what `render_ci_report` computed. All the actual logic lives in that
+/// pure function; this is just its CLI glue (load config, print, turn a
+/// bool into a process `ExitCode`) — see `render_ci_report`'s own docs.
+fn cmd_diff_ci(
+    report: &okf_analyzer::DiffReport,
+    path: &std::path::Path,
+    from_ref: &str,
+    to_ref: &str,
+) -> Result<ExitCode> {
+    let policy = okf_core::config::load(path).diff;
+    let summary = okf_analyzer::ci_summary(report);
+    let (text, failed) = render_ci_report(&summary, policy, from_ref, to_ref);
+    println!("{text}");
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Renders an `okf_analyzer::CiSummary` against a `DiffPolicy` as
+/// `okf-rs diff --ci`'s report text, and says whether it should fail the
+/// exit code — pure data-in, data-out, so the full exit-code table
+/// (`docs/improvement-plan-provenance-diff.md`'s Phase C) is directly
+/// unit-testable without a real git repository or language server,
+/// the same reason `render_review_markdown` is split out from `cmd_review`.
+///
+/// Source changes are never configurable — always reported (❌) and
+/// always failure-worthy. Resolver/confidence changes are reported with
+/// whichever icon their policy implies (❌ `"fail"`, ⚠️ `"warn"`, ℹ️
+/// `"ignore"`) and fail the exit code only under `"fail"`.
+fn render_ci_report(
+    summary: &okf_analyzer::CiSummary,
+    policy: okf_core::config::DiffPolicy,
+    from_ref: &str,
+    to_ref: &str,
+) -> (String, bool) {
+    if summary.is_empty() {
+        return (
+            format!("No changes between {from_ref} and {to_ref}\n\nexit code: 0"),
+            false,
+        );
+    }
+
+    let mut lines = Vec::new();
+    // Source changes are never configurable -- always both reported and
+    // failure-worthy.
+    let mut failed = summary.source_changes > 0;
+    if summary.source_changes > 0 {
+        lines.push(format!("❌ SOURCE CHANGES: {}", summary.source_changes));
+    }
+    if summary.resolver_changes > 0 {
+        let (icon, fails) = policy_icon(policy.resolver_changes);
+        failed |= fails;
+        lines.push(format!(
+            "{icon} RESOLVER CHANGES: {}",
+            summary.resolver_changes
+        ));
+    }
+    if summary.confidence_changes > 0 {
+        let (icon, fails) = policy_icon(policy.confidence_changes);
+        failed |= fails;
+        lines.push(format!(
+            "{icon} CONFIDENCE CHANGES: {}",
+            summary.confidence_changes
+        ));
+    }
+    lines.push(String::new());
+    lines.push(format!("exit code: {}", if failed { 1 } else { 0 }));
+
+    (lines.join("\n"), failed)
+}
+
+/// The icon a `--ci` category line renders with (❌ fail, ⚠️ warn, ℹ️
+/// ignore), and whether that action should fail the exit code.
+fn policy_icon(action: okf_core::config::PolicyAction) -> (&'static str, bool) {
+    match action {
+        okf_core::config::PolicyAction::Fail => ("❌", true),
+        okf_core::config::PolicyAction::Warn => ("⚠️ ", false),
+        okf_core::config::PolicyAction::Ignore => ("ℹ️ ", false),
+    }
 }
 
 fn cmd_impact(from_ref: &str, to_ref: &str, path: &std::path::Path) -> Result<ExitCode> {
@@ -1715,6 +1851,188 @@ mod review_tests {
     }
 }
 
+/// Covers `okf-rs diff --ci`'s full exit-code table
+/// (`docs/improvement-plan-provenance-diff.md`'s Phase C) directly against
+/// `render_ci_report`, entirely without a real git repository or language
+/// server — a synthetic `CiSummary` plays the role two real `--lsp`
+/// analyses would otherwise need to produce (in particular, a genuine
+/// resolver-*version* difference needs two different installed
+/// `rust-analyzer` binaries, which this environment — and CI — has no way
+/// to guarantee; the classification logic that turns real relationship
+/// pairs into these counts is `okf-analyzer`'s own job, and is tested
+/// there against real provenance data).
+#[cfg(test)]
+mod diff_ci_tests {
+    use super::*;
+    use okf_analyzer::CiSummary;
+    use okf_core::config::{DiffPolicy, PolicyAction};
+
+    #[test]
+    fn no_changes_exits_zero() {
+        let (text, failed) =
+            render_ci_report(&CiSummary::default(), DiffPolicy::default(), "a", "b");
+        assert!(!failed);
+        assert!(text.contains("No changes between a and b"));
+        assert!(text.contains("exit code: 0"));
+    }
+
+    #[test]
+    fn metadata_only_change_with_default_policy_exits_zero() {
+        let summary = CiSummary {
+            confidence_changes: 2,
+            ..Default::default()
+        };
+        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(!failed);
+        assert!(text.contains("ℹ️"));
+        assert!(text.contains("CONFIDENCE CHANGES: 2"));
+        assert!(text.contains("exit code: 0"));
+    }
+
+    #[test]
+    fn resolver_only_change_with_default_policy_warns_but_exits_zero() {
+        let summary = CiSummary {
+            resolver_changes: 4,
+            ..Default::default()
+        };
+        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(!failed);
+        assert!(text.contains("⚠️"));
+        assert!(text.contains("RESOLVER CHANGES: 4"));
+        assert!(text.contains("exit code: 0"));
+    }
+
+    #[test]
+    fn added_source_edge_exits_one() {
+        let summary = CiSummary {
+            source_changes: 1,
+            ..Default::default()
+        };
+        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(failed);
+        assert!(text.contains("❌ SOURCE CHANGES: 1"));
+        assert!(text.contains("exit code: 1"));
+    }
+
+    #[test]
+    fn removed_source_edge_exits_one() {
+        // Same shape as an addition -- `CiSummary` doesn't distinguish
+        // add vs. remove in the count itself (only which relationship
+        // pair changed matters, not which direction), so this is the
+        // same case as `added_source_edge_exits_one` from this
+        // function's point of view; `okf-analyzer`'s own tests cover
+        // that both directions really do produce a `SourceChange`.
+        let summary = CiSummary {
+            source_changes: 1,
+            ..Default::default()
+        };
+        let (_, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(failed);
+    }
+
+    #[test]
+    fn semantic_target_change_exits_one() {
+        // A rewired target is two `SourceChange` entries (the removed
+        // pair, the added pair) -- see
+        // `okf_analyzer::diff_relationships`'s own scenario-3/5 tests.
+        let summary = CiSummary {
+            source_changes: 2,
+            ..Default::default()
+        };
+        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(failed);
+        assert!(text.contains("SOURCE CHANGES: 2"));
+    }
+
+    #[test]
+    fn mixed_source_and_resolver_changes_exits_one() {
+        let summary = CiSummary {
+            source_changes: 1,
+            resolver_changes: 1,
+            ..Default::default()
+        };
+        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(
+            failed,
+            "a source change fails regardless of the resolver change's own policy"
+        );
+        assert!(text.contains("❌ SOURCE CHANGES: 1"));
+        assert!(text.contains("RESOLVER CHANGES: 1"));
+    }
+
+    #[test]
+    fn resolver_only_change_fails_when_policy_is_fail() {
+        let summary = CiSummary {
+            resolver_changes: 4,
+            ..Default::default()
+        };
+        let policy = DiffPolicy {
+            resolver_changes: PolicyAction::Fail,
+            confidence_changes: PolicyAction::Ignore,
+        };
+        let (text, failed) = render_ci_report(&summary, policy, "a", "b");
+        assert!(failed);
+        assert!(text.contains("❌"));
+        assert!(text.contains("RESOLVER CHANGES: 4"));
+        assert!(text.contains("exit code: 1"));
+    }
+
+    #[test]
+    fn resolver_ignore_policy_still_reports_but_never_fails() {
+        let summary = CiSummary {
+            resolver_changes: 3,
+            ..Default::default()
+        };
+        let policy = DiffPolicy {
+            resolver_changes: PolicyAction::Ignore,
+            confidence_changes: PolicyAction::Ignore,
+        };
+        let (text, failed) = render_ci_report(&summary, policy, "a", "b");
+        assert!(!failed);
+        assert!(text.contains("ℹ️"));
+        assert!(text.contains("RESOLVER CHANGES: 3"));
+    }
+
+    #[test]
+    fn confidence_fail_policy_fails_the_exit_code() {
+        let summary = CiSummary {
+            confidence_changes: 2,
+            ..Default::default()
+        };
+        let policy = DiffPolicy {
+            resolver_changes: PolicyAction::Warn,
+            confidence_changes: PolicyAction::Fail,
+        };
+        let (text, failed) = render_ci_report(&summary, policy, "a", "b");
+        assert!(failed);
+        assert!(text.contains("❌"));
+        assert!(text.contains("exit code: 1"));
+    }
+
+    #[test]
+    fn provenance_change_is_reported_and_gated_as_a_resolver_change_not_confidence() {
+        // A ProvenanceChange (resolved_by/resolver_version *and*
+        // confidence both moved) is folded into `resolver_changes` by
+        // `okf_analyzer::ci_summary`, so it follows `resolver_changes`'
+        // policy, not `confidence_changes` -- this test locks in that
+        // routing decision at the CLI-policy level, distinct from
+        // `okf-analyzer`'s own test verifying the classification itself.
+        let summary = CiSummary {
+            resolver_changes: 1,
+            ..Default::default()
+        };
+        let policy = DiffPolicy {
+            resolver_changes: PolicyAction::Fail,
+            confidence_changes: PolicyAction::Warn,
+        };
+        let (_, failed) = render_ci_report(&summary, policy, "a", "b");
+        assert!(
+            failed,
+            "resolver_changes = \"fail\" should gate a ProvenanceChange-derived count too"
+        );
+    }
+}
+
 #[cfg(test)]
 mod determinism_tests {
     use super::*;
@@ -1793,6 +2111,83 @@ mod determinism_tests {
         let diffs = diff_dirs(a.path(), b.path(), "run 1", "run 2").unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(diffs[0].contains("functions/nested/f.md"));
+    }
+
+    #[test]
+    fn strip_source_revision_line_removes_only_that_line() {
+        let input = b"---\nokf_version: \"0.2\"\ngenerator_name: \"okf-rs\"\ngenerator_version: \"0.4.0\"\nsource_revision: \"abc123\"\n---\n\n# Knowledge Base\n";
+        let stripped = strip_source_revision_line(input);
+        let stripped = String::from_utf8(stripped).unwrap();
+        assert!(!stripped.contains("source_revision"));
+        assert!(stripped.contains("generator_version: \"0.4.0\""));
+        assert!(stripped.contains("# Knowledge Base"));
+    }
+
+    #[test]
+    fn strip_source_revision_line_is_a_no_op_without_one() {
+        let input = b"---\nokf_version: \"0.2\"\n---\n\n# Knowledge Base\n";
+        let stripped = strip_source_revision_line(input);
+        assert_eq!(
+            String::from_utf8(stripped).unwrap(),
+            "---\nokf_version: \"0.2\"\n---\n\n# Knowledge Base"
+        );
+    }
+
+    /// The regression test for the false-staleness risk this phase's own
+    /// design doc calls out: two root `index.md` files differing *only*
+    /// in `source_revision` (the shape `--check-fresh` sees whenever
+    /// `HEAD` has moved since the committed bundle was generated, even if
+    /// the analyzed source itself didn't change) must report no diff.
+    #[test]
+    fn diff_dirs_ignores_a_source_revision_only_difference_in_the_root_index() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(
+            a.path().join("index.md"),
+            "---\nokf_version: \"0.2\"\ngenerator_name: \"okf-rs\"\ngenerator_version: \"0.4.0\"\nsource_revision: \"aaaaaaa\"\n---\n\n# Knowledge Base\n",
+        )
+        .unwrap();
+        fs::write(
+            b.path().join("index.md"),
+            "---\nokf_version: \"0.2\"\ngenerator_name: \"okf-rs\"\ngenerator_version: \"0.4.0\"\nsource_revision: \"bbbbbbb\"\n---\n\n# Knowledge Base\n",
+        )
+        .unwrap();
+
+        assert!(
+            diff_dirs(
+                a.path(),
+                b.path(),
+                "the committed bundle",
+                "a fresh regenerate"
+            )
+            .unwrap()
+            .is_empty(),
+            "a source_revision-only difference must not be reported as staleness"
+        );
+    }
+
+    /// The complementary case: a *real* content difference in the root
+    /// index (not just `source_revision`) must still be caught —
+    /// normalization strips one specific line, not the whole file's
+    /// ability to be diffed.
+    #[test]
+    fn diff_dirs_still_catches_a_real_root_index_content_difference() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(
+            a.path().join("index.md"),
+            "---\nokf_version: \"0.2\"\n---\n\n# Knowledge Base\n\n- [Functions](functions/index.md) (1)\n",
+        )
+        .unwrap();
+        fs::write(
+            b.path().join("index.md"),
+            "---\nokf_version: \"0.2\"\n---\n\n# Knowledge Base\n\n- [Functions](functions/index.md) (2)\n",
+        )
+        .unwrap();
+
+        let diffs = diff_dirs(a.path(), b.path(), "a", "b").unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].contains("index.md"));
     }
 
     #[test]
