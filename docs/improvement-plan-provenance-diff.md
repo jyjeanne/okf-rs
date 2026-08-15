@@ -11,7 +11,9 @@ automatically verifiable, not another prose roadmap.
 **Delivery status:** tracked in
 [`ROADMAP.md`](../ROADMAP.md#improvement-plan--provenance-depth-graph-diff--mcp-tool-selection).
 Phases A (resolver version), B (provenance-aware graph diff), C (`diff --ci` policy), and D
-(reproducibility metadata) have shipped; Phases E-F are still as proposed below.
+(reproducibility metadata) have shipped in full. Phase E has shipped its fully offline harness
+(question set, fixture, scoring) — the live-endpoint wiring is deliberately deferred, per this
+phase's own "CONDITIONAL GO" verdict below. Phase F is still as proposed below.
 
 ## 0. What's already shipped, and what's actually new here
 
@@ -35,7 +37,7 @@ then only phases the genuinely new remainder.
 | **Provenance-aware graph diff** (source vs. resolver vs. semantic change classes) | ✅ Shipped (this plan's Phase B) | `okf_analyzer::{RelationshipChangeKind, diff_relationships}` — see `ROADMAP.md` |
 | **`okf-rs diff --ci` policy with source/resolver/metadata classification** | ✅ Shipped (this plan's Phase C) | `okf-rs diff --ci`, `okf_analyzer::ci_summary`, `okf_core::config::DiffPolicy` — see `ROADMAP.md` |
 | **Artifact-level reproducibility metadata** (generator name/version, source revision) | ✅ Shipped (this plan's Phase D) | `okf_core::git::head_revision`, `okf_generator::write_root_index`'s `generator_name`/`generator_version`/`source_revision` — see `ROADMAP.md` |
-| **Specialized-vs-consolidated tool-*selection-accuracy*** benchmark (real model calls) | ❌ Not shipped | The consolidation above was already decided and shipped; nothing measured whether a model actually picks the right `relation` value as reliably as it picked the right tool name before |
+| **Specialized-vs-consolidated tool-*selection-accuracy*** benchmark (real model calls) | 🚧 Harness shipped (this plan's Phase E); live-endpoint wiring deliberately deferred | `okf_mcp::tool_selection_benchmark` — question set, fixture, scoring, all model-free — see `ROADMAP.md` |
 | Golden fixture dataset for provenance/diff/MCP | ❌ Not shipped | No `tests/fixtures/` directory exists in this repo today |
 
 Everything below phases only the six rows this table originally marked ❌ (two have since shipped
@@ -485,7 +487,7 @@ wants a `source_revision` to still point at *something*.
 
 ---
 
-## 6. Phase E — Specialized-vs-consolidated MCP tool-*selection* benchmark
+## 6. Phase E — Specialized-vs-consolidated MCP tool-*selection* benchmark 🚧 Harness shipped, live-endpoint wiring deferred
 
 ### Objective
 
@@ -566,13 +568,22 @@ therefore:
 
 ### Acceptance criteria
 
-- Tool-selection accuracy, call count, tokens, and latency are reported for both designs, from
-  the same fixed question set, run against the same bundle.
-- The comparison is reproducible in the sense that matters here: same questions, same bundle,
-  same model/endpoint in, comparable numbers out — not byte-identical output, which a live model
-  call can never guarantee.
-- The report explicitly states this validates (or doesn't) the consolidation already shipped,
-  rather than presenting it as an open design decision still to be made.
+**Shipped (the harness half):**
+- The 14-question set, one per `graph` relation, exists with a known-correct `relation`/answer
+  each — verified directly against a real fixture bundle through the actual `tools::call`
+  dispatch, with zero model calls (`okf_mcp::tool_selection_benchmark`).
+- The question set's relations are checked against the `graph` tool's own live schema, not a
+  hardcoded copy — a future relation addition/rename can't leave it silently stale.
+- The pre-0.3.0 specialized-tool-name mapping is reconstructed (`graph_<relation>`), with
+  `explain`'s missing counterpart handled as an explicit, tested case, not a silent gap.
+- Scoring logic (`scores_correctly`) is a real, independently unit-tested function — not inlined
+  logic a future live-endpoint runner would have to duplicate or guess at.
+
+**Not yet shipped (needs the live-endpoint decision this phase was always conditional on):**
+- Tool-selection accuracy, call count, tokens, and latency reported for both designs from a real
+  model run.
+- The comparison actually reproduced against a chosen model/endpoint.
+- A report stating whether the consolidation is validated or falsified by real numbers.
 
 ---
 
@@ -688,19 +699,22 @@ table marks ❌, versus how speculative it is.
 | B | Provenance-aware diff classification | M | High — the single biggest named gap; closes both the false-negative (rewire hidden by matching resolver names) and false-positive (invisible resolver-only change) directions at once | Medium — pairing relationships by `(kind, target)` across two snapshots needs care around duplicate targets under different kinds and concepts that both add and remove edges in the same diff; needs the six worked scenarios as real regression tests, not just the happy path | **GO**, sequenced after A — ✅ shipped |
 | C | `okf-rs diff --ci` policy | S-M | High — this is what actually makes B usable in a pipeline, matching the reviewer's own CLI example line for line | Low — mirrors `validate --ci`'s already-shipped, already-tested flag pattern; the only new surface is the `okf.toml` `[diff]` section | **GO**, sequenced after B — ✅ shipped |
 | D | Artifact-level reproducibility metadata (no timestamp) | S | Medium — genuinely useful for CI audit ("which okf-rs, which commit, built this bundle"), but scoped down from the reviewer's ask specifically to avoid the determinism regression a naive implementation would cause | Medium — the risk isn't the feature, it's a future contributor "fixing" the missing timestamp back in; mitigated by testing `--check-determinism`/`--check-fresh` directly against this phase and documenting the cut in the module itself | **GO**, with the no-timestamp scope cut as a hard constraint, not a suggestion — ✅ shipped |
-| E | Specialized-vs-consolidated tool-*selection* benchmark | M-L | Medium — genuinely validates (or falsifies) a decision already shipped and already justified on schema-size grounds alone; real value is closing that specific "did we trade selection accuracy for schema size and never check" open question | Medium-High — the only item in this plan requiring a live LLM call, breaking this project's until-now-consistent "every benchmark is offline and deterministic" posture; must stay explicitly opt-in/non-CI to avoid becoming a flaky, costly, silently-skipped test | **CONDITIONAL GO** — build the harness and question set (fully testable without a model) first; only wire up a real endpoint call once someone is prepared to own interpreting a non-deterministic result, matching how `--enrich`'s own network dependency was scoped in from day one |
+| E | Specialized-vs-consolidated tool-*selection* benchmark | M-L | Medium — genuinely validates (or falsifies) a decision already shipped and already justified on schema-size grounds alone; real value is closing that specific "did we trade selection accuracy for schema size and never check" open question | Medium-High — the only item in this plan requiring a live LLM call, breaking this project's until-now-consistent "every benchmark is offline and deterministic" posture; must stay explicitly opt-in/non-CI to avoid becoming a flaky, costly, silently-skipped test | **CONDITIONAL GO** — build the harness and question set (fully testable without a model) first; only wire up a real endpoint call once someone is prepared to own interpreting a non-deterministic result, matching how `--enrich`'s own network dependency was scoped in from day one — 🚧 harness shipped exactly as conditioned; live-endpoint wiring still open |
 | F | Golden fixture dataset | S | Low-Medium — organizational, not a new capability; mainly pays for itself by giving Phases B/C's own tests a less ad hoc home | Low — pure relocation/addition, no behavior change | **GO**, opportunistically alongside B/C rather than as a blocking prerequisite |
 
 ### Net recommendation
 
-Ship, in order: **A → B → C → D**, all unconditional **GO**s — this sequence alone delivers the
+Shipped, in order: **A → B → C → D**, all unconditional **GO**s — this sequence alone delivers the
 reviewer's core thesis (resolver identity *and version*, provenance-aware diff, CI policy) with
-no unresolved conditions, at a combined cost of roughly S+M+(S-M)+S. **F** rides alongside B/C
-rather than blocking them (the fixtures phases B/C need can be written inline first, relocated
-into `tests/fixtures/` as F lands). **E** is real and worth doing, but is explicitly the one item
-in this plan that breaks with every existing benchmark's offline-and-deterministic posture — it's
-sequenced last, and conditionally, specifically so that constraint gets a deliberate answer
-(who runs it, against what endpoint, how often) rather than an accidental one.
+no unresolved conditions, at a combined cost of roughly S+M+(S-M)+S. **E**'s conditional-GO was
+honored precisely as scoped: the harness/question-set/scoring half (fully offline, model-free)
+shipped; the live-endpoint half remains explicitly not done, since that's the one item in this
+plan that breaks with every existing benchmark's offline-and-deterministic posture, and the
+"who runs it, against what endpoint, how often" question still needs a deliberate answer rather
+than an accidental one. **F** (golden fixtures) remains open — the fixtures phases B/C/E needed
+were written inline as each phase shipped rather than pre-emptively relocated into
+`tests/fixtures/`; F is now purely the relocation-and-consolidation pass those inline fixtures are
+ready for, not a blocker any of them were waiting on.
 
 ## References
 

@@ -11,7 +11,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase 3 — Search, Interop & Intelligence | ✅ Complete (15/15) |
 | Improvement Plan Delivery (competitive gap-closing) | ✅ Complete (7/7) |
 | Improvement Plan (AI-native platform maturity, community feedback) | ✅ Complete (11/11 shipped) |
-| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (4/6) |
+| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (4/6 shipped, 1 partial) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -325,7 +325,23 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   (`strip_source_revision_line`) that one line out of the root `index.md` comparison
   `--check-determinism`/`--check-fresh` both use, before diffing — the artifact still records its
   real provenance; the *staleness check* just doesn't conflate that with content drift.
-- [ ] Phase E — Specialized-vs-consolidated MCP tool-*selection-accuracy* benchmark (opt-in, real model calls)
+- [x] 🚧 **Phase E — Specialized-vs-consolidated MCP tool-*selection* benchmark harness.** A new
+  `okf-mcp` module (`tool_selection_benchmark`) ships the fully offline, model-free half the
+  plan's own review called for building first: a fixed 14-question set (one per `graph` relation),
+  each with a known-correct answer verified directly against a real fixture bundle through the
+  actual `tools::call` dispatch — no model involved, matching every other benchmark in this
+  codebase's offline-and-deterministic posture. The pre-0.3.0 specialized-tool-name mapping
+  (`graph_<relation>`) is reconstructed for comparison, with the one documented exception
+  (`explain`, which postdates the consolidation and has no specialized-era counterpart) scored
+  against the consolidated design only, never a dropped or invented one. **Not done, deliberately:**
+  wiring an actual model endpoint to run this question set live — the only way to get real
+  tool-selection-accuracy/token/latency numbers the plan's Phase E asks for. Every other benchmark
+  in this codebase is offline and deterministic; a live call breaks that posture, costs real
+  money, and — per the plan's own "CONDITIONAL GO" verdict on this item — needs someone to
+  explicitly own interpreting a non-deterministic result and pick a model/endpoint before it's
+  wired in, not a decision to bake in silently. A half-built CLI flag that dumps the question set
+  without ever calling a model would be more misleading than leaving it unbuilt, so nothing here
+  pretends to benchmark anything yet.
 - [ ] Phase F — `tests/fixtures/` golden dataset
 
 Verified by dogfooding. Unit tests cover the new field end-to-end: `okf-lsp` parses `serverInfo.version`
@@ -406,6 +422,19 @@ after) reported clean, confirming this phase doesn't regress either guarantee on
 codebase. Full workspace `cargo test`/`clippy -D warnings`/`fmt --check` stayed clean throughout
 (one pre-existing, environment-timing-dependent real-`rust-analyzer` test flaked and passed on
 retry in isolation, unrelated to this phase — the same flake already noted on this PR's CI).
+
+Phase E's harness verified by dogfooding — through the real MCP tool dispatch, not a shortcut
+around it. `every_question_s_expected_answer_is_correct_against_the_fixture` calls
+`tools::call("graph", ...)` — the same function the real `okf-mcp` stdio server dispatches every
+`tools/call` request through — for all 14 questions against the fixture bundle, and passed on the
+first run: every one of the fixture's deliberately-varied shapes (a real cross-package call for
+`callers`/`callees`/`path`/`explain`/`api`/`modules`/`layers`/`domains`/`communities`, a genuine
+two-function call cycle for `cycles`, a call-free concept for `isolated`, a `*Builder`/
+`*Controller`-shaped pair for `patterns`/`features`) produced exactly the claimed answer. A
+second test cross-checks the question set's 14 relations against the `graph` tool's own live
+schema (`tools::list()`), not a hardcoded copy of it, so the question set can't silently drift out
+of sync with what `graph` actually exposes if a relation is ever added or renamed. Full workspace
+`cargo test`/`clippy -D warnings`/`fmt --check` stayed clean throughout.
 
 ---
 
