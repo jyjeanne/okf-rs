@@ -11,32 +11,27 @@
 //! validation** of that shipped decision, not a live A/B between two
 //! options still on the table.
 //!
-//! This is deliberately only the *fully offline, model-free* half of
-//! that benchmark: a fixed question set, each with a known-correct
+//! This module built the *fully offline, model-free* half of that
+//! benchmark first: a fixed question set, each with a known-correct
 //! `relation`/answer verified directly against a real fixture bundle (no
 //! model involved — every other benchmark in this codebase,
 //! [`crate::benchmark`] included, is offline for the same reason), plus
 //! the reconstructed pre-0.3.0 specialized-tool-name mapping to compare
-//! against. Wiring an actual model endpoint to run this question set live
-//! — the only way to get real tool-selection-accuracy/token/latency
-//! numbers — is deliberately **not done here**: every other benchmark in
-//! this codebase is offline and deterministic, a live call breaks that
-//! posture, real API cost is involved, and unlike everything else this
-//! phase touches, "which endpoint, which model, who owns interpreting a
-//! non-deterministic result" is a decision for whoever runs it, not one
-//! to bake in silently. What's here is the part the plan's own review
-//! called for building first: a harness and question set that's fully
-//! testable without a model, ready for a live-endpoint runner to be
-//! layered on top of once that decision is made.
+//! against. [`crate::tool_selection_live`] is the live-endpoint runner
+//! layered on top: it drives [`questions`], [`specialized_tool_name`],
+//! [`scores_correctly`], and [`fixture_bundle`] from here against a real
+//! OpenAI-compatible model.
 //!
-//! `#[allow(dead_code)]` below is deliberate, not an oversight: every
-//! item here is exercised by this module's own tests (see `mod tests`),
-//! but has no *production* caller yet, since that caller is exactly the
-//! live-endpoint runner this module's docs explain is out of scope for
-//! this pass. A half-built CLI flag that dumps the question set without
-//! ever calling a model would be more misleading than an honest "not
-//! wired up yet" — so nothing pretends to benchmark anything until a
-//! real model call backs it.
+//! `#[allow(dead_code)]` below still applies to [`QuestionArgs`]'s
+//! variant fields, [`QuestionArgs::to_json`], and [`Question::args`]
+//! specifically — not an oversight, but a direct consequence of how the
+//! live runner works: it asks a real model to choose its own tool
+//! arguments (that's the whole point of a tool-*selection* benchmark),
+//! so it never reads a question's own `args`/`to_json` to drive the
+//! call. Those stay exercised only by this module's own tests (see `mod
+//! tests`), which check `args`/`to_json` against the fixture directly —
+//! the source of truth a live run's result gets scored against, even
+//! though the live run itself never touches them.
 #![allow(dead_code)]
 
 /// How to call the consolidated `graph` tool for one [`Question`] — the
@@ -204,7 +199,13 @@ pub fn scores_correctly(chosen: &str, expected: &str) -> bool {
 /// `features`) — the same hand-authored-bundle-file convention
 /// `crate::benchmark`'s and `okf-query`'s own fixture tests already use,
 /// reused here rather than reinvented.
-#[cfg(test)]
+///
+/// Not `#[cfg(test)]`: [`crate::tool_selection_live`]'s
+/// `--benchmark-tool-selection` runner builds this same fixture in the
+/// real binary, not just under `cargo test` — the live benchmark measures
+/// a model's tool-selection behavior against one fixed, known-correct
+/// bundle, not whatever project happens to be passed on the command
+/// line (which has no known-correct answers to score against at all).
 pub fn fixture_bundle() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let write = |relative: &str, content: &str| {
