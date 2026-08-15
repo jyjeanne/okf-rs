@@ -425,4 +425,65 @@ mod tests {
             "external/std-collections-hashmap"
         );
     }
+
+    /// This repository's root, derived from `okf-parser`'s own manifest
+    /// directory (`<repo>/crates/okf-parser`) — the same technique
+    /// `okf-cli`'s e2e tests use to find `tests/fixtures/` at the repo
+    /// root regardless of `cargo test`'s working directory.
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/okf-parser should be two levels below the repo root")
+            .to_path_buf()
+    }
+
+    /// Phase F's golden provenance fixtures
+    /// (`tests/fixtures/provenance/*.md` — see
+    /// `docs/improvement-plan-provenance-diff.md`): each file is read
+    /// through the real `read_bundle` path and its provenance fields
+    /// checked directly, so these fixtures are exercised by a real test
+    /// rather than sitting unused.
+    #[test]
+    fn golden_provenance_fixtures_round_trip_through_read_bundle() {
+        let fixtures = repo_root().join("tests/fixtures/provenance");
+        let concepts = read_bundle(&fixtures).unwrap();
+        assert_eq!(
+            concepts.len(),
+            3,
+            "expected tree-sitter.md, lsp.md, mixed.md"
+        );
+
+        let tree_sitter = concepts.iter().find(|c| c.id == "tree-sitter").unwrap();
+        assert_eq!(tree_sitter.relationships.len(), 1);
+        assert_eq!(tree_sitter.relationships[0].resolved_by, "tree-sitter");
+        assert_eq!(tree_sitter.relationships[0].confidence, Confidence::Exact);
+        assert_eq!(tree_sitter.relationships[0].resolver_version, None);
+
+        let lsp = concepts.iter().find(|c| c.id == "lsp").unwrap();
+        assert_eq!(lsp.relationships.len(), 1);
+        assert_eq!(lsp.relationships[0].resolved_by, "rust-analyzer");
+        assert_eq!(lsp.relationships[0].confidence, Confidence::Semantic);
+        assert_eq!(
+            lsp.relationships[0].resolver_version.as_deref(),
+            Some("1.88.0")
+        );
+
+        let mixed = concepts.iter().find(|c| c.id == "mixed").unwrap();
+        assert_eq!(mixed.relationships.len(), 2);
+        let tree_sitter_edge = mixed
+            .relationships
+            .iter()
+            .find(|r| r.resolved_by == "tree-sitter")
+            .unwrap();
+        assert_eq!(tree_sitter_edge.confidence, Confidence::Exact);
+        assert_eq!(tree_sitter_edge.resolver_version, None);
+        let lsp_edge = mixed
+            .relationships
+            .iter()
+            .find(|r| r.resolved_by == "rust-analyzer")
+            .unwrap();
+        assert_eq!(lsp_edge.confidence, Confidence::Semantic);
+        assert_eq!(lsp_edge.resolver_version.as_deref(), Some("1.88.0"));
+    }
 }

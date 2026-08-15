@@ -280,6 +280,65 @@ mod tests {
     use crate::cache::BundleCache;
     use crate::tools;
 
+    /// This repository's root, derived from `okf-mcp`'s own manifest
+    /// directory — the same technique every other crate's golden-fixture
+    /// test in this workspace uses to find `tests/fixtures/` regardless
+    /// of `cargo test`'s working directory.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/okf-mcp should be two levels below the repo root")
+            .to_path_buf()
+    }
+
+    /// Phase F's `tests/fixtures/mcp/` (see
+    /// `docs/improvement-plan-provenance-diff.md`) exports this module's
+    /// question set and specialized-tool-name mapping as portable JSON,
+    /// for a non-Rust live-endpoint runner to load directly rather than
+    /// re-deriving it. This test is what keeps that export honest: the
+    /// exported files are checked against the actual Rust data on every
+    /// run, so the two can't silently drift apart.
+    #[test]
+    fn exported_json_fixtures_match_the_rust_question_set() {
+        let questions_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                repo_root().join("tests/fixtures/mcp/consolidated/questions.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let exported_questions = questions_json["questions"].as_array().unwrap();
+        let rust_questions = questions();
+        assert_eq!(exported_questions.len(), rust_questions.len());
+
+        for (exported, rust) in exported_questions.iter().zip(rust_questions.iter()) {
+            assert_eq!(exported["prompt"], rust.prompt);
+            assert_eq!(exported["relation"], rust.relation);
+            assert_eq!(exported["expected_substring"], rust.expected_substring);
+            assert_eq!(exported["arguments"], rust.args.to_json(rust.relation));
+        }
+
+        let tool_names_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                repo_root().join("tests/fixtures/mcp/specialized/tool-names.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let exported_tool_names: Vec<String> = tool_names_json["tool_names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let rust_tool_names: Vec<String> = rust_questions
+            .iter()
+            .filter_map(|q| specialized_tool_name(q.relation))
+            .collect();
+        assert_eq!(exported_tool_names, rust_tool_names);
+    }
+
     #[test]
     fn every_question_s_relation_is_one_the_graph_tool_actually_exposes() {
         let tools_list = tools::list();

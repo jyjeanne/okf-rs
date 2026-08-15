@@ -1,0 +1,93 @@
+{
+  "$comment": "The consolidated-design half of Phase E's MCP tool-selection benchmark question set (docs/improvement-plan-provenance-diff.md). This file is a portable export of okf_mcp::tool_selection_benchmark::questions() -- a non-Rust live-endpoint runner can load this directly instead of re-deriving the question set. Kept in sync with the Rust source by a dedicated consistency test (crates/okf-mcp/src/tool_selection_benchmark.rs); do not hand-edit one without the other.",
+  "tool_name": "graph",
+  "schema_note": "Each question is answered by calling the consolidated `graph` tool with the given arguments (relation plus whichever of id/from/to that relation needs). expected_substring is the known-correct answer, verified in Rust against a real fixture bundle -- see fixture_bundle() in the same module.",
+  "questions": [
+    {
+      "prompt": "Who calls bar?",
+      "relation": "callers",
+      "arguments": { "relation": "callers", "id": "functions/pkg-b/bar" },
+      "expected_substring": "functions/pkg-a/foo"
+    },
+    {
+      "prompt": "What does foo call?",
+      "relation": "callees",
+      "arguments": { "relation": "callees", "id": "functions/pkg-a/foo" },
+      "expected_substring": "functions/pkg-b/bar"
+    },
+    {
+      "prompt": "What's the shortest call path from foo to bar?",
+      "relation": "path",
+      "arguments": { "relation": "path", "from": "functions/pkg-a/foo", "to": "functions/pkg-b/bar" },
+      "expected_substring": "functions/pkg-b/bar"
+    },
+    {
+      "prompt": "Why does foo call bar?",
+      "relation": "explain",
+      "arguments": { "relation": "explain", "from": "functions/pkg-a/foo", "to": "functions/pkg-b/bar" },
+      "expected_substring": "Tree-sitter",
+      "specialized_tool_equivalent": null,
+      "note": "explain shipped after the graph_* consolidation this benchmark reconstructs, so it has no historical specialized-tool counterpart -- scored against the consolidated design only."
+    },
+    {
+      "prompt": "Is foo part of the public API?",
+      "relation": "api",
+      "arguments": { "relation": "api" },
+      "expected_substring": "functions/pkg-a/foo"
+    },
+    {
+      "prompt": "Does the call graph have any cycles?",
+      "relation": "cycles",
+      "arguments": { "relation": "cycles" },
+      "expected_substring": "functions/pkg-a/cyc_a"
+    },
+    {
+      "prompt": "What cross-module call dependencies exist?",
+      "relation": "modules",
+      "arguments": { "relation": "modules" },
+      "expected_substring": "modules/pkg-a"
+    },
+    {
+      "prompt": "Which concepts have no calls in or out?",
+      "relation": "isolated",
+      "arguments": { "relation": "isolated" },
+      "expected_substring": "functions/pkg-a/lonely"
+    },
+    {
+      "prompt": "What are this bundle's concept-kind and relationship stats?",
+      "relation": "stats",
+      "arguments": { "relation": "stats" },
+      "expected_substring": "Function"
+    },
+    {
+      "prompt": "What layer is each package in?",
+      "relation": "layers",
+      "arguments": { "relation": "layers" },
+      "expected_substring": "packages/pkg-a"
+    },
+    {
+      "prompt": "Which packages form a connected domain?",
+      "relation": "domains",
+      "arguments": { "relation": "domains" },
+      "expected_substring": "packages/pkg-a"
+    },
+    {
+      "prompt": "What package communities exist?",
+      "relation": "communities",
+      "arguments": { "relation": "communities" },
+      "expected_substring": "packages/pkg-a"
+    },
+    {
+      "prompt": "What design patterns are detected in this bundle?",
+      "relation": "patterns",
+      "arguments": { "relation": "patterns" },
+      "expected_substring": "WidgetBuilder"
+    },
+    {
+      "prompt": "What REST endpoints, database models, or event-flow participants exist?",
+      "relation": "features",
+      "arguments": { "relation": "features" },
+      "expected_substring": "UserController"
+    }
+  ]
+}

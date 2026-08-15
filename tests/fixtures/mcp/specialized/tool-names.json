@@ -1,0 +1,19 @@
+{
+  "$comment": "The reconstructed pre-0.3.0 specialized graph_* tool surface, for Phase E's MCP tool-selection benchmark (docs/improvement-plan-provenance-diff.md) to compare the consolidated `graph(relation=...)` tool against. Recoverable from ROADMAP.md's own enumeration of the pre-consolidation surface; not a live schema (those 13 tools no longer exist in okf-mcp as of 0.3.0). Kept in sync with okf_mcp::tool_selection_benchmark::specialized_tool_name() by a dedicated consistency test.",
+  "note": "Every one of these 13 tools took the same single argument the corresponding graph relation takes today (e.g. graph_callers took `id`, graph_path took `from`/`to`), just as its own dedicated tool rather than one value of a shared `relation` enum. `explain` postdates this surface entirely -- see questions.json's note on it -- so it has no entry here.",
+  "tool_names": [
+    "graph_callers",
+    "graph_callees",
+    "graph_path",
+    "graph_api",
+    "graph_cycles",
+    "graph_modules",
+    "graph_isolated",
+    "graph_stats",
+    "graph_layers",
+    "graph_domains",
+    "graph_communities",
+    "graph_patterns",
+    "graph_features"
+  ]
+}

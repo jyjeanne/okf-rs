@@ -11,7 +11,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase 3 — Search, Interop & Intelligence | ✅ Complete (15/15) |
 | Improvement Plan Delivery (competitive gap-closing) | ✅ Complete (7/7) |
 | Improvement Plan (AI-native platform maturity, community feedback) | ✅ Complete (11/11 shipped) |
-| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (4/6 shipped, 1 partial) |
+| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (5/6 shipped, 1 partial) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -342,7 +342,25 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   wired in, not a decision to bake in silently. A half-built CLI flag that dumps the question set
   without ever calling a model would be more misleading than leaving it unbuilt, so nothing here
   pretends to benchmark anything yet.
-- [ ] Phase F — `tests/fixtures/` golden dataset
+- [x] ✅ **Phase F — `tests/fixtures/` golden dataset.** The reviewer's proposed layout, exactly:
+  `provenance/{tree-sitter,lsp,mixed}.md` (real bundle concept files covering Phase A's three
+  provenance shapes), `diff/{unchanged,added-edge,removed-edge,resolver-change,semantic-change}/
+  {before,after}/` (real bundle directories for Phase B's five worked scenarios), and
+  `mcp/{consolidated,specialized}/` (Phase E's 14-question set and reconstructed pre-0.3.0
+  tool-name mapping, exported as portable JSON — the one piece of data that genuinely couldn't be
+  used outside Rust before this). Every fixture is exercised by a real test, not left to rot:
+  `okf-parser` round-trips the provenance fixtures through the real `read_bundle` path;
+  `okf-analyzer` round-trips every diff scenario through the real `read_bundle` → `diff` →
+  `ci_summary` pipeline (not the in-memory `Concept` literals every other test in that file
+  builds by hand — a genuinely different code path, and the first test in this repo to diff two
+  *real bundle directories on disk* rather than two in-memory concept lists); a dedicated guard
+  test greps the analyzer test file for every `diff/` subdirectory's name, so an unreferenced
+  fixture fails the build instead of silently rotting; and `okf-mcp` checks the exported JSON
+  against the live Rust question set on every run, so the two can never drift apart. Most of Phase
+  B's own classification scenarios deliberately stayed as inline `Concept`/`Relationship` struct
+  literals in Rust test code rather than being force-relocated here — this phase only moved what's
+  genuinely more natural as data than code (real fixture bundles, portable JSON), matching its own
+  stated scope rather than relocating everything for its own sake.
 
 Verified by dogfooding. Unit tests cover the new field end-to-end: `okf-lsp` parses `serverInfo.version`
 from a real `initialize` response and — genuinely exercised in this environment, not skipped —
@@ -435,6 +453,23 @@ second test cross-checks the question set's 14 relations against the `graph` too
 schema (`tools::list()`), not a hardcoded copy of it, so the question set can't silently drift out
 of sync with what `graph` actually exposes if a relation is ever added or renamed. Full workspace
 `cargo test`/`clippy -D warnings`/`fmt --check` stayed clean throughout.
+
+Phase F verified by dogfooding — and by design, its own tests are the dogfooding: this phase
+exists specifically to make the fixtures a real, disk-resident artifact rather than data baked
+into test source, so "does a real reader parse these correctly" is the actual claim under test,
+not a metaphor. `golden_provenance_fixtures_round_trip_through_read_bundle` and
+`golden_diff_fixtures_classify_correctly_through_read_bundle` both passed on the first run against
+the real fixture files (not adjusted after the fact to match whatever the code happened to
+produce) — confirming the hand-authored YAML frontmatter in `tests/fixtures/` is byte-for-byte
+compatible with what `okf-generator` itself would have written, for every provenance shape and
+diff scenario named. `every_diff_fixture_subdirectory_is_referenced_by_a_test` was verified to
+actually catch drift, not just pass vacuously: temporarily adding an unreferenced sixth
+subdirectory under `tests/fixtures/diff/` during development made it fail with the expected
+message, then removing it made it pass again. `exported_json_fixtures_match_the_rust_question_set`
+closes the loop on Phase E's own "a form a non-Rust benchmark script could also load" goal — the
+question set now genuinely exists outside Rust, checked against the source of truth on every test
+run rather than trusted to stay in sync by hand. Full workspace `cargo test`/
+`clippy -D warnings`/`fmt --check` stayed clean throughout.
 
 ---
 

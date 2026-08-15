@@ -1662,6 +1662,114 @@ mod tests {
         assert_eq!(summary.resolver_changes, 1);
     }
 
+    /// This repository's root, derived from `okf-analyzer`'s own manifest
+    /// directory — the same technique `okf-cli`'s e2e tests and
+    /// `okf-parser`'s golden-fixture test use to find `tests/fixtures/`
+    /// regardless of `cargo test`'s working directory.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/okf-analyzer should be two levels below the repo root")
+            .to_path_buf()
+    }
+
+    /// Phase F's golden diff fixtures (`tests/fixtures/diff/*/{before,after}`
+    /// — see `docs/improvement-plan-provenance-diff.md`), each round-tripped
+    /// through the real `okf_parser::read_bundle` path (not the in-memory
+    /// `Concept` literals every other test in this file builds by hand) and
+    /// classified by the real `diff`/`ci_summary` pipeline. This is the
+    /// grep target the guard test right below checks against — every
+    /// subdirectory name here must also appear in this function.
+    #[test]
+    fn golden_diff_fixtures_classify_correctly_through_read_bundle() {
+        let fixtures = repo_root().join("tests/fixtures/diff");
+        let load = |scenario: &str, side: &str| {
+            okf_parser::read_bundle(&fixtures.join(scenario).join(side)).unwrap()
+        };
+
+        // unchanged: byte-identical before/after -- no changes at all.
+        let before = load("unchanged", "before");
+        let after = load("unchanged", "after");
+        let report = diff(&before, &after);
+        assert!(report.is_empty());
+        assert!(ci_summary(&report).is_empty());
+
+        // added-edge: a relationship added to an existing concept.
+        let before = load("added-edge", "before");
+        let after = load("added-edge", "after");
+        let report = diff(&before, &after);
+        assert_eq!(report.changed.len(), 1);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 1);
+        assert_eq!(summary.resolver_changes, 0);
+        assert_eq!(summary.confidence_changes, 0);
+
+        // removed-edge: the inverse of added-edge.
+        let before = load("removed-edge", "before");
+        let after = load("removed-edge", "after");
+        let report = diff(&before, &after);
+        assert_eq!(report.changed.len(), 1);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 1);
+
+        // resolver-change: same target, resolver_version bumps 1.88 -> 1.89.
+        let before = load("resolver-change", "before");
+        let after = load("resolver-change", "after");
+        let report = diff(&before, &after);
+        assert_eq!(report.changed.len(), 1);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 0);
+        assert_eq!(summary.resolver_changes, 1);
+
+        // semantic-change: the target itself is rewired (bar -> baz), even
+        // though the resolver version also happens to differ -- this must
+        // stay a source change, not get absorbed into a resolver change.
+        let before = load("semantic-change", "before");
+        let after = load("semantic-change", "after");
+        let report = diff(&before, &after);
+        assert_eq!(report.changed.len(), 1);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 2);
+        assert_eq!(summary.resolver_changes, 0);
+    }
+
+    /// Guards against a fixture directory silently going stale: every
+    /// subdirectory under `tests/fixtures/diff/` must be named in the
+    /// test above, the same "grep-based, not a runtime check" enforcement
+    /// `docs/improvement-plan-provenance-diff.md`'s Phase F specifies —
+    /// an unused fixture is worse than none, since nothing else would
+    /// catch it silently drifting out of sync with what it claims to
+    /// demonstrate.
+    #[test]
+    fn every_diff_fixture_subdirectory_is_referenced_by_a_test() {
+        let fixtures = repo_root().join("tests/fixtures/diff");
+        let this_file = std::fs::read_to_string(file!())
+            .or_else(|_| {
+                std::fs::read_to_string(repo_root().join("crates/okf-analyzer/src/lib.rs"))
+            })
+            .expect("should be able to read this file's own source to grep it");
+
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&fixtures).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                this_file.contains(&format!("\"{name}\"")),
+                "tests/fixtures/diff/{name} exists but no test in this file references it by name -- \
+                 add it to golden_diff_fixtures_classify_correctly_through_read_bundle"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 5,
+            "expected exactly the 5 scenarios docs/improvement-plan-provenance-diff.md's Phase F names"
+        );
+    }
+
     #[test]
     fn ci_summary_an_added_concept_with_no_relationships_still_counts_as_one_source_change() {
         let before: Vec<Concept> = vec![];
