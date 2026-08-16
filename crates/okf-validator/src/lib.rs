@@ -541,7 +541,7 @@ fn check_index_frontmatter(files: &[ScannedFile], report: &mut ValidationReport)
                     severity: Severity::Error,
                     kind: IssueKind::Other,
                     file: file.relative.clone(),
-                    message: "only the bundle-root index.md may carry YAML frontmatter (an `okf_version` declaration); other index.md files must not".to_string(),
+                    message: "only the bundle-root index.md may carry YAML frontmatter (an `okf_version` declaration); other index.md files must not — strip the frontmatter (making the file a plain §8 listing) or rename the file".to_string(),
                 });
             }
             continue;
