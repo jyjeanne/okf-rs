@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use okf_core::Project;
 use okf_parser::ConceptKind;
-use okf_validator::Severity;
+use okf_validator::{IssueKind, Severity};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -1195,12 +1195,12 @@ fn cmd_validate(bundle: Option<PathBuf>, project: &std::path::Path, ci: bool) ->
         println!("{label}: {}: {}", issue.file, issue.message);
     }
 
-    let fail = report.has_errors()
-        || (ci
-            && report
-                .issues
-                .iter()
-                .any(|i| i.severity == Severity::Warning));
+    // `--ci` only promotes orphan warnings to failures, per its help text
+    // and the README's documented behavior — every other warning class
+    // (redundant duplicate links, the actor-format convention, relationship
+    // provenance/symmetry mismatches) is advisory by design (spec §7, §11)
+    // and stays non-fatal even under `--ci`. See issue #23.
+    let fail = report.has_errors() || (ci && report.has_warning_of_kind(IssueKind::Orphan));
     if fail {
         Ok(ExitCode::FAILURE)
     } else {

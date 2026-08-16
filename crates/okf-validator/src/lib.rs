@@ -47,9 +47,37 @@ pub enum Severity {
     Warning,
 }
 
+/// What check an issue came from. Every issue carries one, but it only
+/// matters for `Warning`-severity issues: `Error` issues never have a
+/// `--ci`-style off-switch (a bundle with dangling links or duplicate ids
+/// isn't conformant, full stop), so every check that only ever emits
+/// `Error`s tags its issues `Other` — there's nothing for a caller to
+/// scope by. The five checks that are advisory-by-design (spec §7's actor
+/// convention is producer guidance; spec §11 says consumers MUST NOT
+/// reject a bundle over advisory link issues) get their own variant so a
+/// caller like `okf-cli`'s `validate --ci` can select which warning
+/// classes it wants to gate on instead of all-or-nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueKind {
+    /// Not reachable from `index.md` (spec-defined "orphaned concept").
+    Orphan,
+    /// The same link target linked twice within one markdown section.
+    RedundantLink,
+    /// An actor identity (`generated.by`, `verified[].by`) doesn't follow
+    /// the `<producer>/<version>` / `human:<id>` / `process:<id>` convention.
+    ActorFormat,
+    /// A `resolver_version` present without a real `resolved_by`.
+    RelationshipProvenance,
+    /// A `calls`/`called_by` edge with no matching reverse edge.
+    RelationshipSymmetry,
+    /// Every other check — always `Error` severity, so nothing scopes by it.
+    Other,
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidationIssue {
     pub severity: Severity,
+    pub kind: IssueKind,
     /// Path relative to the bundle root.
     pub file: String,
     pub message: String,
@@ -63,6 +91,15 @@ pub struct ValidationReport {
 impl ValidationReport {
     pub fn has_errors(&self) -> bool {
         self.issues.iter().any(|i| i.severity == Severity::Error)
+    }
+
+    /// Whether any `Warning`-severity issue is of `kind`. Lets a caller
+    /// like `okf-cli`'s `validate --ci` gate on a specific advisory class
+    /// (e.g. orphans) without treating every warning as a build failure.
+    pub fn has_warning_of_kind(&self, kind: IssueKind) -> bool {
+        self.issues
+            .iter()
+            .any(|i| i.severity == Severity::Warning && i.kind == kind)
     }
 }
 
@@ -130,6 +167,7 @@ fn check_required_index(files: &[ScannedFile], report: &mut ValidationReport) {
     if !files.iter().any(|f| f.relative == "index.md") {
         report.issues.push(ValidationIssue {
             severity: Severity::Error,
+            kind: IssueKind::Other,
             file: "index.md".to_string(),
             message: "missing required root `index.md`".to_string(),
         });
@@ -150,6 +188,7 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
         let Some((yaml, _body)) = split_frontmatter(&file.content) else {
             report.issues.push(ValidationIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Other,
                 file: file.relative.clone(),
                 message: "missing or malformed YAML frontmatter (expected a `---` delimited block)"
                     .to_string(),
@@ -162,6 +201,7 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
             Err(e) => {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.relative.clone(),
                     message: format!("invalid YAML frontmatter: {e}"),
                 });
@@ -172,6 +212,7 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
         let Some(mapping) = value.as_mapping() else {
             report.issues.push(ValidationIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Other,
                 file: file.relative.clone(),
                 message: "frontmatter must be a YAML mapping".to_string(),
             });
@@ -182,6 +223,7 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
             Some(t) if !t.trim().is_empty() => {}
             _ => report.issues.push(ValidationIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Other,
                 file: file.relative.clone(),
                 message: "frontmatter is missing the mandatory non-empty `type` field".to_string(),
             }),
@@ -195,6 +237,7 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
             if !valid {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.relative.clone(),
                     message: "`tags` must be a list of strings".to_string(),
                 });
@@ -205,6 +248,7 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
             if !is_valid_datetime_value(timestamp) {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.relative.clone(),
                     message: "`timestamp` must be an RFC 3339 datetime".to_string(),
                 });
@@ -226,6 +270,7 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
             ) {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.relative.clone(),
                     message: "`status` must be one of `draft`, `stable`, or `deprecated`"
                         .to_string(),
@@ -237,6 +282,7 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
             if !is_valid_date_value(stale_after) {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.relative.clone(),
                     message: "`stale_after` must be an absolute `YYYY-MM-DD` date".to_string(),
                 });
@@ -259,6 +305,7 @@ fn check_frontmatter(files: &[ScannedFile], report: &mut ValidationReport) {
             if !has_runtime {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.relative.clone(),
                     message:
                         "an `Attested Computation` concept requires a non-empty `runtime` field"
@@ -301,6 +348,7 @@ fn check_generated(value: &serde_yaml::Value, file: &str, report: &mut Validatio
     let Some(mapping) = value.as_mapping() else {
         report.issues.push(ValidationIssue {
             severity: Severity::Error,
+            kind: IssueKind::Other,
             file: file.to_string(),
             message: "`generated` must be a mapping with a `by` field".to_string(),
         });
@@ -310,6 +358,7 @@ fn check_generated(value: &serde_yaml::Value, file: &str, report: &mut Validatio
         Some(by) if !by.trim().is_empty() => check_actor(by, "generated.by", file, report),
         _ => report.issues.push(ValidationIssue {
             severity: Severity::Error,
+            kind: IssueKind::Other,
             file: file.to_string(),
             message: "`generated` is missing the required non-empty `by` field".to_string(),
         }),
@@ -318,6 +367,7 @@ fn check_generated(value: &serde_yaml::Value, file: &str, report: &mut Validatio
         if !is_valid_datetime_value(at) {
             report.issues.push(ValidationIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Other,
                 file: file.to_string(),
                 message: "`generated.at` must be an RFC 3339 datetime".to_string(),
             });
@@ -341,6 +391,7 @@ fn check_verified(value: &serde_yaml::Value, file: &str, report: &mut Validation
         let Some(mapping) = entry.as_mapping() else {
             report.issues.push(ValidationIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Other,
                 file: file.to_string(),
                 message: "each `verified` entry must be a mapping with a `by` field".to_string(),
             });
@@ -350,6 +401,7 @@ fn check_verified(value: &serde_yaml::Value, file: &str, report: &mut Validation
             Some(by) if !by.trim().is_empty() => check_actor(by, "verified[].by", file, report),
             _ => report.issues.push(ValidationIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Other,
                 file: file.to_string(),
                 message: "a `verified` entry is missing the required non-empty `by` field"
                     .to_string(),
@@ -359,6 +411,7 @@ fn check_verified(value: &serde_yaml::Value, file: &str, report: &mut Validation
             if !is_valid_datetime_value(at) {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.to_string(),
                     message: "`verified[].at` must be an RFC 3339 datetime".to_string(),
                 });
@@ -374,6 +427,7 @@ fn check_sources(value: &serde_yaml::Value, file: &str, report: &mut ValidationR
     let Some(seq) = value.as_sequence() else {
         report.issues.push(ValidationIssue {
             severity: Severity::Error,
+            kind: IssueKind::Other,
             file: file.to_string(),
             message: "`sources` must be a list".to_string(),
         });
@@ -383,6 +437,7 @@ fn check_sources(value: &serde_yaml::Value, file: &str, report: &mut ValidationR
         let Some(mapping) = entry.as_mapping() else {
             report.issues.push(ValidationIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Other,
                 file: file.to_string(),
                 message: "each `sources` entry must be a mapping".to_string(),
             });
@@ -392,6 +447,7 @@ fn check_sources(value: &serde_yaml::Value, file: &str, report: &mut ValidationR
             Some(r) if !r.trim().is_empty() => {}
             _ => report.issues.push(ValidationIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Other,
                 file: file.to_string(),
                 message: "a `sources` entry is missing the required non-empty `resource` field"
                     .to_string(),
@@ -401,6 +457,7 @@ fn check_sources(value: &serde_yaml::Value, file: &str, report: &mut ValidationR
             if !is_valid_date_value(last_modified) {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.to_string(),
                     message: "a `sources` entry's `last_modified` must be a `YYYY-MM-DD` date"
                         .to_string(),
@@ -411,6 +468,7 @@ fn check_sources(value: &serde_yaml::Value, file: &str, report: &mut ValidationR
             if usage_count.as_u64().is_none() {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.to_string(),
                     message: "a `sources` entry's `usage_count` must be a non-negative integer"
                         .to_string(),
@@ -427,6 +485,7 @@ fn check_usage_window(value: &serde_yaml::Value, file: &str, report: &mut Valida
     let Some(mapping) = value.as_mapping() else {
         report.issues.push(ValidationIssue {
             severity: Severity::Error,
+            kind: IssueKind::Other,
             file: file.to_string(),
             message: "`usage_window` must be a mapping with `from`/`to` dates".to_string(),
         });
@@ -437,6 +496,7 @@ fn check_usage_window(value: &serde_yaml::Value, file: &str, report: &mut Valida
             Some(v) if is_valid_date_value(v) => {}
             _ => report.issues.push(ValidationIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Other,
                 file: file.to_string(),
                 message: format!("`usage_window.{key}` must be a `YYYY-MM-DD` date"),
             }),
@@ -457,6 +517,7 @@ fn check_actor(actor: &str, field: &str, file: &str, report: &mut ValidationRepo
     if !valid {
         report.issues.push(ValidationIssue {
             severity: Severity::Warning,
+            kind: IssueKind::ActorFormat,
             file: file.to_string(),
             message: format!(
                 "`{field}` value `{actor}` doesn't follow the OKF actor convention (`<producer>/<version>`, `human:<id>`, or `process:<id>`)"
@@ -478,6 +539,7 @@ fn check_index_frontmatter(files: &[ScannedFile], report: &mut ValidationReport)
             if has_frontmatter {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.relative.clone(),
                     message: "only the bundle-root index.md may carry YAML frontmatter (an `okf_version` declaration); other index.md files must not".to_string(),
                 });
@@ -490,6 +552,7 @@ fn check_index_frontmatter(files: &[ScannedFile], report: &mut ValidationReport)
         let Some((yaml, _)) = split_frontmatter(&file.content) else {
             report.issues.push(ValidationIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Other,
                 file: file.relative.clone(),
                 message: "malformed YAML frontmatter in the bundle-root index.md (expected a `---` delimited block)".to_string(),
             });
@@ -500,6 +563,7 @@ fn check_index_frontmatter(files: &[ScannedFile], report: &mut ValidationReport)
             Err(e) => {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.relative.clone(),
                     message: format!("invalid YAML frontmatter in the bundle-root index.md: {e}"),
                 });
@@ -509,6 +573,7 @@ fn check_index_frontmatter(files: &[ScannedFile], report: &mut ValidationReport)
         let Some(mapping) = value.as_mapping() else {
             report.issues.push(ValidationIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Other,
                 file: file.relative.clone(),
                 message: "the bundle-root index.md frontmatter must be a YAML mapping".to_string(),
             });
@@ -524,6 +589,7 @@ fn check_index_frontmatter(files: &[ScannedFile], report: &mut ValidationReport)
             if !valid {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: file.relative.clone(),
                     message: "`okf_version` must be a `<major>.<minor>` string (e.g. \"0.2\")"
                         .to_string(),
@@ -558,6 +624,7 @@ fn check_duplicate_ids(files: &[ScannedFile], report: &mut ValidationReport) {
             for path in &sorted {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: path.to_string(),
                     message: format!(
                         "concept id collides case-insensitively with: {}",
@@ -638,6 +705,7 @@ fn check_duplicate_resources(files: &[ScannedFile], report: &mut ValidationRepor
             for path in &sorted {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Error,
+                    kind: IssueKind::Other,
                     file: path.to_string(),
                     message: format!(
                         "duplicate concept identity: `resource: {resource}` also appears in: {}",
@@ -720,6 +788,7 @@ fn check_relationship_targets(
                 if !known_paths.contains(target_path.as_str()) {
                     report.issues.push(ValidationIssue {
                         severity: Severity::Error,
+                        kind: IssueKind::Other,
                         file: file.relative.clone(),
                         message: format!(
                             "`relationships.{kind}` references `{target}`, which doesn't exist in the bundle"
@@ -785,6 +854,7 @@ fn check_relationship_provenance(files: &[ScannedFile], report: &mut ValidationR
                     if !matches!(confidence, "exact" | "semantic") {
                         report.issues.push(ValidationIssue {
                             severity: Severity::Error,
+                            kind: IssueKind::Other,
                             file: file.relative.clone(),
                             message: format!(
                                 "`relationships.{kind}` entry for `{target}` has an unrecognized `confidence: {confidence}` (expected `exact` or `semantic`)"
@@ -796,6 +866,7 @@ fn check_relationship_provenance(files: &[ScannedFile], report: &mut ValidationR
                 if resolved_by == Some("") {
                     report.issues.push(ValidationIssue {
                         severity: Severity::Error,
+                        kind: IssueKind::Other,
                         file: file.relative.clone(),
                         message: format!(
                             "`relationships.{kind}` entry for `{target}` has an empty `resolved_by`"
@@ -816,6 +887,7 @@ fn check_relationship_provenance(files: &[ScannedFile], report: &mut ValidationR
                 {
                     report.issues.push(ValidationIssue {
                         severity: Severity::Warning,
+                        kind: IssueKind::RelationshipProvenance,
                         file: file.relative.clone(),
                         message: format!(
                             "`relationships.{kind}` entry for `{target}` has a `resolver_version` but no real `resolved_by` (tree-sitter has no version to record)"
@@ -922,6 +994,7 @@ fn check_symmetry_direction(
             if !has_reverse {
                 report.issues.push(ValidationIssue {
                     severity: Severity::Warning,
+                    kind: IssueKind::RelationshipSymmetry,
                     file: target_path,
                     message: format!(
                         "`{id}` lists `relationships.{forward_key}: {target}`, but `{target}` doesn't list `relationships.{reverse_key}: {id}` back"
@@ -1018,6 +1091,7 @@ fn check_links_and_collect(
                         if !seen_targets.insert(target.clone()) {
                             report.issues.push(ValidationIssue {
                                 severity: Severity::Warning,
+                                kind: IssueKind::RedundantLink,
                                 file: file.relative.clone(),
                                 message: format!("redundant link to `{target}` (already linked earlier in this file)"),
                             });
@@ -1027,6 +1101,7 @@ fn check_links_and_collect(
                     Some(target) => {
                         report.issues.push(ValidationIssue {
                             severity: Severity::Error,
+                            kind: IssueKind::Other,
                             file: file.relative.clone(),
                             message: format!(
                                 "dangling link to `{target}` (resolved from `{link}`)"
@@ -1036,6 +1111,7 @@ fn check_links_and_collect(
                     None => {
                         report.issues.push(ValidationIssue {
                             severity: Severity::Error,
+                            kind: IssueKind::Other,
                             file: file.relative.clone(),
                             message: format!("link `{link}` escapes the bundle root"),
                         });
@@ -1073,6 +1149,7 @@ fn check_reachability(
         }
         report.issues.push(ValidationIssue {
             severity: Severity::Warning,
+            kind: IssueKind::Orphan,
             file: file.relative.clone(),
             message: "not reachable from index.md (orphaned concept)".to_string(),
         });
@@ -1133,10 +1210,35 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.message.contains("dangling link")));
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| i.severity == Severity::Warning && i.message.contains("orphaned")));
+        assert!(report.issues.iter().any(|i| {
+            i.severity == Severity::Warning
+                && i.kind == IssueKind::Orphan
+                && i.message.contains("orphaned")
+        }));
+    }
+
+    /// Regression test for issue #23: `ValidationReport::has_warning_of_kind`
+    /// lets a caller distinguish an advisory warning class (here, a
+    /// redundant duplicate link) from the one warning class a bundle
+    /// consumer actually wants to gate on (here, orphans) — `okf-cli`'s
+    /// `validate --ci` is exactly that caller.
+    #[test]
+    fn has_warning_of_kind_distinguishes_orphan_from_other_warning_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            "- [run](functions/run.md)\n- [run again](functions/run.md)\n",
+        );
+        write(
+            dir.path(),
+            "functions/run.md",
+            "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L1\n---\n\nbody\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        assert!(report.has_warning_of_kind(IssueKind::RedundantLink));
+        assert!(!report.has_warning_of_kind(IssueKind::Orphan));
     }
 
     #[test]
@@ -1439,6 +1541,7 @@ mod tests {
         assert!(!report.has_errors(), "this is a warning, not an error");
         assert!(report.issues.iter().any(|i| {
             i.severity == Severity::Warning
+                && i.kind == IssueKind::RelationshipProvenance
                 && i.message.contains("resolver_version")
                 && i.message.contains("functions/callee")
         }));
@@ -1487,10 +1590,11 @@ mod tests {
             "a redundant link is a warning, not an error: {:?}",
             report.issues
         );
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| { i.severity == Severity::Warning && i.message.contains("redundant link") }));
+        assert!(report.issues.iter().any(|i| {
+            i.severity == Severity::Warning
+                && i.kind == IssueKind::RedundantLink
+                && i.message.contains("redundant link")
+        }));
     }
 
     /// Found by real-world benchmarking (August 2026): two functions that
@@ -1641,6 +1745,7 @@ mod tests {
         );
         assert!(report.issues.iter().any(|i| {
             i.severity == Severity::Warning
+                && i.kind == IssueKind::RelationshipSymmetry
                 && i.file == "functions/b.md"
                 && i.message.contains("relationships.calls: functions/b")
                 && i.message.contains("relationships.called_by: functions/a")
@@ -1750,10 +1855,11 @@ mod tests {
 
         let report = validate_bundle(dir.path()).unwrap();
         assert!(!report.has_errors());
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| i.severity == Severity::Warning && i.message.contains("actor convention")));
+        assert!(report.issues.iter().any(|i| {
+            i.severity == Severity::Warning
+                && i.kind == IssueKind::ActorFormat
+                && i.message.contains("actor convention")
+        }));
     }
 
     #[test]
