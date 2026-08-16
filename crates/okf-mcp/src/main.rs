@@ -24,10 +24,19 @@
 //! `--benchmark` skips the stdio JSON-RPC loop entirely and instead
 //! prints a one-shot local session-level cost report to stdout, then
 //! exits — see [`benchmark`] for what it measures and why.
+//!
+//! `--benchmark-tool-selection` is the same kind of one-shot side door,
+//! for Phase E's live-endpoint tool-selection benchmark instead — see
+//! [`tool_selection_live`] for what it measures, how it's configured
+//! (`OKF_BENCHMARK_MODEL_BASE_URL`/`OKF_BENCHMARK_MODEL`/
+//! `OKF_BENCHMARK_MODEL_API_KEY`), and why it's a real model call rather
+//! than the offline-only harness [`tool_selection_benchmark`] shipped
+//! first.
 
 mod benchmark;
 mod cache;
 mod tool_selection_benchmark;
+mod tool_selection_live;
 mod tools;
 
 use anyhow::Result;
@@ -47,9 +56,10 @@ const BENCHMARK_SAMPLE_SIZE: usize = 5;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let benchmark_mode = args.iter().any(|a| a == "--benchmark");
+    let benchmark_tool_selection_mode = args.iter().any(|a| a == "--benchmark-tool-selection");
     let project_root = args
         .into_iter()
-        .find(|a| a != "--benchmark")
+        .find(|a| a != "--benchmark" && a != "--benchmark-tool-selection")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let project_root = project_root
@@ -58,6 +68,19 @@ fn main() -> Result<()> {
 
     if benchmark_mode {
         let report = benchmark::run(&project_root, BENCHMARK_SAMPLE_SIZE)?;
+        print!("{}", report.render());
+        return Ok(());
+    }
+
+    if benchmark_tool_selection_mode {
+        // Runs against a fixed fixture bundle with known-correct answers
+        // (see `tool_selection_live::run`), not `project_root` — this
+        // benchmark measures tool-selection accuracy against ground
+        // truth, which only the shared fixture has; `project_root` is
+        // unused here but still accepted/parsed for a consistent CLI
+        // shape with `--benchmark`.
+        let config = tool_selection_live::LiveConfig::from_env()?;
+        let report = tool_selection_live::run(&config)?;
         print!("{}", report.render());
         return Ok(());
     }

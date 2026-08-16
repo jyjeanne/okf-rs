@@ -41,7 +41,7 @@ That's not just a format preference — it's the actual safety property that mat
 - **Deterministic** — identical source always produces byte-identical output; no wall-clock timestamps, no unordered maps leaking into results (and `generate --check-determinism` verifies this directly, rather than asking you to take it on faith).
 - **AI-ready** — structured knowledge that doesn't require an LLM to produce, though one can optionally enrich it later.
 
-See [`docs/specification.md`](docs/specification.md) for the full project specification, including how `okf-rs` compares to other tools in this space, [`docs/improvement-plan.md`](docs/improvement-plan.md) for a gap analysis against CodeGraph and code-review-graph — two SQLite-backed alternatives that converge on the same "pre-index once, query the index" thesis but implement it as a database plus a bespoke query layer rather than the artifact itself being the knowledge base — plus a prioritized improvement plan, [`docs/improvement-plan-provenance-diff.md`](docs/improvement-plan-provenance-diff.md) for the next layer on top — resolver-version tracking, provenance-aware graph diffing, and a `diff --ci` policy — and [`ROADMAP.md`](ROADMAP.md) for what's shipped and what's next.
+See [`docs/specification.md`](docs/specification.md) for the full project specification, including how `okf-rs` compares to other tools in this space, [`docs/improvement-plan.md`](docs/improvement-plan.md) for a gap analysis against CodeGraph and code-review-graph — two SQLite-backed alternatives that converge on the same "pre-index once, query the index" thesis but implement it as a database plus a bespoke query layer rather than the artifact itself being the knowledge base — plus a prioritized improvement plan, [`docs/improvement-plan-provenance-diff.md`](docs/improvement-plan-provenance-diff.md) for the layer built on top of that — resolver-version tracking, provenance-aware graph diffing, a `diff --ci` policy, artifact-level reproducibility metadata, and a specialized-vs-consolidated MCP tool-selection benchmark, shipped in full — and [`ROADMAP.md`](ROADMAP.md) for what's shipped and what's next.
 
 ## Features
 
@@ -64,7 +64,7 @@ See [`docs/specification.md`](docs/specification.md) for the full project specif
 - **AI agent integration** — `okf-rs init` writes/updates `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md`, idempotently; `AGENTS.md` holds the generated content and `CLAUDE.md` just imports it (`@AGENTS.md`), so tools that prefer `AGENTS.md` over `CLAUDE.md` (e.g. opencode) never end up reading stale or missing content; `okf-mcp` exposes search, explore, and graph queries as an MCP server for tools like Claude Code and opencode
 - **Standalone binary** — no runtime dependency beyond the OS's standard C library; see [Packaging & Distribution](docs/specification.md#packaging--distribution)
 
-See [`ROADMAP.md`](ROADMAP.md) for what's shipped (Phases 1 & 2 complete, Phase 3 in progress) and what's next.
+See [`ROADMAP.md`](ROADMAP.md) for what's shipped (Phases 1-3 and both improvement plans complete) and what's next (Phase 4 — Ecosystem).
 
 ## Installation
 
@@ -320,6 +320,8 @@ Register it with opencode by adding it to `opencode.json`:
 or point any other MCP client's stdio transport at the same binary and argument.
 
 Run `okf-mcp <project> --benchmark` instead of registering it with a client to get a local, offline session-level cost report for that project's own bundle: the fixed token cost of registering this server's tool schemas, a sample of real "who calls this?" queries comparing that against a naive grep-and-read baseline, and the resulting break-even point — no LLM call, no client needed. See [`ROADMAP.md`](ROADMAP.md#improvement-plan--ai-native-platform-maturity-community-feedback) for what it does and doesn't measure.
+
+`okf-mcp --benchmark-tool-selection` answers a different question — not "is registering this server worth it," but "does a model pick the right `relation` inside the consolidated `graph` tool as reliably as it used to pick the right tool name," before that 18→6 consolidation happened. Opt-in and never run in CI (it needs a real model call): point it at any OpenAI-compatible `/chat/completions` endpoint with function-calling support via `OKF_BENCHMARK_MODEL_BASE_URL`/`OKF_BENCHMARK_MODEL`(/`OKF_BENCHMARK_MODEL_API_KEY`) — deliberately separate variables from `search_semantic`'s `OKF_ENRICH_*`, so the benchmarked model and the enrichment model can differ — and it runs a fixed 14-question set against both the live `graph` tool and 13 reconstructed pre-consolidation `graph_*` tools on a known-correct fixture bundle, reporting tool-selection accuracy, final-answer accuracy, tokens, and latency for each design. See [`docs/improvement-plan-provenance-diff.md`](docs/improvement-plan-provenance-diff.md#6-phase-e--specialized-vs-consolidated-mcp-tool-selection-benchmark--shipped) for the full design and [`ROADMAP.md`](ROADMAP.md#improvement-plan--provenance-depth-graph-diff--mcp-tool-selection) for how it was verified.
 
 #### Why this reduces token consumption
 

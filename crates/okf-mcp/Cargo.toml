@@ -17,9 +17,17 @@ okf-graph.workspace = true
 okf-query.workspace = true
 okf-enrich.workspace = true
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 ignore.workspace = true
 walkdir.workspace = true
-
-[dev-dependencies]
+# Only for the live half of the Phase E tool-selection benchmark
+# (`tool_selection_live`): an OpenAI-compatible /chat/completions client
+# with function-calling support, the same `ureq` (not reqwest+tokio, no
+# async runtime) choice `okf-enrich` already made for the same reason —
+# see that crate's root doc comment.
+ureq = { version = "2", features = ["json"] }
+# A regular dependency, not dev-only: `--benchmark-tool-selection` builds
+# its fixture bundle (`tool_selection_benchmark::fixture_bundle`) in the
+# real binary, not just in `cargo test`.
 tempfile = "3"

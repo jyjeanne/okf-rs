@@ -1113,8 +1113,10 @@ dependencies = [
  "okf-graph",
  "okf-parser",
  "okf-query",
+ "serde",
  "serde_json",
  "tempfile",
+ "ureq",
  "walkdir",
 ]
 

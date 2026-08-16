@@ -10,10 +10,9 @@ automatically verifiable, not another prose roadmap.
 
 **Delivery status:** tracked in
 [`ROADMAP.md`](../ROADMAP.md#improvement-plan--provenance-depth-graph-diff--mcp-tool-selection).
-Phases A (resolver version), B (provenance-aware graph diff), C (`diff --ci` policy), D
-(reproducibility metadata), and F (golden fixture dataset) have shipped in full. Phase E has
-shipped its fully offline harness (question set, fixture, scoring) — the live-endpoint wiring is
-deliberately deferred, per this phase's own "CONDITIONAL GO" verdict below.
+All six phases have now shipped in full: A (resolver version), B (provenance-aware graph diff), C
+(`diff --ci` policy), D (reproducibility metadata), E (tool-selection benchmark, offline harness
+*and* live-endpoint wiring), and F (golden fixture dataset).
 
 ## 0. What's already shipped, and what's actually new here
 
@@ -37,7 +36,7 @@ then only phases the genuinely new remainder.
 | **Provenance-aware graph diff** (source vs. resolver vs. semantic change classes) | ✅ Shipped (this plan's Phase B) | `okf_analyzer::{RelationshipChangeKind, diff_relationships}` — see `ROADMAP.md` |
 | **`okf-rs diff --ci` policy with source/resolver/metadata classification** | ✅ Shipped (this plan's Phase C) | `okf-rs diff --ci`, `okf_analyzer::ci_summary`, `okf_core::config::DiffPolicy` — see `ROADMAP.md` |
 | **Artifact-level reproducibility metadata** (generator name/version, source revision) | ✅ Shipped (this plan's Phase D) | `okf_core::git::head_revision`, `okf_generator::write_root_index`'s `generator_name`/`generator_version`/`source_revision` — see `ROADMAP.md` |
-| **Specialized-vs-consolidated tool-*selection-accuracy*** benchmark (real model calls) | 🚧 Harness shipped (this plan's Phase E); live-endpoint wiring deliberately deferred | `okf_mcp::tool_selection_benchmark` — question set, fixture, scoring, all model-free — see `ROADMAP.md` |
+| **Specialized-vs-consolidated tool-*selection-accuracy*** benchmark (real model calls) | ✅ Shipped (this plan's Phase E) | `okf_mcp::tool_selection_benchmark` (offline question set/fixture/scoring) + `okf_mcp::tool_selection_live` (live OpenAI-compatible tool-calling runner, `okf-mcp --benchmark-tool-selection`) — see `ROADMAP.md` |
 | Golden fixture dataset for provenance/diff/MCP | ✅ Shipped (this plan's Phase F) | `tests/fixtures/{provenance,diff,mcp}/` — see `ROADMAP.md` |
 
 Everything below phases only the six rows this table originally marked ❌ (two have since shipped
@@ -487,7 +486,7 @@ wants a `source_revision` to still point at *something*.
 
 ---
 
-## 6. Phase E — Specialized-vs-consolidated MCP tool-*selection* benchmark 🚧 Harness shipped, live-endpoint wiring deferred
+## 6. Phase E — Specialized-vs-consolidated MCP tool-*selection* benchmark ✅ Shipped
 
 ### Objective
 
@@ -505,9 +504,8 @@ running to A/B against live, so the comparison has to reconstruct it.
 
 ### Design
 
-A new, standalone benchmark harness (`okf-mcp --benchmark-tool-selection`, or a small script
-under `crates/okf-mcp/benches/` if a live model call doesn't belong in the main binary — see
-open question below) that:
+A new, standalone benchmark harness (`okf-mcp --benchmark-tool-selection`, the same main-binary
+one-shot side door `--benchmark` already uses — no separate `benches/` script needed) that:
 
 1. Defines a fixed set of representative natural-language questions, one per `graph` relation
    (mirroring the reviewer's own examples): "Who calls `Foo`?", "What does `Foo` call?", "What's
@@ -519,39 +517,47 @@ open question below) that:
    `graph_*` consolidation, so it's a genuinely new relation, not one of the 13 that got merged.
 2. For the **consolidated** design (what's actually shipped): feeds each question, plus the real
    `graph` tool's schema from `tools/list`, to a model and records which `relation` value it
-   chose, whether it needed a follow-up/retry, and the final answer's correctness against the
-   bundle's known-correct answer.
+   chose and the final answer's correctness against the bundle's known-correct answer. Single-shot
+   only (`tool_choice: "auto"`, one request per question) — no multi-turn retry loop: a model that
+   picks wrong or declines to call anything is scored as wrong/errored on that one attempt, not
+   re-prompted. Simpler than the "follow-up/retry" tracking this section originally sketched, and
+   an honest one: a retry loop would need its own scoring policy (does a correct-on-retry count as
+   correct?) this plan never specified, so shipping a well-defined single-shot measurement beat
+   shipping an underspecified multi-shot one.
 3. For the **specialized** design (reconstructed, not live): feeds the same question against a
-   hand-built schema list of the 13 old `graph_*` tool names/descriptions (recoverable from git
-   history — `okf-mcp` 0.2.x's `tools/list` output, or the ROADMAP's own enumeration of the old
-   tool names) to the same model, recording which tool name it picked — **with one explicit
-   carve-out**: `explain` has no historical specialized-tool counterpart to reconstruct (no
-   `graph_explain` ever existed), so the 14th question is scored for the consolidated design only,
-   footnoted as "no specialized-era equivalent" in the report rather than either dropped silently
-   or answered against an invented tool name that would undermine the "reconstructed, not
-   invented" methodology the rest of this phase relies on.
-4. Reports, per design: tool/relation-selection accuracy, number of calls needed to reach a
-   correct final answer, total tokens (schema + call + response), and latency — 13 comparable
+   hand-built schema list of the 13 old `graph_*` tool names/descriptions (parameters reconstructed
+   from the consolidated `graph` tool's own per-relation shape; descriptions lifted from that same
+   tool's per-relation bullet points, not invented, so a specialized-design loss can't be an
+   artifact of a worse description) to the same model, recording which tool name it picked — **with
+   one explicit carve-out**: `explain` has no historical specialized-tool counterpart to
+   reconstruct (no `graph_explain` ever existed), so the 14th question is scored for the
+   consolidated design only, excluded from the specialized design's 13-question sample rather than
+   either dropped silently or answered against an invented tool name.
+4. Reports, per design: tool/relation-selection accuracy, final-answer accuracy, total tokens
+   (prompt + completion, from the endpoint's own `usage` object), and latency — 13 comparable
    questions plus 1 consolidated-only question, not 14 directly comparable ones.
 
-### Open question this phase should resolve, not assume
+### Live-endpoint configuration (resolved)
 
 Every other benchmark in this codebase (`okf-mcp --benchmark`, real-world-project benchmarking)
 is deliberately **offline and LLM-free** — a stated design choice, not an oversight (see
 `benchmark.rs`'s own doc comment: "no LLM call or tokenizer dependency involved"). A real
 tool-selection-accuracy measurement, unlike schema-size accounting, *cannot* be done that way —
-"which tool would a model pick" is not decidable without actually calling one. This phase should
-therefore:
+"which tool would a model pick" is not decidable without actually calling one. This phase resolved
+that tension as follows:
 
-- Be clearly scoped as **not run in normal CI** (no API key available, non-deterministic, real
-  cost per run) — an opt-in benchmark script/command, documented as such, the same way
-  `--enrich`'s network dependency is already opt-in and never exercised by default test runs.
-- Support a pluggable model endpoint the same way `okf-enrich` already does (any OpenAI-compatible
-  `chat/completions` endpoint via `--benchmark-model-base-url`/`--benchmark-model`), so this
-  doesn't hard-depend on one vendor either.
-- Report results with the same honesty `okf-mcp --benchmark`'s existing RAG-comparison gap
+- **Not run in normal CI** (no API key available, non-deterministic, real cost per run) — an
+  opt-in `--benchmark-tool-selection` flag, documented as such, the same way `--enrich`'s network
+  dependency is already opt-in and never exercised by default test runs.
+- **Pluggable model endpoint via environment variables**, not CLI flags —
+  `OKF_BENCHMARK_MODEL_BASE_URL`/`OKF_BENCHMARK_MODEL`/`OKF_BENCHMARK_MODEL_API_KEY` — mirroring
+  `--enrich`'s existing `OKF_ENRICH_*` pattern (any OpenAI-compatible `chat/completions` endpoint:
+  Ollama, LM Studio, OpenAI, or a compatible cloud provider), but a **separate** set of variables:
+  the model worth measuring for tool-selection accuracy need not be the model this server would
+  otherwise use for description enrichment or semantic search.
+- **Reports results with the same honesty** `okf-mcp --benchmark`'s existing RAG-comparison gap
   already models: sample size, which model was used, and that a single model's tool-selection
-  behavior is not a universal claim about "LLMs in general."
+  behavior is not a universal claim about "LLMs in general" — see `LiveReport::render`.
 
 ### Tests
 
@@ -568,7 +574,7 @@ therefore:
 
 ### Acceptance criteria
 
-**Shipped (the harness half):**
+**The harness half:**
 - The 14-question set, one per `graph` relation, exists with a known-correct `relation`/answer
   each — verified directly against a real fixture bundle through the actual `tools::call`
   dispatch, with zero model calls (`okf_mcp::tool_selection_benchmark`).
@@ -579,11 +585,30 @@ therefore:
 - Scoring logic (`scores_correctly`) is a real, independently unit-tested function — not inlined
   logic a future live-endpoint runner would have to duplicate or guess at.
 
-**Not yet shipped (needs the live-endpoint decision this phase was always conditional on):**
-- Tool-selection accuracy, call count, tokens, and latency reported for both designs from a real
-  model run.
-- The comparison actually reproduced against a chosen model/endpoint.
-- A report stating whether the consolidation is validated or falsified by real numbers.
+**The live-endpoint half — `okf_mcp::tool_selection_live`, `okf-mcp --benchmark-tool-selection`:**
+- A real OpenAI-compatible tool-calling client (`tools`/`tool_choice`, not plain chat completion —
+  see that module's doc comment on why `okf_enrich::EnrichClient` doesn't fit), configured through
+  `OKF_BENCHMARK_MODEL_BASE_URL`/`OKF_BENCHMARK_MODEL`/`OKF_BENCHMARK_MODEL_API_KEY` — a deliberately
+  separate set of variables from `--enrich`'s `OKF_ENRICH_*`, so the benchmarked model and the
+  enrichment model can be configured independently.
+- Both designs actually run: the consolidated design against the real `graph` tool's live schema
+  (`tools::list()`), the specialized design against 13 reconstructed `graph_<relation>` schemas
+  (`explain` excluded, no pre-0.3.0 counterpart) — reusing the harness's own
+  `questions()`/`scores_correctly()`/`specialized_tool_name()`, not a second copy of them.
+- Tool-selection accuracy, final-answer accuracy, total tokens, and total latency reported per
+  design (`DesignReport`), plus a per-question `[WRONG]`/`[ERROR]` breakdown — with the model name
+  and sample size stated up front and an explicit "not a universal claim about LLMs in general"
+  caveat, per this phase's own honesty requirement.
+- Never run by `cargo test --workspace`: this module's own tests cover the HTTP request/response
+  parsing layer against a hand-rolled mock server (mirroring `okf_enrich::test_support`), not real
+  model behavior. Verified end to end against a real, separate-process HTTP server (not just the
+  in-process Rust mock) three ways: `--benchmark-tool-selection` with no env vars set reports a
+  clear `OKF_BENCHMARK_MODEL_BASE_URL` error; against a server that answers every question
+  correctly, both designs score 100%/100% (14/14 consolidated, 13/13 specialized); against a
+  server deliberately wrong on one question and silent (no tool call) on another, the report
+  correctly drops to 12/14 and 11/13 with both a `[WRONG]` and an `[ERROR]` line naming the exact
+  question and reason — proving the scoring, dispatch, and error-reporting paths all work against
+  a real socket, not just canned unit-test data.
 
 ---
 
@@ -699,7 +724,7 @@ table marks ❌, versus how speculative it is.
 | B | Provenance-aware diff classification | M | High — the single biggest named gap; closes both the false-negative (rewire hidden by matching resolver names) and false-positive (invisible resolver-only change) directions at once | Medium — pairing relationships by `(kind, target)` across two snapshots needs care around duplicate targets under different kinds and concepts that both add and remove edges in the same diff; needs the six worked scenarios as real regression tests, not just the happy path | **GO**, sequenced after A — ✅ shipped |
 | C | `okf-rs diff --ci` policy | S-M | High — this is what actually makes B usable in a pipeline, matching the reviewer's own CLI example line for line | Low — mirrors `validate --ci`'s already-shipped, already-tested flag pattern; the only new surface is the `okf.toml` `[diff]` section | **GO**, sequenced after B — ✅ shipped |
 | D | Artifact-level reproducibility metadata (no timestamp) | S | Medium — genuinely useful for CI audit ("which okf-rs, which commit, built this bundle"), but scoped down from the reviewer's ask specifically to avoid the determinism regression a naive implementation would cause | Medium — the risk isn't the feature, it's a future contributor "fixing" the missing timestamp back in; mitigated by testing `--check-determinism`/`--check-fresh` directly against this phase and documenting the cut in the module itself | **GO**, with the no-timestamp scope cut as a hard constraint, not a suggestion — ✅ shipped |
-| E | Specialized-vs-consolidated tool-*selection* benchmark | M-L | Medium — genuinely validates (or falsifies) a decision already shipped and already justified on schema-size grounds alone; real value is closing that specific "did we trade selection accuracy for schema size and never check" open question | Medium-High — the only item in this plan requiring a live LLM call, breaking this project's until-now-consistent "every benchmark is offline and deterministic" posture; must stay explicitly opt-in/non-CI to avoid becoming a flaky, costly, silently-skipped test | **CONDITIONAL GO** — build the harness and question set (fully testable without a model) first; only wire up a real endpoint call once someone is prepared to own interpreting a non-deterministic result, matching how `--enrich`'s own network dependency was scoped in from day one — 🚧 harness shipped exactly as conditioned; live-endpoint wiring still open |
+| E | Specialized-vs-consolidated tool-*selection* benchmark | M-L | Medium — genuinely validates (or falsifies) a decision already shipped and already justified on schema-size grounds alone; real value is closing that specific "did we trade selection accuracy for schema size and never check" open question | Medium-High — the only item in this plan requiring a live LLM call, breaking this project's until-now-consistent "every benchmark is offline and deterministic" posture; must stay explicitly opt-in/non-CI to avoid becoming a flaky, costly, silently-skipped test | **CONDITIONAL GO** — build the harness and question set (fully testable without a model) first; only wire up a real endpoint call once someone is prepared to own interpreting a non-deterministic result, matching how `--enrich`'s own network dependency was scoped in from day one — ✅ both halves shipped: harness first, live-endpoint runner (`okf-mcp --benchmark-tool-selection`) once the endpoint/env-var decision was made |
 | F | Golden fixture dataset | S | Low-Medium — organizational, not a new capability; mainly pays for itself by giving Phases B/C's own tests a less ad hoc home | Low — pure relocation/addition, no behavior change | **GO**, opportunistically alongside B/C rather than as a blocking prerequisite — ✅ shipped, and additively (not a relocation of existing tests, which stayed as-is) |
 
 ### Net recommendation
@@ -707,21 +732,22 @@ table marks ❌, versus how speculative it is.
 Shipped, in order: **A → B → C → D**, all unconditional **GO**s — this sequence alone delivers the
 reviewer's core thesis (resolver identity *and version*, provenance-aware diff, CI policy) with
 no unresolved conditions, at a combined cost of roughly S+M+(S-M)+S. **E**'s conditional-GO was
-honored precisely as scoped: the harness/question-set/scoring half (fully offline, model-free)
-shipped; the live-endpoint half remains explicitly not done, since that's the one item in this
-plan that breaks with every existing benchmark's offline-and-deterministic posture, and the
-"who runs it, against what endpoint, how often" question still needs a deliberate answer rather
-than an accidental one. **F** shipped last, exactly as its own low-priority, non-blocking scoring
-in this table always said it should: real fixture files for Phase A's provenance shapes and Phase
-B's five diff scenarios, plus a portable JSON export of Phase E's question set (the one piece that
-genuinely couldn't be used outside Rust before), each backed by a real test proving the fixture
-round-trips through the actual code path it claims to exercise — additive alongside the existing
+honored precisely as scoped, in two steps: the harness/question-set/scoring half (fully offline,
+model-free) shipped first; the live-endpoint half — a real OpenAI-compatible tool-calling client,
+configured via `OKF_BENCHMARK_MODEL_*` env vars, actually exercising both designs against a real
+model — shipped once that deliberate decision (which endpoint, env vars vs. flags) was made,
+closing the one item in this plan that broke with every existing benchmark's offline-and-
+deterministic posture. **F** shipped in between, exactly as its own low-priority, non-blocking
+scoring in this table always said it should: real fixture files for Phase A's provenance shapes and
+Phase B's five diff scenarios, plus a portable JSON export of Phase E's question set (the one piece
+that genuinely couldn't be used outside Rust before), each backed by a real test proving the
+fixture round-trips through the actual code path it claims to exercise — additive alongside the existing
 inline Rust-native tests from B/C/E, which stayed exactly where they were, not a relocation of
 them.
 
-**Where this plan stands:** every phase this document proposed has either shipped in full (A, B,
-C, D, F) or shipped exactly the part its own conditional verdict called for (E's harness, with the
-live-endpoint half correctly left for a deliberate future decision, not an accidental default).
+**Where this plan stands:** every phase this document proposed has shipped in full — A, B, C, D,
+E (both the harness and, once its own conditional verdict's deliberate decision was made, the
+live-endpoint runner), and F.
 
 ## References
 

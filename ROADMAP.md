@@ -11,7 +11,7 @@ This roadmap tracks delivery against the plan in [`docs/specification.md`](docs/
 | Phase 3 — Search, Interop & Intelligence | ✅ Complete (15/15) |
 | Improvement Plan Delivery (competitive gap-closing) | ✅ Complete (7/7) |
 | Improvement Plan (AI-native platform maturity, community feedback) | ✅ Complete (11/11 shipped) |
-| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | 🚧 In progress (5/6 shipped, 1 partial) |
+| Improvement Plan (provenance depth, graph diff, MCP tool-selection) | ✅ Shipped (6/6) |
 | Phase 4 — Ecosystem | ⬜ Not started |
 
 ---
@@ -325,23 +325,45 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   (`strip_source_revision_line`) that one line out of the root `index.md` comparison
   `--check-determinism`/`--check-fresh` both use, before diffing — the artifact still records its
   real provenance; the *staleness check* just doesn't conflate that with content drift.
-- [x] 🚧 **Phase E — Specialized-vs-consolidated MCP tool-*selection* benchmark harness.** A new
-  `okf-mcp` module (`tool_selection_benchmark`) ships the fully offline, model-free half the
-  plan's own review called for building first: a fixed 14-question set (one per `graph` relation),
-  each with a known-correct answer verified directly against a real fixture bundle through the
-  actual `tools::call` dispatch — no model involved, matching every other benchmark in this
-  codebase's offline-and-deterministic posture. The pre-0.3.0 specialized-tool-name mapping
+- [x] ✅ **Phase E — Specialized-vs-consolidated MCP tool-*selection* benchmark.** Shipped in two
+  parts, exactly as the plan's own "CONDITIONAL GO" verdict scoped it.
+
+  **The offline harness** (`okf_mcp::tool_selection_benchmark`) is the fully offline, model-free
+  half the plan's own review called for building first: a fixed 14-question set (one per `graph`
+  relation), each with a known-correct answer verified directly against a real fixture bundle
+  through the actual `tools::call` dispatch — no model involved, matching every other benchmark in
+  this codebase's offline-and-deterministic posture. The pre-0.3.0 specialized-tool-name mapping
   (`graph_<relation>`) is reconstructed for comparison, with the one documented exception
   (`explain`, which postdates the consolidation and has no specialized-era counterpart) scored
-  against the consolidated design only, never a dropped or invented one. **Not done, deliberately:**
-  wiring an actual model endpoint to run this question set live — the only way to get real
-  tool-selection-accuracy/token/latency numbers the plan's Phase E asks for. Every other benchmark
-  in this codebase is offline and deterministic; a live call breaks that posture, costs real
-  money, and — per the plan's own "CONDITIONAL GO" verdict on this item — needs someone to
-  explicitly own interpreting a non-deterministic result and pick a model/endpoint before it's
-  wired in, not a decision to bake in silently. A half-built CLI flag that dumps the question set
-  without ever calling a model would be more misleading than leaving it unbuilt, so nothing here
-  pretends to benchmark anything yet.
+  against the consolidated design only, never a dropped or invented one.
+
+  **The live-endpoint runner** (`okf_mcp::tool_selection_live`, behind `okf-mcp
+  --benchmark-tool-selection`) actually calls a model now that the plan's deliberate
+  "who owns interpreting a non-deterministic result, which endpoint" decision has been made:
+  an OpenAI-compatible endpoint configured entirely through environment variables —
+  `OKF_BENCHMARK_MODEL_BASE_URL`/`OKF_BENCHMARK_MODEL`/`OKF_BENCHMARK_MODEL_API_KEY` — mirroring
+  `--enrich`'s existing `OKF_ENRICH_*` pattern, but a deliberately **separate** set of variables so
+  the benchmarked model and the enrichment model can be configured independently. Not a reuse of
+  `okf_enrich::EnrichClient`: that client's `complete()` sends plain system+user chat completion
+  with no `tools`/`tool_choice`, insufficient for a benchmark that has to measure which tool schema
+  a model actually picks — this module has its own small `ToolCallingClient` speaking the
+  OpenAI-compatible function-calling wire format (`tools: [{type: "function", function: {...}}]`,
+  reading back `choices[0].message.tool_calls`). Runs both designs for real: the consolidated
+  design against the live `graph` tool's own schema (`tools::list()`, not a hand-copied
+  approximation), the specialized design against 13 reconstructed `graph_<relation>` schemas whose
+  descriptions are lifted from the consolidated tool's own per-relation bullet points (so a
+  specialized-design loss can't be an artifact of a worse description) — reusing the harness's own
+  `questions()`/`scores_correctly()`/`specialized_tool_name()` rather than duplicating them.
+  Reports tool-selection accuracy, final-answer accuracy, total tokens, and total latency per
+  design, plus a per-question `[WRONG]`/`[ERROR]` breakdown, with the model name, sample size, and
+  an explicit "not a universal claim about LLMs in general" caveat stated up front. Single-shot
+  only (`tool_choice: "auto"`, no multi-turn retry loop) — a deliberate scope cut from the plan's
+  original "records whether it needed a follow-up/retry" sketch: a retry loop needs its own scoring
+  policy (does a correct-on-retry count as correct?) the plan never specified, so a well-defined
+  single-shot measurement shipped instead of an underspecified multi-shot one. Never run by `cargo
+  test --workspace`, matching every other live-network path in this codebase; this module's own
+  tests cover the HTTP request/response parsing layer against a hand-rolled mock server (the same
+  pattern `okf_enrich::test_support` established), not real model behavior.
 - [x] ✅ **Phase F — `tests/fixtures/` golden dataset.** The reviewer's proposed layout, exactly:
   `provenance/{tree-sitter,lsp,mixed}.md` (real bundle concept files covering Phase A's three
   provenance shapes), `diff/{unchanged,added-edge,removed-edge,resolver-change,semantic-change}/
@@ -470,6 +492,44 @@ closes the loop on Phase E's own "a form a non-Rust benchmark script could also 
 question set now genuinely exists outside Rust, checked against the source of truth on every test
 run rather than trusted to stay in sync by hand. Full workspace `cargo test`/
 `clippy -D warnings`/`fmt --check` stayed clean throughout.
+
+Phase E's live-endpoint runner verified by dogfooding against a **real, separate-process** HTTP
+server — not just the in-process Rust mock its own unit tests use — proving the whole chain (CLI
+flag parsing → env-var config → real socket HTTP request → OpenAI-compatible function-calling
+response parsing → dispatch through the real `graph` tool → scoring → report rendering) actually
+works end to end, three ways: (1) `okf-mcp --benchmark-tool-selection` with no env vars set exits
+with a clear error naming `OKF_BENCHMARK_MODEL_BASE_URL`, not a panic or a generic failure; (2)
+against a standalone Python mock server (a genuinely separate OS process, reachable only over
+`127.0.0.1`) that answers every question correctly for whichever schema it's offered, both designs
+scored perfectly — 14/14 (100%) consolidated, 13/13 (100%) specialized; (3) against a second mock
+server deliberately wrong on the `callers` question and silent (no tool call at all) on `stats`,
+the report correctly dropped to 12/14 (86%) consolidated and 11/13 (85%) specialized, with an exact
+`[WRONG] "Who calls bar?": expected \`callers\`, got Some("callees")` line and an exact `[ERROR]
+"...concept-kind and relationship stats?": model ... did not call any tool` line — confirming the
+scoring and error-reporting paths, not just the happy path, hold up against a real socket. Full
+workspace `cargo build`/`cargo test --workspace --no-fail-fast`/`clippy --all-targets -D warnings`/
+`fmt --check` stayed clean throughout (33 test-result blocks, all passed, zero failures).
+
+A follow-up code review of that live-endpoint runner caught and fixed three real issues before
+merge, none of them requiring a design change: (1) `ResponseMessage.tool_calls` now deserializes
+as `Option<Vec<ToolCall>>` instead of a bare `Vec` with `#[serde(default)]` — that annotation only
+covers a *missing* key, and several OpenAI-compatible endpoints reply with an explicit JSON `null`
+for `tool_calls` instead, which previously failed deserialization with a generic "malformed
+response" error rather than this module's own clear "did not call any tool" diagnostic; a
+regression test locks this in, and it was re-verified against a real standalone mock server
+replying with a literal `"tool_calls":null` — the CLI now reports the intended per-question
+`[ERROR]` line instead. (2) `tool_selection_live::run` is now fallible
+(`-> Result<LiveReport>`) instead of panicking through `fixture_bundle()`'s `.unwrap()`s on I/O
+failure — `tool_selection_benchmark` now exposes both the original panicking `fixture_bundle()`
+(kept for the many test call sites, where a hard setup panic is the accepted idiom already used
+throughout this codebase's tests) and a fallible `fixture_bundle_try()` that `run` uses instead,
+propagated with `?` through `main()`'s existing `anyhow` error path — an unwritable or full temp
+directory now surfaces as a normal error message rather than crashing the process. (3) the
+"always answers correctly" end-to-end test no longer reimplements the mock server's raw
+Content-Length/body-read loop inline; `start_mock_server` is now a thin wrapper over a new
+`start_mock_server_with(respond)` taking a per-request response callback, and that test reuses it.
+Full workspace verification repeated after both this fix and a rebase onto three unrelated PRs
+that merged to `main` in the meantime — clean throughout, zero failures.
 
 ---
 
