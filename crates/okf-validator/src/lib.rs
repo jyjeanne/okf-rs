@@ -1015,8 +1015,13 @@ fn extract_local_links(content: &str) -> Vec<String> {
         let after = &rest[pos + 2..];
         if let Some(end) = after.find(')') {
             let target = &after[..end];
-            if target.ends_with(".md") && !target.contains("://") && !target.starts_with('#') {
-                links.push(target.to_string());
+            // Strip a trailing `#fragment` before classifying the link so
+            // `../../X.md#anchor` is treated the same as `../../X.md`:
+            // otherwise the anchored form doesn't end in `.md` and skips
+            // every check below it (dangling-link, root-escape) silently.
+            let path = target.split('#').next().unwrap_or(target);
+            if path.ends_with(".md") && !path.contains("://") && !path.is_empty() {
+                links.push(path.to_string());
             }
             rest = &after[end + 1..];
         } else {
@@ -1215,6 +1220,46 @@ mod tests {
                 && i.kind == IssueKind::Orphan
                 && i.message.contains("orphaned")
         }));
+    }
+
+    /// Regression test for issue #24: an anchored link (`../../X.md#term`)
+    /// that escapes the bundle root must be flagged exactly like its
+    /// anchor-less twin (`../../X.md`), not silently ignored because the
+    /// `#fragment` made it fail the `.md`-suffix check.
+    #[test]
+    fn root_escape_check_is_not_fooled_by_a_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", "- [entry](sub/entry.md)\n");
+        write(
+            dir.path(),
+            "sub/entry.md",
+            "---\ntype: Doc\n---\n\nSee [GLOSSARY](../../GLOSSARY.md#term) and [ARCHITECTURE](../../ARCHITECTURE.md).\n",
+        );
+
+        let report = validate_bundle(dir.path()).unwrap();
+        let escapes: Vec<&str> = report
+            .issues
+            .iter()
+            .filter(|i| i.message.contains("escapes the bundle root"))
+            .map(|i| i.message.as_str())
+            .collect();
+        // Both are reported against the same fragment-stripped path: the
+        // `#term` anchor carries no filesystem meaning, so the anchored
+        // link resolves to the identical (escaping) target as its
+        // anchor-less twin and must be flagged exactly the same way.
+        assert!(
+            escapes.iter().any(|m| m.contains("../../GLOSSARY.md")),
+            "anchored escaping link was not flagged: {escapes:?}"
+        );
+        assert!(
+            escapes.iter().any(|m| m.contains("../../ARCHITECTURE.md")),
+            "anchor-less escaping link was not flagged: {escapes:?}"
+        );
+        assert_eq!(
+            escapes.len(),
+            2,
+            "expected exactly two flagged links: {escapes:?}"
+        );
     }
 
     /// Regression test for issue #23: `ValidationReport::has_warning_of_kind`
