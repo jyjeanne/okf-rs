@@ -180,7 +180,8 @@ fn standalone_binary_runs_the_full_command_surface_against_this_project() {
     assert!(stdout_of(&regenerate).contains("(0 files parsed,"));
 
     // validate: the freshly generated bundle must be conformant, with and
-    // without the stricter `--ci` warnings-as-errors gate.
+    // without the `--ci` orphan-warnings-as-errors gate (see the dedicated
+    // `validate_ci_*` tests below for the warning-class scoping itself).
     let validate = run(&project, &["validate", "--project", "."]);
     assert_success(&validate, &["validate"]);
     assert!(stdout_of(&validate).contains("no issues found"));
@@ -349,6 +350,71 @@ fn standalone_binary_runs_the_full_command_surface_against_this_project() {
     );
     assert_success(&docs_obsidian, &["docs obsidian"]);
     assert!(project.join("docs-obsidian/index.md").exists());
+}
+
+/// Regression test for issue #23: `validate --ci` must not fail on a
+/// redundant-duplicate-link warning — only orphan warnings are promoted to
+/// failures under `--ci`, matching the flag's own `--help` text and the
+/// README's documented behavior. Before the fix, `--ci` failed on *any*
+/// warning, including this advisory-only one (spec §11: consumers MUST NOT
+/// reject a bundle over advisory link issues).
+#[test]
+fn validate_ci_does_not_fail_on_a_redundant_link_warning() {
+    let workspace = tempfile::tempdir().unwrap();
+    let bundle = workspace.path().join("knowledge");
+    fs::create_dir_all(bundle.join("functions")).unwrap();
+    fs::write(
+        bundle.join("index.md"),
+        "- [run](functions/run.md)\n- [run again](functions/run.md)\n",
+    )
+    .unwrap();
+    fs::write(
+        bundle.join("functions/run.md"),
+        "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L1\n---\n\nbody\n",
+    )
+    .unwrap();
+
+    let validate = run(workspace.path(), &["validate", "knowledge"]);
+    assert_success(&validate, &["validate"]);
+    assert!(stdout_of(&validate).contains("redundant link"));
+
+    let validate_ci = run(workspace.path(), &["validate", "knowledge", "--ci"]);
+    assert_success(&validate_ci, &["validate --ci"]);
+}
+
+/// The other half of the issue #23 fix: `--ci` still fails on the warning
+/// class its `--help` text actually names — an orphaned (unreachable)
+/// concept — even though redundant links and other advisory warnings no
+/// longer do.
+#[test]
+fn validate_ci_still_fails_on_an_orphan_warning() {
+    let workspace = tempfile::tempdir().unwrap();
+    let bundle = workspace.path().join("knowledge");
+    fs::create_dir_all(bundle.join("functions")).unwrap();
+    fs::write(bundle.join("index.md"), "- [run](functions/run.md)\n").unwrap();
+    fs::write(
+        bundle.join("functions/run.md"),
+        "---\ntype: Rust Function\ntitle: run\nresource: src/main.rs#L1\n---\n\nbody\n",
+    )
+    .unwrap();
+    // Never linked from index.md (or anywhere else) — an orphan.
+    fs::write(
+        bundle.join("functions/orphan.md"),
+        "---\ntype: Rust Function\ntitle: orphan\nresource: src/main.rs#L2\n---\n\nbody\n",
+    )
+    .unwrap();
+
+    let validate = run(workspace.path(), &["validate", "knowledge"]);
+    assert_success(&validate, &["validate"]);
+    assert!(stdout_of(&validate).contains("orphaned"));
+
+    let validate_ci = run(workspace.path(), &["validate", "knowledge", "--ci"]);
+    assert!(
+        !validate_ci.status.success(),
+        "an orphan warning must still fail --ci\nstdout: {}\nstderr: {}",
+        stdout_of(&validate_ci),
+        stderr_of(&validate_ci)
+    );
 }
 
 /// `okf-rs generate --dita` imports a DITA corpus as `Document` concepts,
