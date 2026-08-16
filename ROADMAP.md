@@ -510,6 +510,27 @@ scoring and error-reporting paths, not just the happy path, hold up against a re
 workspace `cargo build`/`cargo test --workspace --no-fail-fast`/`clippy --all-targets -D warnings`/
 `fmt --check` stayed clean throughout (33 test-result blocks, all passed, zero failures).
 
+A follow-up code review of that live-endpoint runner caught and fixed three real issues before
+merge, none of them requiring a design change: (1) `ResponseMessage.tool_calls` now deserializes
+as `Option<Vec<ToolCall>>` instead of a bare `Vec` with `#[serde(default)]` — that annotation only
+covers a *missing* key, and several OpenAI-compatible endpoints reply with an explicit JSON `null`
+for `tool_calls` instead, which previously failed deserialization with a generic "malformed
+response" error rather than this module's own clear "did not call any tool" diagnostic; a
+regression test locks this in, and it was re-verified against a real standalone mock server
+replying with a literal `"tool_calls":null` — the CLI now reports the intended per-question
+`[ERROR]` line instead. (2) `tool_selection_live::run` is now fallible
+(`-> Result<LiveReport>`) instead of panicking through `fixture_bundle()`'s `.unwrap()`s on I/O
+failure — `tool_selection_benchmark` now exposes both the original panicking `fixture_bundle()`
+(kept for the many test call sites, where a hard setup panic is the accepted idiom already used
+throughout this codebase's tests) and a fallible `fixture_bundle_try()` that `run` uses instead,
+propagated with `?` through `main()`'s existing `anyhow` error path — an unwritable or full temp
+directory now surfaces as a normal error message rather than crashing the process. (3) the
+"always answers correctly" end-to-end test no longer reimplements the mock server's raw
+Content-Length/body-read loop inline; `start_mock_server` is now a thin wrapper over a new
+`start_mock_server_with(respond)` taking a per-request response callback, and that test reuses it.
+Full workspace verification repeated after both this fix and a rebase onto three unrelated PRs
+that merged to `main` in the meantime — clean throughout, zero failures.
+
 ---
 
 ## Phase 4 — Ecosystem
