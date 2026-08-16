@@ -50,8 +50,10 @@
 //! response *parsing* covered without a real endpoint.
 
 use crate::cache::BundleCache;
+#[cfg(test)]
+use crate::tool_selection_benchmark::fixture_bundle;
 use crate::tool_selection_benchmark::{
-    fixture_bundle, questions, scores_correctly, specialized_tool_name,
+    fixture_bundle_try, questions, scores_correctly, specialized_tool_name,
 };
 use crate::tools;
 use anyhow::{anyhow, Context, Result};
@@ -136,8 +138,15 @@ struct ResponseChoice {
 
 #[derive(Deserialize, Default)]
 struct ResponseMessage {
+    /// `Option`, not a bare `Vec` with `#[serde(default)]`: several
+    /// OpenAI-compatible endpoints reply with an explicit JSON `null`
+    /// here (not just an omitted key) when the model declines to call
+    /// any tool, and `#[serde(default)]` alone only substitutes a
+    /// missing key -- an explicit `null` would still fail to deserialize
+    /// into a bare `Vec<ToolCall>`. Callers treat `None` the same as an
+    /// empty `Vec` (see [`ToolCallingClient::choose_tool`]).
     #[serde(default)]
-    tool_calls: Vec<ToolCall>,
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Deserialize)]
@@ -235,6 +244,7 @@ impl ToolCallingClient {
         let tool_call = choice
             .message
             .tool_calls
+            .unwrap_or_default()
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("model at {url} did not call any tool for prompt {prompt:?}"))?;
@@ -619,20 +629,24 @@ fn run_specialized(client: &ToolCallingClient, bundle: &Path, cache: &BundleCach
 
 /// Runs the full live benchmark (both designs, all questions) against
 /// `config`, on the shared fixture bundle. The one entry point
-/// `main.rs`'s `--benchmark-tool-selection` calls.
-pub fn run(config: &LiveConfig) -> LiveReport {
+/// `main.rs`'s `--benchmark-tool-selection` calls. Fallible: unlike the
+/// harness's own tests (which use the panicking `fixture_bundle()`, fine
+/// for test setup), a real I/O failure building the fixture bundle here
+/// -- an unwritable or full temp directory -- surfaces as a clean
+/// `anyhow` error through `main()` rather than panicking the process.
+pub fn run(config: &LiveConfig) -> Result<LiveReport> {
     let client = ToolCallingClient::new(config.clone());
-    let dir = fixture_bundle();
+    let dir = fixture_bundle_try()?;
     let cache = BundleCache::new();
 
     let consolidated = run_consolidated(&client, dir.path(), &cache);
     let specialized = run_specialized(&client, dir.path(), &cache);
 
-    LiveReport {
+    Ok(LiveReport {
         model: config.model.clone(),
         consolidated,
         specialized,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -650,7 +664,16 @@ mod tests {
         base_url: String,
     }
 
-    fn start_mock_server(reply_body: &'static str, status_line: &'static str) -> MockServer {
+    /// The one hand-rolled HTTP request/response loop every mock server in
+    /// this module's tests is built from — `respond` is handed the raw
+    /// request body and returns `(response_body, status_line)`. Both
+    /// `start_mock_server` (fixed reply) and the "always answers
+    /// correctly" end-to-end test (reply computed per-request from the
+    /// question being asked) go through this single loop, instead of each
+    /// reimplementing the Content-Length scan and exact-body read.
+    fn start_mock_server_with(
+        respond: impl Fn(&[u8]) -> (String, &'static str) + Send + 'static,
+    ) -> MockServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -675,6 +698,7 @@ mod tests {
                 let mut body = vec![0u8; content_length];
                 std::io::Read::read_exact(&mut reader, &mut body).unwrap();
 
+                let (reply_body, status_line) = respond(&body);
                 let response = format!(
                     "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     reply_body.len(),
@@ -687,6 +711,10 @@ mod tests {
         MockServer {
             base_url: format!("http://127.0.0.1:{port}/v1"),
         }
+    }
+
+    fn start_mock_server(reply_body: &'static str, status_line: &'static str) -> MockServer {
+        start_mock_server_with(move |_request| (reply_body.to_string(), status_line))
     }
 
     fn client_for(server: &MockServer) -> ToolCallingClient {
@@ -717,6 +745,22 @@ mod tests {
     #[test]
     fn choose_tool_errors_clearly_when_the_model_calls_no_tool() {
         let server = start_mock_server(r#"{"choices":[{"message":{}}]}"#, "200 OK");
+        let client = client_for(&server);
+        let err = client
+            .choose_tool("Who calls bar?", &[consolidated_tool_schema()])
+            .unwrap_err();
+        assert!(err.to_string().contains("did not call any tool"));
+    }
+
+    /// Same as above, but for an endpoint that replies with an explicit
+    /// JSON `null` for `tool_calls` rather than omitting the key entirely
+    /// -- a shape several OpenAI-compatible endpoints use. Must produce
+    /// the same clear "did not call any tool" error, not a generic
+    /// deserialization failure.
+    #[test]
+    fn choose_tool_errors_clearly_when_tool_calls_is_an_explicit_null() {
+        let server =
+            start_mock_server(r#"{"choices":[{"message":{"tool_calls":null}}]}"#, "200 OK");
         let client = client_for(&server);
         let err = client
             .choose_tool("Who calls bar?", &[consolidated_tool_schema()])
@@ -800,53 +844,22 @@ mod tests {
     fn run_consolidated_against_a_mock_that_always_answers_correctly_scores_perfectly() {
         let dir = fixture_bundle();
         let cache = BundleCache::new();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut content_length = 0usize;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                        break;
-                    }
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        break;
-                    }
-                    if let Some(value) = trimmed.strip_prefix("Content-Length: ") {
-                        content_length = value.trim().parse().unwrap_or(0);
-                    }
-                }
-                let mut raw_body = vec![0u8; content_length];
-                std::io::Read::read_exact(&mut reader, &mut raw_body).unwrap();
-                let request: Value = serde_json::from_slice(&raw_body).unwrap();
-                let prompt = request["messages"][0]["content"].as_str().unwrap();
-                let question = questions()
-                    .into_iter()
-                    .find(|q| q.prompt == prompt)
-                    .unwrap();
-                let args = question.args.to_json(question.relation);
-                let args_str = serde_json::to_string(&args).unwrap().replace('"', "\\\"");
-                let payload = format!(
-                    r#"{{"choices":[{{"message":{{"tool_calls":[{{"function":{{"name":"graph","arguments":"{args_str}"}}}}]}}}}]}}"#
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    payload.len(),
-                    payload
-                );
-                let _ = stream.write_all(response.as_bytes());
-            }
+        let server = start_mock_server_with(|raw_body| {
+            let request: Value = serde_json::from_slice(raw_body).unwrap();
+            let prompt = request["messages"][0]["content"].as_str().unwrap();
+            let question = questions()
+                .into_iter()
+                .find(|q| q.prompt == prompt)
+                .unwrap();
+            let args = question.args.to_json(question.relation);
+            let args_str = serde_json::to_string(&args).unwrap().replace('"', "\\\"");
+            let payload = format!(
+                r#"{{"choices":[{{"message":{{"tool_calls":[{{"function":{{"name":"graph","arguments":"{args_str}"}}}}]}}}}]}}"#
+            );
+            (payload, "200 OK")
         });
 
-        let client = ToolCallingClient::new(LiveConfig {
-            base_url: format!("http://127.0.0.1:{port}/v1"),
-            model: "test-model".to_string(),
-            api_key: None,
-        });
+        let client = client_for(&server);
         let report = run_consolidated(&client, dir.path(), &cache);
         assert_eq!(report.correct_selections(), report.outcomes.len());
         assert_eq!(report.correct_final_answers(), report.outcomes.len());

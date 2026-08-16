@@ -80,7 +80,7 @@ fn main() -> Result<()> {
         // unused here but still accepted/parsed for a consistent CLI
         // shape with `--benchmark`.
         let config = tool_selection_live::LiveConfig::from_env()?;
-        let report = tool_selection_live::run(&config);
+        let report = tool_selection_live::run(&config)?;
         print!("{}", report.render());
         return Ok(());
     }
