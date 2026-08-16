@@ -204,6 +204,13 @@ okf-rs generate --dita path/to/dita-topics/
 
 A technical-writing team's existing DITA XML topics import as `Document` concepts, merged into the same bundle alongside everything extracted from source — so `search`, `graph`, and every other command work over docs and code together. A topic that fails to parse is skipped with a warning rather than failing the whole command. Going the other way, `okf-rs docs --format dita` exports a bundle (code, imported docs, or both) back out as a DITA topic set.
 
+#### Optional: migrating an existing docs tree
+
+If you're folding a pre-existing `docs/`-style tree straight into `knowledge/` (rather than generating it from scratch), you'll likely have hand-maintained `index.md` files in subdirectories that carry their own YAML frontmatter. Spec §8 only allows frontmatter (an `okf_version` declaration) on the bundle-root `index.md` — every other `index.md` is a plain listing and must not have a frontmatter block at all. `okf-rs validate` catches this with an error naming the offending file; resolve it by either:
+
+- stripping the frontmatter, so the file becomes a plain §8 listing, or
+- renaming the file (e.g. `index.md` → `overview.md`) so it's no longer treated as a directory index.
+
 ### 4. Explore it
 
 ```sh
