@@ -397,6 +397,33 @@ fn call_via_relation(
     tools::call("graph", &args, bundle, cache)
 }
 
+/// Whether a wrong tool-selection outcome failed *loudly* or *silently* —
+/// the distinction external review (see `docs/improvement-plan-provenance-diff.md`'s
+/// Phase G) points out this benchmark's headline accuracy percentage
+/// erases: the two designs fail in different registers, so one number
+/// flatters whichever design happens to fail more often in the cheap
+/// register. A [`LoudFailure`](FailureMode::LoudFailure) is visible the
+/// moment it happens (no tool matched, the arguments didn't satisfy a
+/// schema, the endpoint errored) and whatever's driving the session can
+/// react to it. A [`SilentWrong`](FailureMode::SilentWrong) is a
+/// well-formed call to the wrong tool/relation — it returns real data,
+/// indistinguishable in shape from a correct answer, so nothing
+/// downstream has a reason to retry it. Derived from data every
+/// [`QuestionOutcome`] already carries (`error`/`tool_selection_correct`),
+/// not a new field to keep in sync with those two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureMode {
+    /// The expected tool/relation was chosen.
+    Correct,
+    /// The call itself never produced a usable result — no tool chosen,
+    /// malformed arguments, or the endpoint/tool errored outright.
+    LoudFailure,
+    /// A different tool/relation than expected was chosen, and the call
+    /// still succeeded — real, well-formed data that happens to answer
+    /// the wrong question.
+    SilentWrong,
+}
+
 /// One question's scored outcome within one design.
 pub struct QuestionOutcome {
     pub prompt: &'static str,
@@ -408,6 +435,24 @@ pub struct QuestionOutcome {
     pub completion_tokens: u64,
     pub latency: Duration,
     pub error: Option<String>,
+}
+
+impl QuestionOutcome {
+    /// Classifies this outcome per [`FailureMode`]. `error.is_some()` is
+    /// exactly the loud/silent boundary: every loud-failure path in
+    /// [`run_consolidated`]/[`run_specialized`] (the model declined to
+    /// call a tool, sent malformed arguments, or the endpoint/dispatch
+    /// itself returned an error) sets `error`; a well-formed call to the
+    /// wrong tool/relation never does, no matter how wrong it was.
+    pub fn failure_mode(&self) -> FailureMode {
+        if self.tool_selection_correct {
+            FailureMode::Correct
+        } else if self.error.is_some() {
+            FailureMode::LoudFailure
+        } else {
+            FailureMode::SilentWrong
+        }
+    }
 }
 
 /// All of one design's (consolidated or specialized) question outcomes.
@@ -431,6 +476,26 @@ impl DesignReport {
             .count()
     }
 
+    /// Count of [`FailureMode::LoudFailure`] outcomes — see that variant's
+    /// docs for why this is kept separate from [`silent_wrong`](Self::silent_wrong)
+    /// rather than folded into one "wrong" count.
+    pub fn loud_failures(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| o.failure_mode() == FailureMode::LoudFailure)
+            .count()
+    }
+
+    /// Count of [`FailureMode::SilentWrong`] outcomes — the expensive
+    /// category, since nothing about the response itself signals a retry
+    /// is needed.
+    pub fn silent_wrong(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| o.failure_mode() == FailureMode::SilentWrong)
+            .count()
+    }
+
     pub fn selection_accuracy(&self) -> f64 {
         if self.outcomes.is_empty() {
             return 0.0;
@@ -443,6 +508,30 @@ impl DesignReport {
             return 0.0;
         }
         self.correct_final_answers() as f64 / self.outcomes.len() as f64
+    }
+
+    /// Requests spent per correctly-answered question — `1 /
+    /// final_answer_accuracy`, expressed in the unit external review
+    /// argued actually matters for the specialized-vs-consolidated
+    /// tradeoff: requests, not tokens. Tool schemas are re-serialized into
+    /// every request in a session, so the *savings* from consolidating N
+    /// tools scale predictably with schema size. The *cost* of a wrong
+    /// selection does not scale with tokens at all — a
+    /// [`FailureMode::LoudFailure`] costs one extra round trip carrying
+    /// the whole conversation prefix, and a [`FailureMode::SilentWrong`]
+    /// can cost the rest of the session if nothing catches it. Requests
+    /// are the unit both sides of that tradeoff can be compared in without
+    /// depending on how long a session happens to run. `None` when no
+    /// question in the sample was answered correctly at all — a rate has
+    /// no meaningful value to report there (this benchmark's own
+    /// `[SILENT-WRONG]`/`[LOUD-FAIL]` breakdown is the more useful number
+    /// in that case).
+    pub fn requests_per_answered_question(&self) -> Option<f64> {
+        let correct = self.correct_final_answers();
+        if correct == 0 {
+            return None;
+        }
+        Some(self.outcomes.len() as f64 / correct as f64)
     }
 
     pub fn total_tokens(&self) -> u64 {
@@ -496,11 +585,32 @@ impl LiveReport {
             );
             let _ = writeln!(
                 out,
+                "    of which loud failures (no/malformed call, visibly retryable): {}",
+                design.loud_failures(),
+            );
+            let _ = writeln!(
+                out,
+                "    of which silent-wrong (well-formed call, wrong data, no retry signal): {}",
+                design.silent_wrong(),
+            );
+            let _ = writeln!(
+                out,
                 "  final-answer accuracy:            {}/{} ({:.0}%)",
                 design.correct_final_answers(),
                 design.outcomes.len(),
                 design.final_answer_accuracy() * 100.0,
             );
+            match design.requests_per_answered_question() {
+                Some(rate) => {
+                    let _ = writeln!(out, "  requests per answered question:   {rate:.2}");
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "  requests per answered question:   n/a (no question answered correctly)"
+                    );
+                }
+            }
             let _ = writeln!(
                 out,
                 "  total tokens (prompt+completion): {}",
@@ -512,14 +622,19 @@ impl LiveReport {
                 design.total_latency().as_secs_f64()
             );
             for o in &design.outcomes {
-                if let Some(err) = &o.error {
-                    let _ = writeln!(out, "    [ERROR] {:?}: {err}", o.prompt);
-                } else if !o.tool_selection_correct {
-                    let _ = writeln!(
-                        out,
-                        "    [WRONG] {:?}: expected `{}`, got {:?}",
-                        o.prompt, o.expected, o.chosen
-                    );
+                match o.failure_mode() {
+                    FailureMode::Correct => {}
+                    FailureMode::LoudFailure => {
+                        let err = o.error.as_deref().unwrap_or("");
+                        let _ = writeln!(out, "    [LOUD-FAIL] {:?}: {err}", o.prompt);
+                    }
+                    FailureMode::SilentWrong => {
+                        let _ = writeln!(
+                            out,
+                            "    [SILENT-WRONG] {:?}: expected `{}`, got {:?}",
+                            o.prompt, o.expected, o.chosen
+                        );
+                    }
                 }
             }
             let _ = writeln!(out);
@@ -902,8 +1017,141 @@ mod tests {
         assert!(text.contains("test-model"));
         assert!(text.contains("consolidated"));
         assert!(text.contains("specialized"));
-        assert!(text.contains("[WRONG]"));
+        assert!(text.contains("[SILENT-WRONG]"));
         assert!(text.contains("100%"));
         assert!(text.contains("0%"));
+    }
+
+    /// The failure-mode split this module exists to add: a `[SILENT-WRONG]`
+    /// outcome (well-formed call, wrong relation, `error: None`) is never
+    /// counted as a loud failure, and vice versa — the two are different
+    /// costs, not one "wrong" bucket. See [`FailureMode`]'s docs.
+    #[test]
+    fn failure_mode_distinguishes_silent_wrong_from_loud_failure() {
+        let silent = QuestionOutcome {
+            prompt: "p",
+            expected: "callers".to_string(),
+            chosen: Some("callees".to_string()),
+            tool_selection_correct: false,
+            final_answer_correct: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            latency: Duration::ZERO,
+            error: None,
+        };
+        assert_eq!(silent.failure_mode(), FailureMode::SilentWrong);
+
+        let loud = QuestionOutcome {
+            prompt: "p",
+            expected: "callers".to_string(),
+            chosen: None,
+            tool_selection_correct: false,
+            final_answer_correct: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            latency: Duration::ZERO,
+            error: Some("did not call any tool".to_string()),
+        };
+        assert_eq!(loud.failure_mode(), FailureMode::LoudFailure);
+
+        let correct = QuestionOutcome {
+            prompt: "p",
+            expected: "callers".to_string(),
+            chosen: Some("callers".to_string()),
+            tool_selection_correct: true,
+            final_answer_correct: true,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            latency: Duration::ZERO,
+            error: None,
+        };
+        assert_eq!(correct.failure_mode(), FailureMode::Correct);
+    }
+
+    /// A design report with one loud failure and one silent-wrong outcome
+    /// counts each in exactly one bucket, and reports requests-per-
+    /// answered-question as the reciprocal of final-answer accuracy —
+    /// the "unit that matters" per `docs/improvement-plan-provenance-diff.md`'s
+    /// Phase G, not raw token counts.
+    #[test]
+    fn design_report_counts_failure_modes_and_requests_per_answered_question() {
+        let design = DesignReport {
+            design: "consolidated",
+            outcomes: vec![
+                QuestionOutcome {
+                    prompt: "correct",
+                    expected: "callers".to_string(),
+                    chosen: Some("callers".to_string()),
+                    tool_selection_correct: true,
+                    final_answer_correct: true,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    latency: Duration::ZERO,
+                    error: None,
+                },
+                QuestionOutcome {
+                    prompt: "silent",
+                    expected: "callers".to_string(),
+                    chosen: Some("callees".to_string()),
+                    tool_selection_correct: false,
+                    final_answer_correct: false,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    latency: Duration::ZERO,
+                    error: None,
+                },
+                QuestionOutcome {
+                    prompt: "loud",
+                    expected: "callers".to_string(),
+                    chosen: None,
+                    tool_selection_correct: false,
+                    final_answer_correct: false,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    latency: Duration::ZERO,
+                    error: Some("boom".to_string()),
+                },
+                QuestionOutcome {
+                    prompt: "correct2",
+                    expected: "callers".to_string(),
+                    chosen: Some("callers".to_string()),
+                    tool_selection_correct: true,
+                    final_answer_correct: true,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    latency: Duration::ZERO,
+                    error: None,
+                },
+            ],
+        };
+        assert_eq!(design.silent_wrong(), 1);
+        assert_eq!(design.loud_failures(), 1);
+        assert_eq!(design.correct_final_answers(), 2);
+        // 4 requests, 2 answered correctly -> 2.0 requests per answered question.
+        assert_eq!(design.requests_per_answered_question(), Some(2.0));
+
+        let text = design.selection_accuracy();
+        assert!((text - 0.5).abs() < f64::EPSILON);
+    }
+
+    /// No correct answer in the sample at all: `requests_per_answered_question`
+    /// reports `None` rather than dividing by zero.
+    #[test]
+    fn requests_per_answered_question_is_none_when_nothing_was_answered_correctly() {
+        let design = DesignReport {
+            design: "consolidated",
+            outcomes: vec![QuestionOutcome {
+                prompt: "p",
+                expected: "callers".to_string(),
+                chosen: None,
+                tool_selection_correct: false,
+                final_answer_correct: false,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                latency: Duration::ZERO,
+                error: Some("boom".to_string()),
+            }],
+        };
+        assert_eq!(design.requests_per_answered_question(), None);
     }
 }

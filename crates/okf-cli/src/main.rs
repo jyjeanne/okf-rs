@@ -1630,6 +1630,16 @@ fn render_ci_report(
             "{icon} RESOLVER CHANGES: {}",
             summary.resolver_changes
         ));
+        // See `okf_analyzer::CiSummary::resolver_only_rate`'s own docs: the
+        // empirical number that decides whether `resolver_changes` is
+        // worth defaulting to "ignore" in this project's own `okf.toml`,
+        // rather than guessing from one worked example.
+        if let Some(rate) = summary.resolver_only_rate() {
+            lines.push(format!(
+                "   ({:.0}% of relationship-level changes in this diff were resolver-only)",
+                rate * 100.0
+            ));
+        }
     }
     if summary.confidence_changes > 0 {
         let (icon, fails) = policy_icon(policy.confidence_changes);
@@ -1900,6 +1910,36 @@ mod diff_ci_tests {
         assert!(text.contains("⚠️"));
         assert!(text.contains("RESOLVER CHANGES: 4"));
         assert!(text.contains("exit code: 0"));
+    }
+
+    /// The empirical number `docs/improvement-plan-provenance-diff.md`'s
+    /// Phase G adds: when every relationship-level change in the diff is
+    /// resolver-only, `--ci` says so as a rate, not just a bare count --
+    /// the number a project would actually watch across real resolver
+    /// version bumps to decide whether `resolver_changes` can default to
+    /// `"ignore"` in its own `okf.toml`.
+    #[test]
+    fn resolver_only_change_reports_its_share_of_relationship_level_changes() {
+        let summary = CiSummary {
+            resolver_changes: 4,
+            ..Default::default()
+        };
+        let (text, _) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(text.contains("100% of relationship-level changes in this diff were resolver-only"));
+    }
+
+    /// A resolver-only change mixed with a genuine source rewire reports a
+    /// rate below 100% -- confirming this isn't just "resolver_changes >
+    /// 0 -> print 100%" but an actual share of the total.
+    #[test]
+    fn resolver_only_rate_is_below_100_percent_when_source_changes_also_present() {
+        let summary = CiSummary {
+            source_changes: 1,
+            resolver_changes: 1,
+            ..Default::default()
+        };
+        let (text, _) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        assert!(text.contains("50% of relationship-level changes in this diff were resolver-only"));
     }
 
     #[test]

@@ -383,6 +383,20 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   literals in Rust test code rather than being force-relocated here — this phase only moved what's
   genuinely more natural as data than code (real fixture bundles, portable JSON), matching its own
   stated scope rather than relocating everything for its own sake.
+- [x] ✅ **Phase G — Benchmark-scoring and CI-signal follow-up** (a later, third round of external
+  review — [`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`](docs/feedback/2026-08-tool-consolidation-benchmark-review.md)):
+  Phase E's live benchmark now distinguishes a *loud* failure (no tool matched, or a schema the
+  model couldn't satisfy) from a *silent-wrong* one (a well-formed call to the wrong tool/relation
+  that still returns real data) instead of one undifferentiated "wrong" bucket — `FailureMode`,
+  `DesignReport::{loud_failures, silent_wrong}`, and `[LOUD-FAIL]`/`[SILENT-WRONG]` per-question
+  report lines. It also reports `requests_per_answered_question()` (`1 / final_answer_accuracy`) —
+  cost expressed in requests, the unit that stays comparable across sessions of any length, rather
+  than tokens. Separately, `okf_analyzer::CiSummary::resolver_only_rate()` and `okf-rs diff --ci`
+  now surface the share of a diff's relationship-level changes that were resolver-only, so a
+  project can watch that number across its own real resolver-version bumps and decide for itself
+  whether `DiffPolicy::resolver_changes` can default to `ignore` — see
+  [`docs/improvement-plan-provenance-diff.md`](docs/improvement-plan-provenance-diff.md#11-phase-g--benchmark-scoring-and-ci-signal-follow-up-medium-review-august-2026--shipped)
+  for the full writeup.
 
 Verified by dogfooding. Unit tests cover the new field end-to-end: `okf-lsp` parses `serverInfo.version`
 from a real `initialize` response and — genuinely exercised in this environment, not skipped —

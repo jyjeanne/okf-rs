@@ -726,6 +726,7 @@ table marks ❌, versus how speculative it is.
 | D | Artifact-level reproducibility metadata (no timestamp) | S | Medium — genuinely useful for CI audit ("which okf-rs, which commit, built this bundle"), but scoped down from the reviewer's ask specifically to avoid the determinism regression a naive implementation would cause | Medium — the risk isn't the feature, it's a future contributor "fixing" the missing timestamp back in; mitigated by testing `--check-determinism`/`--check-fresh` directly against this phase and documenting the cut in the module itself | **GO**, with the no-timestamp scope cut as a hard constraint, not a suggestion — ✅ shipped |
 | E | Specialized-vs-consolidated tool-*selection* benchmark | M-L | Medium — genuinely validates (or falsifies) a decision already shipped and already justified on schema-size grounds alone; real value is closing that specific "did we trade selection accuracy for schema size and never check" open question | Medium-High — the only item in this plan requiring a live LLM call, breaking this project's until-now-consistent "every benchmark is offline and deterministic" posture; must stay explicitly opt-in/non-CI to avoid becoming a flaky, costly, silently-skipped test | **CONDITIONAL GO** — build the harness and question set (fully testable without a model) first; only wire up a real endpoint call once someone is prepared to own interpreting a non-deterministic result, matching how `--enrich`'s own network dependency was scoped in from day one — ✅ both halves shipped: harness first, live-endpoint runner (`okf-mcp --benchmark-tool-selection`) once the endpoint/env-var decision was made |
 | F | Golden fixture dataset | S | Low-Medium — organizational, not a new capability; mainly pays for itself by giving Phases B/C's own tests a less ad hoc home | Low — pure relocation/addition, no behavior change | **GO**, opportunistically alongside B/C rather than as a blocking prerequisite — ✅ shipped, and additively (not a relocation of existing tests, which stayed as-is) |
+| G | Failure-mode split, requests-per-answered-question, resolver-only rate (Medium review follow-up) | S | High — directly fixes a real scoring blind spot in E (one accuracy number hiding two different-cost failure modes) and gives C's own policy knob an actual instrument to justify itself with, both from data already collected | Low — pure derived metrics/rendering on already-shipped structs, no new fields, no new network dependency | **GO** — ✅ shipped |
 
 ### Net recommendation
 
@@ -747,11 +748,106 @@ them.
 
 **Where this plan stands:** every phase this document proposed has shipped in full — A, B, C, D,
 E (both the harness and, once its own conditional verdict's deliberate decision was made, the
-live-endpoint runner), and F.
+live-endpoint runner), and F. Phase G below is a follow-up driven by a later round of external
+review of Phases B/C/E specifically, not part of the original proposal.
+
+---
+
+## 11. Phase G — Benchmark-scoring and CI-signal follow-up (Medium review, August 2026) ✅ Shipped
+
+### Objective
+
+A third round of external review (recorded verbatim in
+[`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`](feedback/2026-08-tool-consolidation-benchmark-review.md))
+raised two concrete gaps in what Phases B/C/E shipped, not new features:
+
+1. Phase E's live benchmark reports one selection-accuracy percentage, but the two designs fail in
+   different registers — a specialized tool name a model hallucinates fails loudly (no matching
+   tool, or a schema the model can't satisfy), while a wrong `relation` value inside the
+   consolidated `graph` tool still produces a well-formed call that returns real, just-wrong, data.
+   Collapsing both into one "wrong" count flatters whichever design happens to fail in the cheap
+   (loud) register more often.
+2. Phase E's own break-even reasoning (and `benchmark.rs`'s separate token-based break-even) never
+   expressed cost in the unit the reviewer argues actually matters: tool schemas are re-serialized
+   into every request in a session, so consolidation's savings scale predictably with request
+   count — but the cost of a wrong selection doesn't scale with tokens at all, since one bad
+   selection costs a full extra round trip regardless of how large the conversation prefix is.
+3. Phase B/C's `RelationshipChangeKind::ResolverChange`/`CiSummary.resolver_changes` classification
+   makes "did the resolver change something?" observable, but nothing computed the empirical rate
+   a project would actually need to decide whether `DiffPolicy::resolver_changes` can safely
+   default to `ignore` instead of `warn`.
+
+### What shipped
+
+**Failure-mode split** (`crates/okf-mcp/src/tool_selection_live.rs`): a `FailureMode` enum
+(`Correct`/`LoudFailure`/`SilentWrong`) and `QuestionOutcome::failure_mode()`, derived from data
+each outcome already carried (`error.is_some()` is exactly the loud/silent boundary — no new field
+needed, since every path that fails to produce a usable call already set `error`, and a
+well-formed call to the wrong tool/relation never does). `DesignReport` gained
+`loud_failures()`/`silent_wrong()` counts, and `render()`'s per-question lines are now tagged
+`[LOUD-FAIL]`/`[SILENT-WRONG]` instead of one undifferentiated `[WRONG]`/`[ERROR]` pair, plus a
+breakdown line under the headline selection-accuracy percentage.
+
+**`requests_per_answered_question()`** (same module): `1 / final_answer_accuracy`, i.e. how many
+requests this design spent per question it actually answered correctly — the reviewer's proposed
+unit, computed from data the benchmark already collects rather than a new measurement. `None` when
+no question in the sample was answered correctly (a rate has nothing meaningful to report there;
+the failure-mode breakdown above is the more useful number in that case). Rendered alongside the
+existing token/latency totals.
+
+**`CiSummary::resolver_only_rate()`** (`crates/okf-analyzer/src/lib.rs`): the share of all
+relationship-level changes in a diff (`source_changes + resolver_changes + confidence_changes`)
+that were `resolver_changes` alone. `None` on an empty diff or one with no relationship-level
+changes at all. `okf-rs diff --ci` now prints this rate alongside the `RESOLVER CHANGES` count
+(`crates/okf-cli/src/main.rs`'s `render_ci_report`) whenever `resolver_changes > 0`, so a project
+gets the exact number the reviewer's "measure on your own corpus" ask calls for on every CI run
+that has any resolver-only changes to report — rather than needing a bespoke script to compute it.
+Most informative on a diff where the underlying source is identical and only the resolver version
+changed (Phase A's own two-installed-`rust-analyzer`-versions integration scenario); a diff that
+also contains real source changes mixes concept-level churn into the denominator, which
+understates the rate for reasons unrelated to resolver behavior — documented on the method itself,
+not left as a silent caveat.
+
+This project still hasn't run that measurement across a real `rust-analyzer` minor-version bump on
+its own corpus (that needs two pinned toolchain installs, the same cost noted against Phase A's own
+integration-test scenario) — `resolver_only_rate()` is the instrument, not the measurement itself.
+`docs/improvement-plan-provenance-diff.md`'s own `DiffPolicy::resolver_changes` default stays
+`Warn` (not `Ignore`) until a project actually collects that number and finds it consistently near
+zero.
+
+### Tests
+
+- `tool_selection_live::tests`: `failure_mode_distinguishes_silent_wrong_from_loud_failure` (all
+  three `FailureMode` variants against hand-built outcomes),
+  `design_report_counts_failure_modes_and_requests_per_answered_question` (a 4-outcome design —
+  two correct, one silent-wrong, one loud-failure — asserts both counts and the resulting `2.0`
+  requests-per-answered-question), `requests_per_answered_question_is_none_when_nothing_was_answered_correctly`.
+  The pre-existing `live_report_render_includes_the_model_and_both_designs` test is updated to
+  assert the new `[SILENT-WRONG]` tag rather than the old undifferentiated `[WRONG]`.
+- `okf-analyzer::tests`: `resolver_only_rate_is_none_on_an_empty_summary`,
+  `resolver_only_rate_reports_the_share_of_relationship_level_changes` (a mixed diff — one genuine
+  rewire, one resolver-only pair — asserts the rate is exactly `1/3`, not just "some resolver
+  changes happened"), plus an existing resolver-only-change test extended to assert `Some(1.0)`.
+- `okf-cli::diff_ci_tests`: `resolver_only_change_reports_its_share_of_relationship_level_changes`,
+  `resolver_only_rate_is_below_100_percent_when_source_changes_also_present`.
+
+### Acceptance criteria
+
+- A silent-wrong outcome and a loud-failure outcome are never counted in the same bucket, in either
+  the live benchmark's aggregate counts or its per-question rendered lines.
+- `requests_per_answered_question()` is derivable from data the benchmark already collects (no new
+  network calls or fields), and reports `None` rather than dividing by zero when nothing was
+  answered correctly.
+- `resolver_only_rate()` is visible on every `okf-rs diff --ci` run with a nonzero resolver-change
+  count, with no extra flag needed to see it.
+- Every existing Phase A-F test keeps passing unchanged — this phase adds detail and derived
+  metrics to already-shipped surfaces, the same additive posture every earlier phase in this
+  document took (§9).
 
 ## References
 
 - [`docs/feedback/2026-08-provenance-graph-diff-review.md`](feedback/2026-08-provenance-graph-diff-review.md) — the raw feedback this plan distills
 - [`docs/feedback/2026-08-community-roadmap-review.md`](feedback/2026-08-community-roadmap-review.md) — the reviewer's first-round feedback, already delivered
+- [`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`](feedback/2026-08-tool-consolidation-benchmark-review.md) — the reviewer's third-round feedback (Medium), driving Phase G
 - [`ROADMAP.md` — Improvement Plan (AI-native platform maturity)](../ROADMAP.md#improvement-plan--ai-native-platform-maturity-community-feedback) — what's already shipped from the first round
 - [`docs/improvement-plan.md`](improvement-plan.md) — the competitive gap-analysis plan this document's phase/test/acceptance-criteria structure follows

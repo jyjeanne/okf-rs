@@ -472,6 +472,33 @@ impl CiSummary {
     pub fn is_empty(&self) -> bool {
         self.source_changes == 0 && self.resolver_changes == 0 && self.confidence_changes == 0
     }
+
+    /// The share of all relationship-level changes in this diff that were
+    /// `resolver_changes` alone — the empirical number
+    /// `docs/improvement-plan-provenance-diff.md`'s Phase G asks a project
+    /// to watch on its own corpus: external review argued that if this
+    /// rate stays near zero across a real resolver-version bump,
+    /// resolver-class changes can safely default to `ignore` in that
+    /// project's own `okf.toml` (`DiffPolicy::resolver_changes`) instead
+    /// of `warn`, and a rate that *isn't* near zero is itself a resolver
+    /// finding worth reporting upstream. `None` when there's no
+    /// relationship-level change to take a rate over (an empty diff, or
+    /// one containing only whole-concept adds/removes).
+    ///
+    /// Most informative computed over a diff whose two sides are the exact
+    /// same source re-analyzed with two different resolver versions (no
+    /// concept-level adds/removes at all, matching the fixture Phase A's
+    /// own plan describes) — `source_changes` also counts a concept's own
+    /// existence changing, which a diff spanning real commits mixes in
+    /// alongside relationship-pair rewires, understating this rate for
+    /// reasons that have nothing to do with resolver behavior.
+    pub fn resolver_only_rate(&self) -> Option<f64> {
+        let total = self.source_changes + self.resolver_changes + self.confidence_changes;
+        if total == 0 {
+            return None;
+        }
+        Some(self.resolver_changes as f64 / total as f64)
+    }
 }
 
 /// Reduces a [`DiffReport`] to the three counts [`CiSummary`] holds.
@@ -1603,6 +1630,59 @@ mod tests {
         assert_eq!(summary.source_changes, 0);
         assert_eq!(summary.resolver_changes, 1);
         assert_eq!(summary.confidence_changes, 0);
+        // The whole diff is one resolver-only pair -- 100% of it.
+        assert_eq!(summary.resolver_only_rate(), Some(1.0));
+    }
+
+    #[test]
+    fn resolver_only_rate_is_none_on_an_empty_summary() {
+        assert_eq!(CiSummary::default().resolver_only_rate(), None);
+    }
+
+    /// A diff mixing one genuine source rewire with one resolver-only pair
+    /// reports the resolver-only share of relationship-level changes, not
+    /// just a bare "some resolver changes happened" boolean -- the number
+    /// `docs/improvement-plan-provenance-diff.md`'s Phase G asks a project
+    /// to watch across real resolver-version bumps on its own corpus.
+    #[test]
+    fn resolver_only_rate_reports_the_share_of_relationship_level_changes() {
+        let mut before = make_concept("functions/foo", "fn foo()");
+        before.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "functions/bar",
+            "bar",
+        ));
+        before.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/baz",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.88.0"),
+        ));
+        let mut after = make_concept("functions/foo", "fn foo()");
+        // functions/bar -> functions/qux: a genuine rewire (2 SourceChange
+        // pairs, remove + add).
+        after.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "functions/qux",
+            "qux",
+        ));
+        // functions/baz unchanged except the resolver version bumped.
+        after.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/baz",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.89.0"),
+        ));
+
+        let report = diff(&[before], &[after]);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 2);
+        assert_eq!(summary.resolver_changes, 1);
+        // 1 resolver-only pair out of 3 total relationship-level changes.
+        let rate = summary.resolver_only_rate().unwrap();
+        assert!((rate - (1.0 / 3.0)).abs() < 1e-9);
     }
 
     #[test]
