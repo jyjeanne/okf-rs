@@ -417,7 +417,9 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   runs, 1.90.0 on 1/3) — a real number for a real known limitation, not just an assertion — see
   [`docs/improvement-plan-provenance-diff.md`](docs/improvement-plan-provenance-diff.md#11-phase-g--benchmark-scoring-and-ci-signal-follow-up-medium-review-august-2026--shipped)
   for the full writeup, including the `{:.0}%`→`{:.1}%` rounding bug that same run caught (a genuine
-  99.85% was rounding to a bare, misleadingly-clean "100%").
+  99.85% was rounding to a bare, misleadingly-clean "100%"). Every benchmark this phase and Phase E
+  ship — MCP tool-selection, MCP session-cost, and resolver-stability — now has a discoverable,
+  how-to-run-it index at [`benchmarks/`](benchmarks/), including the real results above.
 
 Verified by dogfooding. Unit tests cover the new field end-to-end: `okf-lsp` parses `serverInfo.version`
 from a real `initialize` response and — genuinely exercised in this environment, not skipped —

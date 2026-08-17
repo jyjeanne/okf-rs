@@ -997,3 +997,4 @@ that reproduces the exact 1292/1294 ratio from this run.
 - [`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`](feedback/2026-08-tool-consolidation-benchmark-review.md) — the reviewer's third-round feedback (Medium), driving Phase G
 - [`ROADMAP.md` — Improvement Plan (AI-native platform maturity)](../ROADMAP.md#improvement-plan--ai-native-platform-maturity-community-feedback) — what's already shipped from the first round
 - [`docs/improvement-plan.md`](improvement-plan.md) — the competitive gap-analysis plan this document's phase/test/acceptance-criteria structure follows
+- [`benchmarks/`](../benchmarks/) — the discoverable, reproducible-run companion to this document's design writeups: how to actually run each of Phase E/G's benchmarks, and the real results collected against real corpora so far
