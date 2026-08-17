@@ -389,12 +389,15 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   model couldn't satisfy) from a *silent-wrong* one (a well-formed call to the wrong tool/relation
   that still returns real data) instead of one undifferentiated "wrong" bucket — `FailureMode`,
   `DesignReport::{loud_failures, silent_wrong}`, and `[LOUD-FAIL]`/`[SILENT-WRONG]` per-question
-  report lines. It also reports `requests_per_answered_question()` (`1 / final_answer_accuracy`) —
-  cost expressed in requests, the unit that stays comparable across sessions of any length, rather
-  than tokens. Separately, `okf_analyzer::CiSummary::resolver_only_rate()` and `okf-rs diff --ci`
-  now surface the share of a diff's relationship-level changes that were resolver-only, so a
-  project can watch that number across its own real resolver-version bumps and decide for itself
-  whether `DiffPolicy::resolver_changes` can default to `ignore` — see
+  report lines, now also shown as a percentage of the sample alongside the raw count. It also
+  reports `requests_per_answered_question()` (`1 / final_answer_accuracy`) — cost expressed in
+  requests, the unit that stays comparable across sessions of any length, rather than tokens.
+  Separately, `okf_analyzer::resolver_only_rate(&DiffReport)` and `okf-rs diff --ci` now surface
+  the share of a diff's relationship-*pair* changes that were resolver-only, so a project can watch
+  that number across its own real resolver-version bumps and decide for itself whether
+  `DiffPolicy::resolver_changes` can default to `ignore` — computed straight from the diff's
+  relationship changes rather than `CiSummary`'s aggregate counts, so unrelated concept-level churn
+  in the same diff can't dilute it — see
   [`docs/improvement-plan-provenance-diff.md`](docs/improvement-plan-provenance-diff.md#11-phase-g--benchmark-scoring-and-ci-signal-follow-up-medium-review-august-2026--shipped)
   for the full writeup.
 

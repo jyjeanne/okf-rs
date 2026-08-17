@@ -795,25 +795,43 @@ no question in the sample was answered correctly (a rate has nothing meaningful 
 the failure-mode breakdown above is the more useful number in that case). Rendered alongside the
 existing token/latency totals.
 
-**`CiSummary::resolver_only_rate()`** (`crates/okf-analyzer/src/lib.rs`): the share of all
-relationship-level changes in a diff (`source_changes + resolver_changes + confidence_changes`)
-that were `resolver_changes` alone. `None` on an empty diff or one with no relationship-level
-changes at all. `okf-rs diff --ci` now prints this rate alongside the `RESOLVER CHANGES` count
-(`crates/okf-cli/src/main.rs`'s `render_ci_report`) whenever `resolver_changes > 0`, so a project
-gets the exact number the reviewer's "measure on your own corpus" ask calls for on every CI run
-that has any resolver-only changes to report — rather than needing a bespoke script to compute it.
-Most informative on a diff where the underlying source is identical and only the resolver version
-changed (Phase A's own two-installed-`rust-analyzer`-versions integration scenario); a diff that
-also contains real source changes mixes concept-level churn into the denominator, which
-understates the rate for reasons unrelated to resolver behavior — documented on the method itself,
-not left as a silent caveat.
+**`okf_analyzer::resolver_only_rate(&DiffReport)`** (`crates/okf-analyzer/src/lib.rs`): the share
+of relationship-*pair* changes in a diff that were resolver-only (`ResolverChange`/
+`ProvenanceChange`). `None` on an empty diff or one with no `Changed` concepts carrying a
+relationship-level change at all. `okf-rs diff --ci` prints this rate alongside the
+`RESOLVER CHANGES` count (`crates/okf-cli/src/main.rs`'s `render_ci_report`) whenever
+`resolver_changes > 0`, so a project gets the exact number the reviewer's "measure on your own
+corpus" ask calls for on every CI run that has any resolver-only changes to report — rather than
+needing a bespoke script to compute it.
 
-This project still hasn't run that measurement across a real `rust-analyzer` minor-version bump on
-its own corpus (that needs two pinned toolchain installs, the same cost noted against Phase A's own
-integration-test scenario) — `resolver_only_rate()` is the instrument, not the measurement itself.
-`docs/improvement-plan-provenance-diff.md`'s own `DiffPolicy::resolver_changes` default stays
-`Warn` (not `Ignore`) until a project actually collects that number and finds it consistently near
-zero.
+**Correction during review** (a further round of feedback on this same Phase G, also recorded in
+`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`): this function originally shipped
+as a `CiSummary` method, deriving its rate from `CiSummary`'s own three aggregate counters
+(`resolver_changes / (source_changes + resolver_changes + confidence_changes)`). That's a real bug,
+not just a documentation gap — `CiSummary::source_changes` also folds in whole-concept adds/removes
+and signature-only changes (see `ci_summary`), none of which are relationship-*pair* changes at
+all. Any concept churn elsewhere in the same diff inflated that denominator and understated the
+resolver-only rate for reasons that have nothing to do with resolver behavior — exactly the kind of
+silent bias that would lead a project to keep `resolver_changes: warn` when the real, relationship-
+level rate was actually near 100%. Fixed by reading `report.changed[..].relationship_changes`
+directly (the same source `ci_summary` itself reduces from) instead of going through `CiSummary` at
+all: `okf_analyzer::resolver_only_rate` is now a free function taking the full `&DiffReport`, and
+`okf-cli`'s `cmd_diff_ci` (which already has the full report in scope before reducing it to a
+`CiSummary`) computes it there and threads it into `render_ci_report` as a plain `Option<f64>`
+parameter, keeping that function exactly as unit-testable against hand-built values as it was
+before.
+
+This project still hasn't run the actual measurement across a real `rust-analyzer` minor-version
+bump on its own corpus (that needs two pinned toolchain installs, the same cost noted against
+Phase A's own integration-test scenario) — `resolver_only_rate` is the instrument, not the
+measurement itself. `DiffPolicy::resolver_changes`'s own default stays `Warn` (not `Ignore`) until
+a project actually collects that number and finds it consistently near zero.
+
+**Percentages on the failure-mode breakdown**: `LiveReport::render()`'s loud-failure/silent-wrong
+counts are now also rendered as a percentage of the design's sample size (e.g. `1 (7%)`), not just
+a bare count — the accuracy lines already reported percentages, and the failure-mode breakdown
+existed specifically so the two failure costs could be compared at a glance, which a bare count
+doesn't support as directly across sample sizes of different size.
 
 ### Tests
 
@@ -824,12 +842,18 @@ zero.
   requests-per-answered-question), `requests_per_answered_question_is_none_when_nothing_was_answered_correctly`.
   The pre-existing `live_report_render_includes_the_model_and_both_designs` test is updated to
   assert the new `[SILENT-WRONG]` tag rather than the old undifferentiated `[WRONG]`.
-- `okf-analyzer::tests`: `resolver_only_rate_is_none_on_an_empty_summary`,
+- `okf-analyzer::tests`: `resolver_only_rate_is_none_on_an_empty_diff`,
   `resolver_only_rate_reports_the_share_of_relationship_level_changes` (a mixed diff — one genuine
   rewire, one resolver-only pair — asserts the rate is exactly `1/3`, not just "some resolver
-  changes happened"), plus an existing resolver-only-change test extended to assert `Some(1.0)`.
+  changes happened"), `resolver_only_rate_is_not_diluted_by_unrelated_whole_concept_churn` (the
+  regression test for the bug described above — a diff with an added whole concept *and* a
+  resolver-only relationship pair still reports `Some(1.0)`, not diluted by the added concept),
+  plus an existing resolver-only-change test extended to assert `Some(1.0)`.
 - `okf-cli::diff_ci_tests`: `resolver_only_change_reports_its_share_of_relationship_level_changes`,
-  `resolver_only_rate_is_below_100_percent_when_source_changes_also_present`.
+  `resolver_only_rate_is_below_100_percent_when_source_changes_also_present`,
+  `no_rate_line_is_rendered_when_resolver_only_rate_is_none` — `render_ci_report` now takes the
+  rate as an explicit parameter, so these lock in only the rendering, not the (now separately
+  tested) rate computation itself.
 
 ### Acceptance criteria
 
@@ -838,8 +862,9 @@ zero.
 - `requests_per_answered_question()` is derivable from data the benchmark already collects (no new
   network calls or fields), and reports `None` rather than dividing by zero when nothing was
   answered correctly.
-- `resolver_only_rate()` is visible on every `okf-rs diff --ci` run with a nonzero resolver-change
-  count, with no extra flag needed to see it.
+- `resolver_only_rate` is visible on every `okf-rs diff --ci` run with a nonzero resolver-change
+  count, with no extra flag needed to see it, and is unaffected by concept-level churn (adds,
+  removes, signature-only changes) elsewhere in the same diff.
 - Every existing Phase A-F test keeps passing unchanged — this phase adds detail and derived
   metrics to already-shipped surfaces, the same additive posture every earlier phase in this
   document took (§9).

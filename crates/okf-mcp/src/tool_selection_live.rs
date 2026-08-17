@@ -496,6 +496,20 @@ impl DesignReport {
             .count()
     }
 
+    /// `count`'s share of this design's sample size as a percentage — `0.0`
+    /// on an empty sample, mirroring [`selection_accuracy`](Self::selection_accuracy)/
+    /// [`final_answer_accuracy`](Self::final_answer_accuracy)'s own empty-sample
+    /// handling. Private: only used to render the loud-failure/silent-wrong
+    /// breakdown as a percentage alongside its raw count, the same way the
+    /// accuracy lines already are — a bare count alone doesn't compare
+    /// across sample sizes as directly.
+    fn rate_of(&self, count: usize) -> f64 {
+        if self.outcomes.is_empty() {
+            return 0.0;
+        }
+        count as f64 / self.outcomes.len() as f64 * 100.0
+    }
+
     pub fn selection_accuracy(&self) -> f64 {
         if self.outcomes.is_empty() {
             return 0.0;
@@ -585,13 +599,15 @@ impl LiveReport {
             );
             let _ = writeln!(
                 out,
-                "    of which loud failures (no/malformed call, visibly retryable): {}",
+                "    of which loud failures (no/malformed call, visibly retryable): {} ({:.0}%)",
                 design.loud_failures(),
+                design.rate_of(design.loud_failures()),
             );
             let _ = writeln!(
                 out,
-                "    of which silent-wrong (well-formed call, wrong data, no retry signal): {}",
+                "    of which silent-wrong (well-formed call, wrong data, no retry signal): {} ({:.0}%)",
                 design.silent_wrong(),
+                design.rate_of(design.silent_wrong()),
             );
             let _ = writeln!(
                 out,
@@ -1132,6 +1148,75 @@ mod tests {
 
         let text = design.selection_accuracy();
         assert!((text - 0.5).abs() < f64::EPSILON);
+    }
+
+    /// The percentage `render()` prints alongside each failure-mode count
+    /// (`design.rate_of(count)`) is the count's share of the *whole*
+    /// sample, not of the wrong-selection subset -- 1 silent-wrong and 1
+    /// loud-failure out of 4 total outcomes is 25% each, not 50%.
+    #[test]
+    fn render_shows_failure_mode_counts_as_a_percentage_of_the_whole_sample() {
+        let report = LiveReport {
+            model: "test-model".to_string(),
+            consolidated: DesignReport {
+                design: "consolidated",
+                outcomes: vec![
+                    QuestionOutcome {
+                        prompt: "correct",
+                        expected: "callers".to_string(),
+                        chosen: Some("callers".to_string()),
+                        tool_selection_correct: true,
+                        final_answer_correct: true,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        latency: Duration::ZERO,
+                        error: None,
+                    },
+                    QuestionOutcome {
+                        prompt: "correct2",
+                        expected: "callees".to_string(),
+                        chosen: Some("callees".to_string()),
+                        tool_selection_correct: true,
+                        final_answer_correct: true,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        latency: Duration::ZERO,
+                        error: None,
+                    },
+                    QuestionOutcome {
+                        prompt: "silent",
+                        expected: "callers".to_string(),
+                        chosen: Some("callees".to_string()),
+                        tool_selection_correct: false,
+                        final_answer_correct: false,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        latency: Duration::ZERO,
+                        error: None,
+                    },
+                    QuestionOutcome {
+                        prompt: "loud",
+                        expected: "callers".to_string(),
+                        chosen: None,
+                        tool_selection_correct: false,
+                        final_answer_correct: false,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        latency: Duration::ZERO,
+                        error: Some("boom".to_string()),
+                    },
+                ],
+            },
+            specialized: DesignReport {
+                design: "specialized",
+                outcomes: vec![],
+            },
+        };
+        let text = report.render();
+        assert!(text.contains("loud failures (no/malformed call, visibly retryable): 1 (25%)"));
+        assert!(
+            text.contains("silent-wrong (well-formed call, wrong data, no retry signal): 1 (25%)")
+        );
     }
 
     /// No correct answer in the sample at all: `requests_per_answered_question`
