@@ -696,6 +696,54 @@ fn standalone_binary_diff_ci_loads_a_configured_diff_policy_without_erroring() {
     assert!(stdout_of(&ci).contains("❌ SOURCE CHANGES: 1"));
 }
 
+/// `okf-rs diff-bundles` against Phase F's own checked-in
+/// `tests/fixtures/diff/resolver-change/{before,after}/` golden fixture --
+/// a real bundle pair on disk (not two git refs re-analyzed) whose only
+/// difference is `resolver_version`, exactly the shape this command
+/// exists for: comparing two independently generated bundles directly,
+/// the way two `generate --lsp` runs against two different installed
+/// resolver versions would produce (see `docs/improvement-plan-provenance-diff.md`'s
+/// Phase G, which this command's own real-world run against a genuine
+/// rust-analyzer 1.90.0-vs-1.94.1 pair is what caught the `{:.0}%`
+/// rounding bug `render_ci_report`'s own tests now cover directly).
+#[test]
+fn standalone_binary_diff_bundles_reports_the_resolver_only_rate_from_a_real_fixture_pair() {
+    let bundle_a = repo_root().join("tests/fixtures/diff/resolver-change/before");
+    let bundle_b = repo_root().join("tests/fixtures/diff/resolver-change/after");
+
+    let result = run(
+        &repo_root(),
+        &[
+            "diff-bundles",
+            bundle_a.to_str().unwrap(),
+            bundle_b.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "a purely resolver-only change should warn, not fail, under the default policy: {}",
+        stdout_of(&result)
+    );
+    let text = stdout_of(&result);
+    assert!(text.contains("⚠️  RESOLVER CHANGES: 1"));
+    assert!(text.contains("100.0% of relationship-level changes in this diff were resolver-only"));
+}
+
+/// The other direction: `diff-bundles` on two byte-identical bundle
+/// directories reports no changes at all, the same "nothing to report"
+/// shape `diff --ci` has for an unchanged ref pair -- confirms this isn't
+/// hardwired to always find a resolver change just because it's the
+/// primary use case.
+#[test]
+fn standalone_binary_diff_bundles_reports_no_changes_for_identical_bundles() {
+    let bundle = repo_root().join("tests/fixtures/diff/resolver-change/before");
+    let bundle_str = bundle.to_str().unwrap();
+
+    let result = run(&repo_root(), &["diff-bundles", bundle_str, bundle_str]);
+    assert!(result.status.success());
+    assert!(stdout_of(&result).contains("No changes between"));
+}
+
 /// `okf-rs impact` extends `diff`'s concept-level added/removed/changed
 /// list with blast radius (transitive callers) and structural
 /// criticality. Two commits where only `callee`'s signature changes

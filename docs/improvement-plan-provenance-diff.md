@@ -869,6 +869,71 @@ doesn't support as directly across sample sizes of different size.
   metrics to already-shipped surfaces, the same additive posture every earlier phase in this
   document took (§9).
 
+### `diff-bundles`, and the real measurement it made possible
+
+`resolver_only_rate` and `okf-rs diff --ci` are the *instrument* Phase G shipped; running the actual
+measurement across two real resolver versions on a real corpus — the reviewer's explicit ask — needs
+a way to compare two bundles generated from the identical source snapshot under two different
+resolver versions, which `okf-rs diff`'s two-git-ref comparison can't express at all (the source
+never changed; there's no second ref to check out). `okf-rs diff-bundles <bundle-a> <bundle-b>`
+closes that gap: it reads two bundle directories directly off disk (`okf_parser::read_bundle` on
+each side) and renders the exact same `--ci`-style classified report `diff --ci` does — reusing
+`render_ci_report` unchanged, just fed `Option<f64>` computed from a `DiffReport` built from two
+already-generated bundles instead of two freshly-analyzed git refs. Not limited to the
+resolver-version use case: any two independently generated bundles of conceptually the same project
+(`--lsp` on vs. off, two different `okf-rs` versions, ...) compare the same way.
+
+**The measurement, run for real** (not just described): two real `rust-analyzer` installs via
+`rustup toolchain install`/`rustup component add rust-analyzer` (1.90.0 and 1.94.1 — GitHub release
+downloads are blocked by this environment's egress policy, but `static.rust-lang.org`, which `rustup`
+itself uses, isn't), `okf-rs generate . --lsp --no-cache` against this repository's own 1153-concept
+source snapshot under each, then `okf-rs diff-bundles` between the two resulting bundles:
+
+```
+❌ SOURCE CHANGES: 2
+⚠️  RESOLVER CHANGES: 1292
+   (99.8% of relationship-level changes in this diff were resolver-only)
+
+exit code: 1
+```
+
+1292 of 1294 relationship-level changes between the two versions were purely `resolver_version`
+metadata — real, if modest, evidence that `resolver_changes: "ignore"` is a defensible policy choice
+for a project willing to accept the confound described next. The 2 remaining `SourceChange` entries
+(both directions of one edge: `cmd_check_determinism → Project::load`) looked, at first, like a
+genuine cross-version resolution disagreement — until the obvious control experiment
+(`okf-rs generate --lsp --check-determinism`, which re-runs analysis twice *independently under the
+same resolver version* and diffs byte-for-byte) showed `--lsp` resolution on this codebase isn't
+fully deterministic run-to-run even holding the resolver version fixed: 1.94.1 disagreed with itself
+on 2/2 repeated runs (on two different call sites each time), and 1.90.0 disagreed with itself on
+1/3. That means the one real `SourceChange` found between versions can't be confidently attributed to
+the version bump at all — it's at least as well explained by this baseline indexing noise, already
+named as a known limitation in this ROADMAP's Phase 2 section, now quantified rather than just
+asserted. The more solidly reproducible finding here is the non-determinism itself, present in both
+tested versions, not a 1.90.0-vs-1.94.1 semantic disagreement.
+
+**A real bug this run caught**: `render_ci_report`'s resolver-only-rate line originally formatted at
+zero decimal places (`{:.0}%`), which rounds a genuine 99.8454...% up to a bare "100%" —
+indistinguishable from an actually-clean diff with zero source changes, exactly the distinction this
+number exists to preserve. Found only by running the real tool against real data, not by any of the
+hand-picked round-number test cases (100%, 50%) already in place; fixed to one decimal place, with a
+regression test (`resolver_only_rate_renders_at_one_decimal_place_not_rounded_to_a_bare_100_percent`)
+that reproduces the exact 1292/1294 ratio from this run.
+
+### Tests (continued)
+
+- `okf-cli::diff_ci_tests::resolver_only_rate_renders_at_one_decimal_place_not_rounded_to_a_bare_100_percent`
+  — the regression test for the rounding bug above.
+- `okf-cli` e2e (`tests/e2e.rs`): `standalone_binary_diff_bundles_reports_the_resolver_only_rate_from_a_real_fixture_pair`
+  runs the real compiled binary against Phase F's own checked-in
+  `tests/fixtures/diff/resolver-change/{before,after}/` fixture (no live resolver install needed —
+  the fixture already encodes a resolver-version-only change);
+  `standalone_binary_diff_bundles_reports_no_changes_for_identical_bundles` covers the
+  no-difference-at-all case. The two-real-resolver-versions measurement itself isn't a repository
+  test (no more feasible to pin two `rust-analyzer` installs in CI than Phase A's own integration
+  scenario already noted) — it was run once, by hand, exactly as this section describes, and
+  `diff-bundles` is what a project would run to repeat it.
+
 ## References
 
 - [`docs/feedback/2026-08-provenance-graph-diff-review.md`](feedback/2026-08-provenance-graph-diff-review.md) — the raw feedback this plan distills

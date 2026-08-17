@@ -397,9 +397,17 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   that number across its own real resolver-version bumps and decide for itself whether
   `DiffPolicy::resolver_changes` can default to `ignore` — computed straight from the diff's
   relationship changes rather than `CiSummary`'s aggregate counts, so unrelated concept-level churn
-  in the same diff can't dilute it — see
+  in the same diff can't dilute it. A new `okf-rs diff-bundles <bundle-a> <bundle-b>` command makes
+  that measurement actually runnable: it compares two already-generated bundle directories directly
+  (no git ref to check out when the source never changed, only the resolver version did) with the
+  same `--ci`-style classified report. Run for real against this repository's own source under
+  `rust-analyzer` 1.90.0 vs. 1.94.1: 99.8% of relationship-level changes were resolver-only, and the
+  exercise also caught that `--lsp` resolution isn't fully deterministic run-to-run even holding the
+  resolver version fixed (1.94.1 disagreed with itself on 2/2 repeated `--check-determinism --lsp`
+  runs, 1.90.0 on 1/3) — a real number for a real known limitation, not just an assertion — see
   [`docs/improvement-plan-provenance-diff.md`](docs/improvement-plan-provenance-diff.md#11-phase-g--benchmark-scoring-and-ci-signal-follow-up-medium-review-august-2026--shipped)
-  for the full writeup.
+  for the full writeup, including the `{:.0}%`→`{:.1}%` rounding bug that same run caught (a genuine
+  99.85% was rounding to a bare, misleadingly-clean "100%").
 
 Verified by dogfooding. Unit tests cover the new field end-to-end: `okf-lsp` parses `serverInfo.version`
 from a real `initialize` response and — genuinely exercised in this environment, not skipped —

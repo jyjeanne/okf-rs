@@ -65,6 +65,17 @@ to `graph`, matching what Phase E actually measures, not to `explore`.
 See [`docs/improvement-plan-provenance-diff.md`](../improvement-plan-provenance-diff.md)'s Phase G
 for the concrete, shipped follow-up: a `FailureMode` split (`Correct`/`LoudFailure`/`SilentWrong`)
 on the live tool-selection benchmark, a `requests_per_answered_question()` metric expressed in the
-unit this review argues actually matters, and a `resolver_only_rate()` on `okf-rs diff --ci`'s
-`CiSummary` so a project can watch this exact number on its own corpus instead of guessing from one
-worked example.
+unit this review argues actually matters, and `okf_analyzer::resolver_only_rate(&DiffReport)` (later
+corrected from an initial `CiSummary`-based version whose denominator was diluted by unrelated
+concept-level churn — see Phase G's own writeup) so a project can watch this exact number on its own
+corpus instead of guessing from one worked example.
+
+That measurement was then actually run, not just made measurable: a new `okf-rs diff-bundles`
+command (comparing two already-generated bundle directories directly, since two `--lsp` runs of the
+identical source under different resolver versions have no git ref to diff against) against a real
+`rust-analyzer` 1.90.0-vs-1.94.1 pair on this repository's own source found a 99.8% resolver-only
+rate — real evidence for the "near zero → safe to ignore" case this review's diff-classification
+point was making — while also surfacing that `--lsp` resolution on this codebase isn't fully
+deterministic run-to-run even under one fixed resolver version, which is what the remaining 0.2%
+turned out to be at least as well explained by. See Phase G's "`diff-bundles`, and the real
+measurement it made possible" section for the full run and the rounding bug it caught along the way.
