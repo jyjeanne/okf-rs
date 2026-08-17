@@ -63,12 +63,25 @@ to `graph`, matching what Phase E actually measures, not to `explore`.
 ## Response
 
 See [`docs/improvement-plan-provenance-diff.md`](../improvement-plan-provenance-diff.md)'s Phase G
-for the concrete, shipped follow-up: a `FailureMode` split (`Correct`/`LoudFailure`/`SilentWrong`)
-on the live tool-selection benchmark, a `requests_per_answered_question()` metric expressed in the
-unit this review argues actually matters, and `okf_analyzer::resolver_only_rate(&DiffReport)` (later
-corrected from an initial `CiSummary`-based version whose denominator was diluted by unrelated
-concept-level churn — see Phase G's own writeup) so a project can watch this exact number on its own
-corpus instead of guessing from one worked example.
+for the concrete, shipped follow-up: a `FailureMode` split
+(`Correct`/`LoudFailure`/`DetectableWrong`/`SilentWrong`) on the live tool-selection benchmark, a
+`requests_per_answered_question()` metric expressed in the unit this review argues actually
+matters, and `okf_analyzer::resolver_only_rate(&DiffReport)` (later corrected from an initial
+`CiSummary`-based version whose denominator was diluted by unrelated concept-level churn — see
+Phase G's own writeup) so a project can watch this exact number on its own corpus instead of
+guessing from one worked example.
+
+The middle category (the review's "mauvais outil mais détectable" — a wrong tool the model "might
+realize" was wrong) shipped in two passes, deliberately. The first pass built only
+`Correct`/`LoudFailure`/`SilentWrong`, on the grounds that "did the model notice its own mistake"
+isn't measurable by a harness that scores one tool call per question and never asks a model to
+reflect on its own answer. The second pass added `DetectableWrong` as a narrower, honestly-scoped
+substitute: not "did the model notice," but "is the wrong tool's response itself one of
+`okf-query`'s own empty/negative results" — a signal any downstream consumer could act on without
+knowing the right answer, verified against the real fixture rather than assumed. Making that
+classification possible required actually calling the wrong tool (previously skipped entirely once
+selection was known to be wrong), which in turn surfaced and fixed a real ordering bug in
+`failure_mode`'s own logic — see Phase G's own writeup for both.
 
 That measurement was then actually run, not just made measurable: a new `okf-rs diff-bundles`
 command (comparing two already-generated bundle directories directly, since two `--lsp` runs of the

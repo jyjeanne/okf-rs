@@ -833,15 +833,65 @@ a bare count — the accuracy lines already reported percentages, and the failur
 existed specifically so the two failure costs could be compared at a glance, which a bare count
 doesn't support as directly across sample sizes of different size.
 
+**A fourth failure mode, `DetectableWrong`** (a further round of feedback on this same Phase G,
+recorded in `docs/feedback/2026-08-tool-consolidation-benchmark-review.md`): the original review
+named a third category between loud and silent — a wrong tool a model "might realize" was wrong —
+that Phase G deliberately left unmodeled at first, since this benchmark scores one tool call per
+question and never asks a model to reflect on its own answer, so there's no "did it notice" signal
+to read at all. What *is* measurable without a second model call: whether the wrong tool's response
+is itself one of `okf-query`'s own empty/negative "nothing found" sentinels (`"No callers found for
+..."`, `` "`id` doesn't call anything..." ``, and the rest of that family —
+`okf_mcp::tool_selection_benchmark::is_negative_response`) — a signal any downstream consumer could
+act on without knowing the right answer, unlike a populated-but-wrong response, which looks exactly
+as plausible as a correct one. `FailureMode` gained a fourth variant, `DetectableWrong`, between
+`LoudFailure` and `SilentWrong`; `DesignReport::detectable_wrong()`, a `[DETECTABLE-WRONG]` report
+line (which also prints the actual negative response text, unlike `[SILENT-WRONG]`), and its own
+percentage in the breakdown.
+
+Two real code changes had to happen for this to be honest rather than approximated. First,
+`run_consolidated`/`run_specialized` previously only ever called the *chosen* tool when selection
+was correct (`final_correct = selection_correct && tools::call(...)`) — a wrong selection's actual
+response was never observed at all, so there was no response text for `DetectableWrong` to classify
+against. Both now always dispatch whichever tool/relation the model actually picked, right or
+wrong, and thread the real response (or error) through a new `QuestionOutcome::response:
+Option<String>` field. Second, that same change makes a previously-only-theoretical state
+reachable for real: a *correct* relation selection whose underlying call still errors (e.g. the
+right relation, wrong argument) now genuinely occurs, and `QuestionOutcome::failure_mode` had to
+check `error` *before* `tool_selection_correct` to classify it `LoudFailure` rather than silently
+`Correct` — external code review had already flagged this exact ordering as a latent gap when only
+`error`/`tool_selection_correct` existed and could never actually disagree; adding `response` and
+always calling the tool is what turned that from a theoretical concern into a real, now-fixed, one.
+
+`is_negative_response` is deliberately narrow, and says so in its own doc comment: it only catches
+the case where the *wrong* tool happens to have nothing to report for these specific arguments, not
+the broader "populated, but obviously about a different subject" case (e.g. a `stats` breakdown
+returned for a "who calls X" question) — that stays `SilentWrong`, since building a general notion
+of "expected response shape per question" risks false positives a narrower, verified-against-the-
+real-fixture rule avoids. Verified directly, not assumed: on the shared fixture, swapping
+`callers`/`callees` for either of the two questions built around the `foo -> bar` edge produces a
+genuine empty-result sentinel (`bar` has no outgoing calls of its own; `foo` has no callers of its
+own), confirming there's a real behavioral distinction here to classify against.
+
 ### Tests
 
-- `tool_selection_live::tests`: `failure_mode_distinguishes_silent_wrong_from_loud_failure` (all
-  three `FailureMode` variants against hand-built outcomes),
-  `design_report_counts_failure_modes_and_requests_per_answered_question` (a 4-outcome design —
-  two correct, one silent-wrong, one loud-failure — asserts both counts and the resulting `2.0`
-  requests-per-answered-question), `requests_per_answered_question_is_none_when_nothing_was_answered_correctly`.
-  The pre-existing `live_report_render_includes_the_model_and_both_designs` test is updated to
-  assert the new `[SILENT-WRONG]` tag rather than the old undifferentiated `[WRONG]`.
+- `tool_selection_benchmark::tests`: `is_negative_response_recognizes_the_okf_query_empty_result_sentinels`
+  (the sentinel strings, checked against literal `okf-query` output shapes),
+  `callers_callees_swap_on_this_fixture_produces_a_real_negative_response` (verifies the real
+  behavioral distinction against the actual fixture bundle, not just the string-matching rule in
+  isolation).
+- `tool_selection_live::tests`: `failure_mode_distinguishes_all_four_outcomes` (all four
+  `FailureMode` variants, including `DetectableWrong`, against hand-built outcomes),
+  `failure_mode_treats_a_correct_selection_whose_call_still_errored_as_loud_not_correct` (the
+  invariant-ordering fix — `error` checked before `tool_selection_correct`),
+  `design_report_counts_failure_modes_and_requests_per_answered_question` (a 5-outcome design —
+  two correct, one silent-wrong, one detectable-wrong, one loud-failure — asserts all four counts
+  and the resulting `2.5` requests-per-answered-question),
+  `render_shows_failure_mode_counts_as_a_percentage_of_the_whole_sample` (now covering all three
+  wrong-outcome percentages, not just loud/silent),
+  `requests_per_answered_question_is_none_when_nothing_was_answered_correctly`. The pre-existing
+  `live_report_render_includes_the_model_and_both_designs` test is updated to assert the new
+  `[SILENT-WRONG]` tag rather than the old undifferentiated `[WRONG]`, with a response chosen
+  deliberately non-negative so it doesn't accidentally classify as `DetectableWrong`.
 - `okf-analyzer::tests`: `resolver_only_rate_is_none_on_an_empty_diff`,
   `resolver_only_rate_reports_the_share_of_relationship_level_changes` (a mixed diff — one genuine
   rewire, one resolver-only pair — asserts the rate is exactly `1/3`, not just "some resolver
@@ -857,8 +907,14 @@ doesn't support as directly across sample sizes of different size.
 
 ### Acceptance criteria
 
-- A silent-wrong outcome and a loud-failure outcome are never counted in the same bucket, in either
-  the live benchmark's aggregate counts or its per-question rendered lines.
+- A silent-wrong, detectable-wrong, and loud-failure outcome are never counted in more than one
+  bucket, in either the live benchmark's aggregate counts or its per-question rendered lines — the
+  four `FailureMode` variants partition `DesignReport::outcomes` exactly.
+- `DetectableWrong`'s classification is based on the wrong tool's *real* response, actually
+  dispatched (never skipped just because the selection was wrong), not approximated or left unset.
+- A correct relation selection whose underlying tool call still errors is classified `LoudFailure`,
+  never silently `Correct` — `error` is checked before `tool_selection_correct` in
+  `QuestionOutcome::failure_mode`.
 - `requests_per_answered_question()` is derivable from data the benchmark already collects (no new
   network calls or fields), and reports `None` rather than dividing by zero when nothing was
   answered correctly.

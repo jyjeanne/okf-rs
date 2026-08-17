@@ -385,11 +385,21 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   stated scope rather than relocating everything for its own sake.
 - [x] ✅ **Phase G — Benchmark-scoring and CI-signal follow-up** (a later, third round of external
   review — [`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`](docs/feedback/2026-08-tool-consolidation-benchmark-review.md)):
-  Phase E's live benchmark now distinguishes a *loud* failure (no tool matched, or a schema the
-  model couldn't satisfy) from a *silent-wrong* one (a well-formed call to the wrong tool/relation
-  that still returns real data) instead of one undifferentiated "wrong" bucket — `FailureMode`,
-  `DesignReport::{loud_failures, silent_wrong}`, and `[LOUD-FAIL]`/`[SILENT-WRONG]` per-question
-  report lines, now also shown as a percentage of the sample alongside the raw count. It also
+  Phase E's live benchmark now distinguishes four outcomes instead of one undifferentiated "wrong"
+  bucket: `Correct`; a *loud* failure (no tool matched, or a schema/argument the model or tool
+  itself rejected); a *detectable-wrong* one (the wrong tool/relation, but its response is itself
+  one of `okf-query`'s own empty/negative "nothing found" sentinels — a signal a downstream consumer
+  could act on without knowing the right answer); and a *silent-wrong* one (a well-formed call to
+  the wrong tool/relation whose response is real, populated data, indistinguishable in shape from a
+  correct answer) — `FailureMode`, `DesignReport::{loud_failures, detectable_wrong, silent_wrong}`,
+  and `[LOUD-FAIL]`/`[DETECTABLE-WRONG]`/`[SILENT-WRONG]` per-question report lines, each also shown
+  as a percentage of the sample alongside the raw count. Making `DetectableWrong` real (not just
+  approximated) required two real code changes: `run_consolidated`/`run_specialized` now always
+  dispatch whichever tool the model actually picked, right or wrong (previously the wrong tool was
+  never even called, so its response was never observed), and `QuestionOutcome::failure_mode` now
+  checks `error` before `tool_selection_correct` — closing, for real, an ordering gap external code
+  review had already flagged as a latent risk once a correct selection could also carry an error. It
+  also
   reports `requests_per_answered_question()` (`1 / final_answer_accuracy`) — cost expressed in
   requests, the unit that stays comparable across sessions of any length, rather than tokens.
   Separately, `okf_analyzer::resolver_only_rate(&DiffReport)` and `okf-rs diff --ci` now surface

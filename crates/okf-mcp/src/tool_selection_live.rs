@@ -404,13 +404,16 @@ fn call_via_relation(
 /// flatters whichever design happens to fail more often in the cheap
 /// register. A [`LoudFailure`](FailureMode::LoudFailure) is visible the
 /// moment it happens (no tool matched, the arguments didn't satisfy a
-/// schema, the endpoint errored) and whatever's driving the session can
-/// react to it. A [`SilentWrong`](FailureMode::SilentWrong) is a
-/// well-formed call to the wrong tool/relation — it returns real data,
-/// indistinguishable in shape from a correct answer, so nothing
-/// downstream has a reason to retry it. Derived from data every
-/// [`QuestionOutcome`] already carries (`error`/`tool_selection_correct`),
-/// not a new field to keep in sync with those two.
+/// schema, the endpoint or the tool itself errored) and whatever's
+/// driving the session can react to it. Everything else called the
+/// *wrong* tool/relation but still got a well-formed result back, split
+/// two ways: [`DetectableWrong`](FailureMode::DetectableWrong), where
+/// that result is itself one of `okf-query`'s own "nothing found"
+/// sentinels (see [`crate::tool_selection_benchmark::is_negative_response`]
+/// for exactly what this does and doesn't claim to detect), and
+/// [`SilentWrong`](FailureMode::SilentWrong), where it's real, populated,
+/// plausible-looking data — the expensive case, since nothing about the
+/// response itself gives anything downstream a reason to retry it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureMode {
     /// The expected tool/relation was chosen.
@@ -419,8 +422,14 @@ pub enum FailureMode {
     /// malformed arguments, or the endpoint/tool errored outright.
     LoudFailure,
     /// A different tool/relation than expected was chosen, and the call
-    /// still succeeded — real, well-formed data that happens to answer
-    /// the wrong question.
+    /// succeeded, but its response is itself an empty/negative "nothing
+    /// found" result — a signal a downstream consumer could act on
+    /// without knowing the right answer, even though this benchmark
+    /// itself never asks the model to notice it.
+    DetectableWrong,
+    /// A different tool/relation than expected was chosen, and the call
+    /// succeeded with real, populated data — indistinguishable in shape
+    /// from a correct answer.
     SilentWrong,
 }
 
@@ -431,6 +440,15 @@ pub struct QuestionOutcome {
     pub chosen: Option<String>,
     pub tool_selection_correct: bool,
     pub final_answer_correct: bool,
+    /// The chosen tool/relation's real response text, whenever the call
+    /// itself succeeded — `Some` even when `tool_selection_correct` is
+    /// `false` (see [`run_consolidated`]/[`run_specialized`]: the wrong
+    /// tool is still actually called, not just scored against the
+    /// expected one, specifically so [`failure_mode`](QuestionOutcome::failure_mode)
+    /// has real response text to classify `DetectableWrong` against).
+    /// `None` exactly when `error` is `Some` — the call never produced a
+    /// response to inspect at all.
+    pub response: Option<String>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub latency: Duration,
@@ -438,17 +456,27 @@ pub struct QuestionOutcome {
 }
 
 impl QuestionOutcome {
-    /// Classifies this outcome per [`FailureMode`]. `error.is_some()` is
-    /// exactly the loud/silent boundary: every loud-failure path in
-    /// [`run_consolidated`]/[`run_specialized`] (the model declined to
-    /// call a tool, sent malformed arguments, or the endpoint/dispatch
-    /// itself returned an error) sets `error`; a well-formed call to the
-    /// wrong tool/relation never does, no matter how wrong it was.
+    /// Classifies this outcome per [`FailureMode`]. `error` is checked
+    /// *first*, ahead of `tool_selection_correct`: a correct relation
+    /// selection whose underlying call still failed (e.g. the model chose
+    /// the right relation but supplied an argument the tool itself
+    /// rejected) is a real, visible failure, not a silent "Correct" —
+    /// the two fields are independent (unlike the loud/silent split
+    /// alone, this benchmark's own tool-execution path can now set both
+    /// `tool_selection_correct: true` and `error: Some(..)` together, see
+    /// [`run_consolidated`]), so whichever field is checked first is
+    /// load-bearing, not just style.
     pub fn failure_mode(&self) -> FailureMode {
-        if self.tool_selection_correct {
-            FailureMode::Correct
-        } else if self.error.is_some() {
+        if self.error.is_some() {
             FailureMode::LoudFailure
+        } else if self.tool_selection_correct {
+            FailureMode::Correct
+        } else if self
+            .response
+            .as_deref()
+            .is_some_and(crate::tool_selection_benchmark::is_negative_response)
+        {
+            FailureMode::DetectableWrong
         } else {
             FailureMode::SilentWrong
         }
@@ -477,12 +505,24 @@ impl DesignReport {
     }
 
     /// Count of [`FailureMode::LoudFailure`] outcomes — see that variant's
-    /// docs for why this is kept separate from [`silent_wrong`](Self::silent_wrong)
-    /// rather than folded into one "wrong" count.
+    /// docs for why this is kept separate from [`silent_wrong`](Self::silent_wrong)/
+    /// [`detectable_wrong`](Self::detectable_wrong) rather than folded
+    /// into one "wrong" count.
     pub fn loud_failures(&self) -> usize {
         self.outcomes
             .iter()
             .filter(|o| o.failure_mode() == FailureMode::LoudFailure)
+            .count()
+    }
+
+    /// Count of [`FailureMode::DetectableWrong`] outcomes — a wrong
+    /// tool/relation whose response is itself an empty/negative "nothing
+    /// found" result, structurally distinguishable from a real answer
+    /// without knowing what the right one was.
+    pub fn detectable_wrong(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| o.failure_mode() == FailureMode::DetectableWrong)
             .count()
     }
 
@@ -605,6 +645,12 @@ impl LiveReport {
             );
             let _ = writeln!(
                 out,
+                "    of which detectable-wrong (wrong tool, empty/negative result): {} ({:.0}%)",
+                design.detectable_wrong(),
+                design.rate_of(design.detectable_wrong()),
+            );
+            let _ = writeln!(
+                out,
                 "    of which silent-wrong (well-formed call, wrong data, no retry signal): {} ({:.0}%)",
                 design.silent_wrong(),
                 design.rate_of(design.silent_wrong()),
@@ -644,6 +690,16 @@ impl LiveReport {
                         let err = o.error.as_deref().unwrap_or("");
                         let _ = writeln!(out, "    [LOUD-FAIL] {:?}: {err}", o.prompt);
                     }
+                    FailureMode::DetectableWrong => {
+                        let _ = writeln!(
+                            out,
+                            "    [DETECTABLE-WRONG] {:?}: expected `{}`, got {:?} -- {}",
+                            o.prompt,
+                            o.expected,
+                            o.chosen,
+                            o.response.as_deref().unwrap_or("")
+                        );
+                    }
                     FailureMode::SilentWrong => {
                         let _ = writeln!(
                             out,
@@ -678,20 +734,49 @@ fn run_consolidated(
                     .to_string();
                 let selection_correct =
                     outcome.tool_name == "graph" && scores_correctly(&chosen_relation, q.relation);
-                let final_correct = selection_correct
-                    && tools::call("graph", &outcome.arguments, bundle, cache)
-                        .map(|r| r.contains(q.expected_substring))
-                        .unwrap_or(false);
-                QuestionOutcome {
-                    prompt: q.prompt,
-                    expected: q.relation.to_string(),
-                    chosen: Some(chosen_relation),
-                    tool_selection_correct: selection_correct,
-                    final_answer_correct: final_correct,
-                    prompt_tokens: outcome.prompt_tokens,
-                    completion_tokens: outcome.completion_tokens,
-                    latency: outcome.latency,
-                    error: None,
+                // Always actually calls the tool the model picked, right
+                // or wrong -- not just when `selection_correct` -- so
+                // `QuestionOutcome::failure_mode` has real response text
+                // to classify `DetectableWrong` against even for a wrong
+                // selection. Previously this call was skipped entirely
+                // whenever selection was wrong (`final_correct` was
+                // computed via `selection_correct && ...`), which meant a
+                // wrong-but-well-formed call's actual response was never
+                // observed at all.
+                match tools::call("graph", &outcome.arguments, bundle, cache) {
+                    Ok(response) => {
+                        let final_correct =
+                            selection_correct && response.contains(q.expected_substring);
+                        QuestionOutcome {
+                            prompt: q.prompt,
+                            expected: q.relation.to_string(),
+                            chosen: Some(chosen_relation),
+                            tool_selection_correct: selection_correct,
+                            final_answer_correct: final_correct,
+                            response: Some(response),
+                            prompt_tokens: outcome.prompt_tokens,
+                            completion_tokens: outcome.completion_tokens,
+                            latency: outcome.latency,
+                            error: None,
+                        }
+                    }
+                    Err(e) => QuestionOutcome {
+                        prompt: q.prompt,
+                        expected: q.relation.to_string(),
+                        chosen: Some(chosen_relation),
+                        // Selection itself may have been correct (e.g. the
+                        // right relation, but an argument the tool
+                        // rejected) -- `failure_mode` checks `error`
+                        // first specifically so this still counts as a
+                        // loud failure rather than a silent "Correct".
+                        tool_selection_correct: selection_correct,
+                        final_answer_correct: false,
+                        response: None,
+                        prompt_tokens: outcome.prompt_tokens,
+                        completion_tokens: outcome.completion_tokens,
+                        latency: outcome.latency,
+                        error: Some(e.to_string()),
+                    },
                 }
             }
             Err(e) => QuestionOutcome {
@@ -700,6 +785,7 @@ fn run_consolidated(
                 chosen: None,
                 tool_selection_correct: false,
                 final_answer_correct: false,
+                response: None,
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 latency: Duration::ZERO,
@@ -722,20 +808,38 @@ fn run_specialized(client: &ToolCallingClient, bundle: &Path, cache: &BundleCach
             Some(match client.choose_tool(q.prompt, &schema) {
                 Ok(outcome) => {
                     let selection_correct = scores_correctly(&outcome.tool_name, &expected_tool);
-                    let final_correct = selection_correct
-                        && call_via_relation(&outcome.tool_name, &outcome.arguments, bundle, cache)
-                            .map(|r| r.contains(q.expected_substring))
-                            .unwrap_or(false);
-                    QuestionOutcome {
-                        prompt: q.prompt,
-                        expected: expected_tool,
-                        chosen: Some(outcome.tool_name),
-                        tool_selection_correct: selection_correct,
-                        final_answer_correct: final_correct,
-                        prompt_tokens: outcome.prompt_tokens,
-                        completion_tokens: outcome.completion_tokens,
-                        latency: outcome.latency,
-                        error: None,
+                    // Same reasoning as `run_consolidated`: always dispatch
+                    // the tool the model actually picked, even when it's
+                    // wrong, so the response is available to classify.
+                    match call_via_relation(&outcome.tool_name, &outcome.arguments, bundle, cache) {
+                        Ok(response) => {
+                            let final_correct =
+                                selection_correct && response.contains(q.expected_substring);
+                            QuestionOutcome {
+                                prompt: q.prompt,
+                                expected: expected_tool,
+                                chosen: Some(outcome.tool_name),
+                                tool_selection_correct: selection_correct,
+                                final_answer_correct: final_correct,
+                                response: Some(response),
+                                prompt_tokens: outcome.prompt_tokens,
+                                completion_tokens: outcome.completion_tokens,
+                                latency: outcome.latency,
+                                error: None,
+                            }
+                        }
+                        Err(e) => QuestionOutcome {
+                            prompt: q.prompt,
+                            expected: expected_tool,
+                            chosen: Some(outcome.tool_name),
+                            tool_selection_correct: selection_correct,
+                            final_answer_correct: false,
+                            response: None,
+                            prompt_tokens: outcome.prompt_tokens,
+                            completion_tokens: outcome.completion_tokens,
+                            latency: outcome.latency,
+                            error: Some(e.to_string()),
+                        },
                     }
                 }
                 Err(e) => QuestionOutcome {
@@ -744,6 +848,7 @@ fn run_specialized(client: &ToolCallingClient, bundle: &Path, cache: &BundleCach
                     chosen: None,
                     tool_selection_correct: false,
                     final_answer_correct: false,
+                    response: None,
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     latency: Duration::ZERO,
@@ -1008,6 +1113,7 @@ mod tests {
                     chosen: Some("callers".to_string()),
                     tool_selection_correct: true,
                     final_answer_correct: true,
+                    response: Some("functions/pkg-a/foo".to_string()),
                     prompt_tokens: 10,
                     completion_tokens: 2,
                     latency: Duration::from_millis(50),
@@ -1016,12 +1122,20 @@ mod tests {
             },
             specialized: DesignReport {
                 design: "specialized",
+                // A populated, non-negative response (not one of
+                // `is_negative_response`'s "nothing found" sentinels) --
+                // stays `SilentWrong`, not `DetectableWrong`, which is
+                // exactly the case this test's own `[SILENT-WRONG]`
+                // assertion below checks.
                 outcomes: vec![QuestionOutcome {
                     prompt: "Who calls bar?",
                     expected: "graph_callers".to_string(),
                     chosen: Some("graph_callees".to_string()),
                     tool_selection_correct: false,
                     final_answer_correct: false,
+                    response: Some(
+                        "`functions/pkg-b/bar` calls functions/pkg-a/some_other_fn".to_string(),
+                    ),
                     prompt_tokens: 10,
                     completion_tokens: 2,
                     latency: Duration::from_millis(50),
@@ -1039,17 +1153,19 @@ mod tests {
     }
 
     /// The failure-mode split this module exists to add: a `[SILENT-WRONG]`
-    /// outcome (well-formed call, wrong relation, `error: None`) is never
-    /// counted as a loud failure, and vice versa — the two are different
-    /// costs, not one "wrong" bucket. See [`FailureMode`]'s docs.
+    /// outcome (well-formed call, wrong relation, populated non-negative
+    /// response) is never counted as a loud failure or a detectable-wrong
+    /// one, and vice versa — each is a different cost, not one "wrong"
+    /// bucket. See [`FailureMode`]'s docs.
     #[test]
-    fn failure_mode_distinguishes_silent_wrong_from_loud_failure() {
+    fn failure_mode_distinguishes_all_four_outcomes() {
         let silent = QuestionOutcome {
             prompt: "p",
             expected: "callers".to_string(),
             chosen: Some("callees".to_string()),
             tool_selection_correct: false,
             final_answer_correct: false,
+            response: Some("functions/pkg-a/other".to_string()),
             prompt_tokens: 0,
             completion_tokens: 0,
             latency: Duration::ZERO,
@@ -1057,12 +1173,27 @@ mod tests {
         };
         assert_eq!(silent.failure_mode(), FailureMode::SilentWrong);
 
+        let detectable = QuestionOutcome {
+            prompt: "p",
+            expected: "callers".to_string(),
+            chosen: Some("callees".to_string()),
+            tool_selection_correct: false,
+            final_answer_correct: false,
+            response: Some("No callers found for `functions/pkg-a/foo`".to_string()),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            latency: Duration::ZERO,
+            error: None,
+        };
+        assert_eq!(detectable.failure_mode(), FailureMode::DetectableWrong);
+
         let loud = QuestionOutcome {
             prompt: "p",
             expected: "callers".to_string(),
             chosen: None,
             tool_selection_correct: false,
             final_answer_correct: false,
+            response: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             latency: Duration::ZERO,
@@ -1076,12 +1207,39 @@ mod tests {
             chosen: Some("callers".to_string()),
             tool_selection_correct: true,
             final_answer_correct: true,
+            response: Some("functions/pkg-a/foo".to_string()),
             prompt_tokens: 0,
             completion_tokens: 0,
             latency: Duration::ZERO,
             error: None,
         };
         assert_eq!(correct.failure_mode(), FailureMode::Correct);
+    }
+
+    /// The invariant fix that made `DetectableWrong` possible to reach
+    /// safely: `error` is checked *before* `tool_selection_correct` in
+    /// [`QuestionOutcome::failure_mode`], so a correct relation selection
+    /// whose underlying tool call still failed (a real, reachable case
+    /// now that `run_consolidated`/`run_specialized` always dispatch the
+    /// chosen tool, right or wrong) is classified `LoudFailure`, not
+    /// silently `Correct` -- the exact gap external code review flagged
+    /// as theoretically possible before this field combination could
+    /// actually occur.
+    #[test]
+    fn failure_mode_treats_a_correct_selection_whose_call_still_errored_as_loud_not_correct() {
+        let outcome = QuestionOutcome {
+            prompt: "p",
+            expected: "callers".to_string(),
+            chosen: Some("callers".to_string()),
+            tool_selection_correct: true,
+            final_answer_correct: false,
+            response: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            latency: Duration::ZERO,
+            error: Some("missing required argument `id`".to_string()),
+        };
+        assert_eq!(outcome.failure_mode(), FailureMode::LoudFailure);
     }
 
     /// A design report with one loud failure and one silent-wrong outcome
@@ -1100,6 +1258,7 @@ mod tests {
                     chosen: Some("callers".to_string()),
                     tool_selection_correct: true,
                     final_answer_correct: true,
+                    response: Some("functions/pkg-a/foo".to_string()),
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     latency: Duration::ZERO,
@@ -1111,6 +1270,19 @@ mod tests {
                     chosen: Some("callees".to_string()),
                     tool_selection_correct: false,
                     final_answer_correct: false,
+                    response: Some("functions/pkg-a/some_other_fn".to_string()),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    latency: Duration::ZERO,
+                    error: None,
+                },
+                QuestionOutcome {
+                    prompt: "detectable",
+                    expected: "callers".to_string(),
+                    chosen: Some("isolated".to_string()),
+                    tool_selection_correct: false,
+                    final_answer_correct: false,
+                    response: Some("No isolated concepts found".to_string()),
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     latency: Duration::ZERO,
@@ -1122,6 +1294,7 @@ mod tests {
                     chosen: None,
                     tool_selection_correct: false,
                     final_answer_correct: false,
+                    response: None,
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     latency: Duration::ZERO,
@@ -1133,6 +1306,7 @@ mod tests {
                     chosen: Some("callers".to_string()),
                     tool_selection_correct: true,
                     final_answer_correct: true,
+                    response: Some("functions/pkg-a/bar".to_string()),
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     latency: Duration::ZERO,
@@ -1141,19 +1315,20 @@ mod tests {
             ],
         };
         assert_eq!(design.silent_wrong(), 1);
+        assert_eq!(design.detectable_wrong(), 1);
         assert_eq!(design.loud_failures(), 1);
         assert_eq!(design.correct_final_answers(), 2);
-        // 4 requests, 2 answered correctly -> 2.0 requests per answered question.
-        assert_eq!(design.requests_per_answered_question(), Some(2.0));
+        // 5 requests, 2 answered correctly -> 2.5 requests per answered question.
+        assert_eq!(design.requests_per_answered_question(), Some(2.5));
 
         let text = design.selection_accuracy();
-        assert!((text - 0.5).abs() < f64::EPSILON);
+        assert!((text - 0.4).abs() < f64::EPSILON);
     }
 
     /// The percentage `render()` prints alongside each failure-mode count
     /// (`design.rate_of(count)`) is the count's share of the *whole*
-    /// sample, not of the wrong-selection subset -- 1 silent-wrong and 1
-    /// loud-failure out of 4 total outcomes is 25% each, not 50%.
+    /// sample, not of the wrong-selection subset -- 1 of each failure
+    /// mode out of 5 total outcomes is 20% each, not 33%.
     #[test]
     fn render_shows_failure_mode_counts_as_a_percentage_of_the_whole_sample() {
         let report = LiveReport {
@@ -1167,6 +1342,7 @@ mod tests {
                         chosen: Some("callers".to_string()),
                         tool_selection_correct: true,
                         final_answer_correct: true,
+                        response: Some("functions/pkg-a/foo".to_string()),
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         latency: Duration::ZERO,
@@ -1178,6 +1354,7 @@ mod tests {
                         chosen: Some("callees".to_string()),
                         tool_selection_correct: true,
                         final_answer_correct: true,
+                        response: Some("functions/pkg-b/bar".to_string()),
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         latency: Duration::ZERO,
@@ -1189,6 +1366,19 @@ mod tests {
                         chosen: Some("callees".to_string()),
                         tool_selection_correct: false,
                         final_answer_correct: false,
+                        response: Some("functions/pkg-a/some_other_fn".to_string()),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        latency: Duration::ZERO,
+                        error: None,
+                    },
+                    QuestionOutcome {
+                        prompt: "detectable",
+                        expected: "callers".to_string(),
+                        chosen: Some("cycles".to_string()),
+                        tool_selection_correct: false,
+                        final_answer_correct: false,
+                        response: Some("No cycles found in the call graph".to_string()),
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         latency: Duration::ZERO,
@@ -1200,6 +1390,7 @@ mod tests {
                         chosen: None,
                         tool_selection_correct: false,
                         final_answer_correct: false,
+                        response: None,
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         latency: Duration::ZERO,
@@ -1213,10 +1404,12 @@ mod tests {
             },
         };
         let text = report.render();
-        assert!(text.contains("loud failures (no/malformed call, visibly retryable): 1 (25%)"));
+        assert!(text.contains("loud failures (no/malformed call, visibly retryable): 1 (20%)"));
+        assert!(text.contains("detectable-wrong (wrong tool, empty/negative result): 1 (20%)"));
         assert!(
-            text.contains("silent-wrong (well-formed call, wrong data, no retry signal): 1 (25%)")
+            text.contains("silent-wrong (well-formed call, wrong data, no retry signal): 1 (20%)")
         );
+        assert!(text.contains("[DETECTABLE-WRONG]"));
     }
 
     /// No correct answer in the sample at all: `requests_per_answered_question`
@@ -1231,6 +1424,7 @@ mod tests {
                 chosen: None,
                 tool_selection_correct: false,
                 final_answer_correct: false,
+                response: None,
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 latency: Duration::ZERO,
