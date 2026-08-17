@@ -215,8 +215,36 @@ pub fn scores_correctly(chosen: &str, expected: &str) -> bool {
 /// notion of expected response *shape* per question this benchmark
 /// doesn't build, so it stays `SilentWrong` rather than being folded into
 /// a heuristic broad enough to risk false positives.
+///
+/// Matched against an exhaustive list of `okf-query`'s actual sentinel
+/// prefixes (one per `graph_*` empty-result branch,
+/// `crates/okf-query/src/lib.rs`), not a bare `starts_with("No ")` — a
+/// generic "No "-prefix check would also match any future *populated*
+/// response that happens to start with those two characters (e.g. a
+/// concept description, or new response text prefixed "No wait, ..."),
+/// silently misclassifying a real `SilentWrong` as `DetectableWrong` and
+/// undermining the exact distinction this scoring rule exists to keep
+/// trustworthy. Update this list alongside any new/changed empty-result
+/// message in `okf-query`, the same way `questions()` above is kept in
+/// sync with `graph`'s own relation enum.
+const NEGATIVE_RESPONSE_PREFIXES: &[&str] = &[
+    "No callers found for",
+    "No public concepts found",
+    "No cycles found in the call graph",
+    "No isolated concepts found",
+    "No cross-module call dependencies found",
+    "No packages found to layer",
+    "No packages found (no Package concepts in the bundle)",
+    "No design patterns detected",
+    "No REST endpoints, database models, or event-flow participants detected",
+    "No call path found from",
+];
+
 pub fn is_negative_response(response: &str) -> bool {
-    response.starts_with("No ") || response.contains("doesn't call anything")
+    NEGATIVE_RESPONSE_PREFIXES
+        .iter()
+        .any(|prefix| response.starts_with(prefix))
+        || response.contains("doesn't call anything")
 }
 
 /// The shared ground-truth fixture every [`Question`] above is checked
@@ -473,6 +501,21 @@ mod tests {
         assert!(!is_negative_response("functions/pkg-a/foo — Rust Function"));
         assert!(!is_negative_response(
             "3 public concepts:\n  Function     functions/pkg-a/foo"
+        ));
+    }
+
+    /// Regression test for the exact false-positive risk a bare
+    /// `starts_with("No ")` heuristic would have: real, populated content
+    /// that happens to start with "No " (e.g. a concept description, or
+    /// unrelated response text) is never one of `okf-query`'s actual
+    /// sentinels, and must not be misclassified as `DetectableWrong`.
+    #[test]
+    fn is_negative_response_does_not_false_positive_on_populated_text_starting_with_no() {
+        assert!(!is_negative_response(
+            "No description available for functions/pkg-a/foo — see the source instead"
+        ));
+        assert!(!is_negative_response(
+            "No wait, this bundle actually has 3 packages"
         ));
     }
 
