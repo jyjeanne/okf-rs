@@ -8,21 +8,37 @@ use okf_tree_sitter::CallCandidate;
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// A freshly started language server needs time to index a project
-/// before `textDocument/definition` returns anything useful — this bounds
-/// how long the *first* query for each language waits for that (10s
-/// total, in half-second steps). Once a language's server has returned at
-/// least one real answer, [`ClientState::warmed_up`] is set and later
-/// calls stop paying that retry budget, so a call the server genuinely
-/// can't resolve (as opposed to one asked before indexing finished) costs
-/// one quick attempt, not a repeated ~10s stall.
-const DEFINITION_RETRIES: u32 = 20;
-const DEFINITION_RETRY_DELAY: Duration = Duration::from_millis(500);
-
-struct ClientState {
-    client: Option<okf_lsp::LspClient>,
-    warmed_up: bool,
-}
+/// Small per-query retry budget applied to *every* ambiguous-call lookup,
+/// not just the first one for a given language. `okf_lsp::LspClient::start`
+/// already pays the expensive, workspace-wide wait once, up front (see
+/// [`okf_lsp::LspClient::wait_until_ready`]), so this only needs to cover
+/// residual, per-lookup lag that a workspace-level readiness signal can't
+/// see — e.g. one crate among many still finishing its own cross-crate
+/// index after the server overall reports ready. That's not hypothetical:
+/// it's the exact shape of the one real disagreement found comparing two
+/// `rust-analyzer` versions against this project's own source (see
+/// `benchmarks/resolver-stability/README.md`) — a cross-crate call whose
+/// answer depended on load timing, not on which version was asked.
+///
+/// This replaces an earlier "retry only the first query per language, then
+/// never again" heuristic that used whether *any* prior query for that
+/// language had already succeeded as a proxy for "the server is warmed
+/// up." That proxy was itself a source of nondeterminism: a fast,
+/// intra-crate first query could mark the whole client warmed up while a
+/// later, slower cross-crate query right behind it got zero retry budget
+/// — the same race being guarded against, just moved one layer up.
+///
+/// Deliberately small (one retry, one short sleep): unlike the old
+/// first-query budget, this one is now paid by *every* call this
+/// ambiguous, including ones the server can never resolve at all (e.g. a
+/// call dispatched through a trait or generic parameter) — a project with
+/// many such calls would otherwise pay the full budget's sleep on each one
+/// forever, not just during startup. `LspClient::start`'s own
+/// `wait_until_ready` already closes most of the readiness race up front;
+/// this only needs to hedge against what that workspace-level wait can't
+/// see, not re-absorb a real indexing delay on every lookup.
+const DEFINITION_RETRIES: u32 = 2;
+const DEFINITION_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 /// Attempts to resolve each of `ambiguous` (calls already known to match
 /// more than one candidate by name) via that call's own language server,
@@ -46,29 +62,24 @@ pub(crate) fn resolve_ambiguous_calls(
     candidates_by_name: &HashMap<&str, Vec<&str>>,
     resolved_edges: &mut Vec<ResolvedEdge>,
 ) {
-    let mut clients: HashMap<Language, ClientState> = HashMap::new();
+    let mut clients: HashMap<Language, Option<okf_lsp::LspClient>> = HashMap::new();
 
     for (call, language, relative_path) in ambiguous {
-        let state = clients.entry(*language).or_insert_with(|| ClientState {
-            client: match okf_lsp::LspClient::start(*language, &project.root) {
-                Ok(client) => client,
-                Err(e) => {
-                    eprintln!(
-                        "warning: failed to start a language server for {language}, \
+        let client_slot =
+            clients.entry(*language).or_insert_with(|| {
+                match okf_lsp::LspClient::start(*language, &project.root) {
+                    Ok(client) => client,
+                    Err(e) => {
+                        eprintln!(
+                            "warning: failed to start a language server for {language}, \
                          skipping LSP disambiguation for it: {e:#}"
-                    );
-                    None
+                        );
+                        None
+                    }
                 }
-            },
-            warmed_up: false,
-        });
+            });
 
-        let retries = if state.warmed_up {
-            1
-        } else {
-            DEFINITION_RETRIES
-        };
-        let Some(client) = state.client.as_mut() else {
+        let Some(client) = client_slot.as_mut() else {
             continue;
         };
         let Some(source) = file_sources.get(relative_path.as_str()) else {
@@ -79,22 +90,17 @@ pub(crate) fn resolve_ambiguous_calls(
         };
 
         let mut locations = Vec::new();
-        let mut got_result = false;
-        for attempt in 0..retries {
+        for attempt in 0..DEFINITION_RETRIES {
             match client.definition(&uri, call.call_site.line, call.call_site.character) {
                 Ok(found) if !found.is_empty() => {
                     locations = found;
-                    got_result = true;
                     break;
                 }
-                Ok(_) if attempt + 1 < retries => {
+                Ok(_) if attempt + 1 < DEFINITION_RETRIES => {
                     std::thread::sleep(DEFINITION_RETRY_DELAY);
                 }
                 _ => break,
             }
-        }
-        if got_result {
-            state.warmed_up = true;
         }
         if locations.is_empty() {
             continue;
@@ -129,9 +135,7 @@ pub(crate) fn resolve_ambiguous_calls(
         }
     }
 
-    for state in clients.into_values() {
-        if let Some(client) = state.client {
-            client.shutdown();
-        }
+    for client in clients.into_values().flatten() {
+        client.shutdown();
     }
 }

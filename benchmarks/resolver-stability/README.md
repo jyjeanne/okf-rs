@@ -21,6 +21,15 @@ a resolver finding worth reporting on its own.
   is the one that actually makes the resolver-version measurement runnable: `diff`'s two-git-ref
   comparison has nothing to check out when the two bundles came from the *identical* source
   snapshot, analyzed under two different resolver versions.
+- [`okf_lsp::LspClient::wait_until_ready`](../../crates/okf-lsp/src/lib.rs) — real readiness gating
+  for the control experiment below: waits for the server's own `$/progress` indexing signal to
+  settle before any query is sent, instead of inferring readiness from whether an arbitrary first
+  query happened to succeed (the mechanism behind the disagreement this benchmark originally found —
+  see "Results so far").
+- [`okf-rs generate --check-determinism --check-determinism-repeats N`](../../crates/okf-cli/src/main.rs)
+  — the control experiment itself, generalized from one pairwise comparison to an actual
+  within-version disagreement distribution: `N` independent analyses, every run after the first
+  diffed against run 1, reporting how many comparisons each concept flipped in.
 
 ## Run it
 
@@ -41,7 +50,16 @@ Two toolchains can be installed side by side via `rustup`, without needing GitHu
 guaranteed deterministic run-to-run even under one fixed resolver version (see Results below). Run
 `okf-rs generate . --lsp --check-determinism` (twice, independently, same version) first, so a
 cross-version difference isn't mistaken for a real version-caused one when it's actually baseline
-indexing noise.
+indexing noise. For more than one pairwise sample — two repeats gives you one pair, not a
+disagreement *rate* — add `--check-determinism-repeats N`:
+
+```sh
+okf-rs generate . --lsp --check-determinism --check-determinism-repeats 10
+```
+
+This runs `N` independent in-process analyses and diffs every run after the first against run 1,
+reporting how many of the `N-1` comparisons each concept flipped in — the shape needed to say
+"X% of concepts disagree within one version," not just "these two runs happened to differ."
 
 ## Results so far
 
@@ -74,7 +92,54 @@ indistinguishable from an actually-clean diff. See
 Phase G, "`diff-bundles`, and the real measurement it made possible," for the full writeup,
 including the exact commands run and the regression test that reproduces this ratio.
 
+### The self-disagreement's mechanism, and what fixing it changed
+
+External review (recorded in
+[`docs/feedback/2026-08-rust-analyzer-self-disagreement-review.md`](../../docs/feedback/2026-08-rust-analyzer-self-disagreement-review.md))
+named a concrete cause worth ruling in before calling the numbers above baseline noise: a query
+landing before the server has actually finished loading the workspace. Read against
+`okf_lsp`/`okf_analyzer`'s real client (not guessed at), that's exactly what was happening —
+`resolve_ambiguous_calls` gated its retry budget on whether *any* earlier query for a language had
+already succeeded, a first-response proxy for "the workspace is ready" that was itself a source of
+the disagreement. `okf_lsp::LspClient` now gates on the server's own `$/progress` indexing signal
+instead (`LspClient::wait_until_ready`), and the per-query retry budget applies to every ambiguous
+lookup, not just the first one per language — see
+[`docs/improvement-plan-provenance-diff.md`](../../docs/improvement-plan-provenance-diff.md)'s
+Phase H for the full mechanism writeup.
+
+Measured again, for real, after the fix:
+
+- **Ordinary conditions** (`--check-determinism`, the default two repeats, one run at a time):
+  three separate invocations, all clean — `Deterministic: 2 independent generate --lsp runs on .
+  all produced byte-identical output (1173 concepts)` every time. A real improvement over the
+  pre-fix 2/2 and 1/3 disagreement rates above, at the same repeat count most projects would
+  actually run in CI.
+- **Stress test** (`--check-determinism-repeats 6`, deliberately run *concurrently with a second,
+  independent instance of the same command* on a 4-core sandbox — the harshest case, not the
+  typical one): still found one run (the very first `LspClient` started, cold-starting directly
+  into contention from the second job) disagreeing with all 5 later runs on exactly one edge:
+
+  ```
+  Non-deterministic: 2 file(s) flipped across 6 independent `generate --lsp` runs on . :
+    5/5 repeat run(s) disagreed with run 1 on at least one file
+    functions/crates/okf-graph/src/Graph/get.md: differed in 5/5 comparison(s) against run 1
+    functions/crates/okf-graph/src/Graph/transitive_callers.md: differed in 5/5 comparison(s) against run 1
+  ```
+
+  The content diff: run 1's render was missing one edge every other run found
+  (`Graph::get → Graph::transitive_callers`) — a `textDocument/definition` query that came back
+  empty on the first attempt and stayed empty through all 4 retries (~1.2s) while the concurrent
+  job starved it of CPU. Applying the review's own diagnostic — "look at which concepts flipped: if
+  they cluster... it is a race with load state and it is fixable" — this flip is a single, tightly
+  clustered pair, not scattered across unrelated plain source, confirming the mechanism rather than
+  turning up something stranger. Readiness gating narrows the window; it doesn't close it under
+  sustained, adversarial CPU contention, and this benchmark now says so with a number instead of a
+  guess.
+
 **Open**: this measurement hasn't been run on a corpus other than okf-rs's own source, or across a
 wider resolver-version gap. A different codebase's ambiguous-call density could plausibly show a
 different rate — that's exactly the kind of project-specific number this benchmark exists to let a
-team collect for itself rather than assume from one worked example.
+team collect for itself rather than assume from one worked example. The residual stress-test gap
+above is also open: further hardening (a larger `READY_QUIET_PERIOD`, or a harder readiness signal
+than a quiet-period heuristic) is possible future work, not something this phase claims to have
+closed.

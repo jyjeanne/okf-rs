@@ -104,6 +104,19 @@ enum Command {
         /// non-determinism.
         #[arg(long)]
         check_determinism: bool,
+        /// With `--check-determinism`, how many independent analysis runs
+        /// to compare instead of the default two. Two runs give one
+        /// pairwise comparison -- enough to detect non-determinism, but
+        /// not enough to say how often it happens: a rate like "1 file
+        /// differed" only means something measured against a real
+        /// within-version disagreement distribution, which needs more
+        /// than one comparison to build. Every run after the first is
+        /// diffed against run 1, and the report tallies how many
+        /// comparisons each concept flipped in -- see
+        /// `benchmarks/resolver-stability/README.md`. Requires
+        /// `--check-determinism`; must be at least 2.
+        #[arg(long, default_value_t = 2)]
+        check_determinism_repeats: u32,
         /// Verify the bundle at `--output` is up to date with source
         /// instead of writing to it: re-analyzes the project fresh (always
         /// bypassing the incremental cache, regardless of `--no-cache`),
@@ -535,6 +548,7 @@ fn run(command: Command) -> Result<ExitCode> {
             enrich_api_key,
             dita,
             check_determinism,
+            check_determinism_repeats,
             check_fresh,
         } => {
             if check_determinism && check_fresh {
@@ -542,13 +556,21 @@ fn run(command: Command) -> Result<ExitCode> {
                     "--check-determinism and --check-fresh check different things (reproducibility vs. staleness) and can't be combined in one run — run them separately"
                 );
             }
+            if check_determinism_repeats != 2 && !check_determinism {
+                anyhow::bail!("--check-determinism-repeats requires --check-determinism");
+            }
             if check_determinism {
                 if enrich {
                     anyhow::bail!(
                         "--check-determinism can't be combined with --enrich: enrichment depends on a live endpoint's response, which isn't guaranteed byte-identical across calls, and would report non-determinism unrelated to what this flag actually checks"
                     );
                 }
-                cmd_check_determinism(&path, lsp, dita.as_deref())
+                if check_determinism_repeats < 2 {
+                    anyhow::bail!(
+                        "--check-determinism-repeats needs at least 2 runs to compare anything"
+                    );
+                }
+                cmd_check_determinism(&path, lsp, dita.as_deref(), check_determinism_repeats)
             } else if check_fresh {
                 if enrich {
                     anyhow::bail!(
@@ -863,62 +885,98 @@ fn cmd_generate(
 }
 
 /// `okf-rs generate --check-determinism`: runs the analysis pipeline
-/// twice, independently, and diffs the two renders byte-for-byte instead
-/// of writing a bundle. Neither run touches `--output` or the real
-/// `.okf-cache.json` — each gets its own fresh, throwaway cache and its
-/// own throwaway render directory, both cleaned up on return.
+/// `repeats` times (2 by default), independently, and diffs every run
+/// after the first against run 1, byte-for-byte, instead of writing a
+/// bundle. No run touches `--output` or the real `.okf-cache.json` — each
+/// gets its own fresh, throwaway cache and its own throwaway render
+/// directory, all cleaned up on return.
 ///
 /// This exists specifically because determinism means different things
 /// on the two paths `generate` can take: the default tree-sitter-only
-/// path has no input but the source text itself, so two runs are
-/// expected to always agree. `--lsp` resolution asks a real language
-/// server, whose answer can depend on that server's own index state in
-/// whatever environment it's running in — see `ROADMAP.md`'s Phase 2
-/// known limitations for the concrete local-vs-cold-CI-runner scenario
-/// this flag exists to let someone actually check for, rather than
-/// discover the hard way in CI.
+/// path has no input but the source text itself, so every run is expected
+/// to always agree. `--lsp` resolution asks a real language server, whose
+/// answer can depend on that server's own index state in whatever
+/// environment it's running in — see `ROADMAP.md`'s Phase 2 known
+/// limitations for the concrete local-vs-cold-CI-runner scenario this
+/// flag exists to let someone actually check for, rather than discover
+/// the hard way in CI.
+///
+/// The default `repeats: 2` gives one pairwise comparison: enough to
+/// *detect* non-determinism, not enough to say how often it happens. A
+/// higher `--check-determinism-repeats` builds an actual within-version
+/// disagreement distribution instead of one sample pair — see
+/// `benchmarks/resolver-stability/README.md`.
 fn cmd_check_determinism(
     path: &std::path::Path,
     lsp: bool,
     dita: Option<&std::path::Path>,
+    repeats: u32,
 ) -> Result<ExitCode> {
     let project = Project::load(path)?;
 
-    let mut cache1 = okf_analyzer::AnalysisCache::default();
-    let (mut result1, _) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache1, lsp)?;
-    let mut cache2 = okf_analyzer::AnalysisCache::default();
-    let (mut result2, _) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache2, lsp)?;
+    let mut runs = Vec::new();
+    let mut concept_count = 0usize;
+    for i in 0..repeats {
+        let mut cache = okf_analyzer::AnalysisCache::default();
+        let (mut result, _) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache, lsp)?;
 
-    if let Some(dita_path) = dita {
-        let (concepts1, _) = okf_dita::import_dita(dita_path)
-            .with_context(|| format!("failed to import DITA corpus at {}", dita_path.display()))?;
-        let (concepts2, _) = okf_dita::import_dita(dita_path)
-            .with_context(|| format!("failed to import DITA corpus at {}", dita_path.display()))?;
-        result1.concepts.extend(concepts1);
-        result2.concepts.extend(concepts2);
+        if let Some(dita_path) = dita {
+            let (concepts, _) = okf_dita::import_dita(dita_path).with_context(|| {
+                format!("failed to import DITA corpus at {}", dita_path.display())
+            })?;
+            result.concepts.extend(concepts);
+        }
+
+        let dir = ScratchDir::new(&format!("determinism-run{}", i + 1));
+        // No source_revision: this is a throwaway comparison between
+        // independent in-process analyses, not a real generate -- see
+        // write_bundle's docs.
+        okf_generator::write_bundle(&result.concepts, dir.path(), None)?;
+        concept_count = result.concepts.len();
+        runs.push(dir);
     }
 
-    let run1 = ScratchDir::new("determinism-run1");
-    let run2 = ScratchDir::new("determinism-run2");
-    // No source_revision: this is a throwaway comparison between two
-    // in-process analyses, not a real generate -- see write_bundle's docs.
-    okf_generator::write_bundle(&result1.concepts, run1.path(), None)?;
-    okf_generator::write_bundle(&result2.concepts, run2.path(), None)?;
+    // Every run after the first, diffed against run 1 -- `comparisons`
+    // pairwise comparisons total, not one. `flip_counts` tallies, per
+    // relative path, how many of those comparisons it differed in;
+    // `disagreeing_runs` counts how many *runs* (not files) disagreed with
+    // run 1 on at least one file. Run 1's own files are collected once
+    // (`run1_files`) and reused for every comparison via `diff_file_maps`
+    // rather than re-reading and re-hashing run 1's whole rendered tree
+    // from disk on each of the `comparisons` comparisons.
+    let comparisons = runs.len() - 1;
+    let mut run1_files = BTreeMap::new();
+    collect_files(runs[0].path(), runs[0].path(), &mut run1_files)?;
+    let mut flip_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut disagreeing_runs = 0usize;
+    for (i, run) in runs.iter().enumerate().skip(1) {
+        let mut run_files = BTreeMap::new();
+        collect_files(run.path(), run.path(), &mut run_files)?;
+        let diffs = diff_file_maps(&run1_files, &run_files, "run 1", &format!("run {}", i + 1));
+        if diffs.is_empty() {
+            continue;
+        }
+        disagreeing_runs += 1;
+        for d in &diffs {
+            let path = d.split(" (").next().unwrap_or(d).to_string();
+            *flip_counts.entry(path).or_insert(0) += 1;
+        }
+    }
 
-    let diffs = diff_dirs(run1.path(), run2.path(), "run 1", "run 2")?;
-    if diffs.is_empty() {
+    let lsp_suffix = if lsp { " --lsp" } else { "" };
+    if flip_counts.is_empty() {
         println!(
-            "Deterministic: two independent `generate{}` runs on {} produced byte-identical output ({} concepts).",
-            if lsp { " --lsp" } else { "" },
+            "Deterministic: {} independent `generate{lsp_suffix}` run{} on {} all produced byte-identical output ({concept_count} concepts).",
+            runs.len(),
+            if runs.len() == 1 { "" } else { "s" },
             path.display(),
-            result1.concepts.len(),
         );
         Ok(ExitCode::SUCCESS)
     } else {
         println!(
-            "Non-deterministic: {} file(s) differed between two independent `generate{}` runs on {}{}:",
-            diffs.len(),
-            if lsp { " --lsp" } else { "" },
+            "Non-deterministic: {} file(s) flipped across {} independent `generate{lsp_suffix}` runs on {}{}:",
+            flip_counts.len(),
+            runs.len(),
             path.display(),
             if lsp {
                 " (expected culprit: language-server index state, not source text — see ROADMAP.md's Phase 2 known limitations)"
@@ -926,8 +984,11 @@ fn cmd_check_determinism(
                 " (unexpected on the tree-sitter-only path — please report this as a bug)"
             },
         );
-        for d in &diffs {
-            println!("  {d}");
+        println!(
+            "  {disagreeing_runs}/{comparisons} repeat run(s) disagreed with run 1 on at least one file"
+        );
+        for (path, count) in &flip_counts {
+            println!("  {path}: differed in {count}/{comparisons} comparison(s) against run 1");
         }
         Ok(ExitCode::FAILURE)
     }
@@ -1050,7 +1111,20 @@ fn diff_dirs(
     collect_files(a, a, &mut a_files)?;
     let mut b_files = BTreeMap::new();
     collect_files(b, b, &mut b_files)?;
+    Ok(diff_file_maps(&a_files, &b_files, label_a, label_b))
+}
 
+/// The comparison core of [`diff_dirs`], factored out so a caller that
+/// needs to diff the *same* side against several others (e.g.
+/// `cmd_check_determinism` comparing run 1 against every later run) can
+/// call [`collect_files`] on that shared side exactly once instead of
+/// paying disk I/O to re-read and re-hash it on every comparison.
+fn diff_file_maps(
+    a_files: &BTreeMap<String, Vec<u8>>,
+    b_files: &BTreeMap<String, Vec<u8>>,
+    label_a: &str,
+    label_b: &str,
+) -> Vec<String> {
     let all_paths: std::collections::BTreeSet<&String> =
         a_files.keys().chain(b_files.keys()).collect();
     let mut diffs = Vec::new();
@@ -1065,7 +1139,7 @@ fn diff_dirs(
             (None, None) => unreachable!("path came from one of the two maps"),
         }
     }
-    Ok(diffs)
+    diffs
 }
 
 fn collect_files(
