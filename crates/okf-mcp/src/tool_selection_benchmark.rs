@@ -190,6 +190,63 @@ pub fn scores_correctly(chosen: &str, expected: &str) -> bool {
     chosen == expected
 }
 
+/// Whether `response` — the real, well-formed output of a *wrong*
+/// tool/relation call — is one of `okf-query`'s own "nothing found"
+/// sentinels (`"No callers found for..."`, `` "`id` doesn't call
+/// anything..." ``, `"No cycles found..."`, and the rest of that family;
+/// see `crates/okf-query/src/lib.rs`, every `graph_*` function's own
+/// empty-result branch). This is [`crate::tool_selection_live::FailureMode::DetectableWrong`]'s
+/// scoring rule: a **conservative, narrow** operationalization of
+/// "detectable wrong" (external review's third failure category,
+/// `docs/improvement-plan-provenance-diff.md`'s Phase G), chosen
+/// deliberately over trying to model whether a live model itself would
+/// notice its own mistake — this benchmark only ever scores one tool call
+/// per question, never asks a model to reflect on its own answer, so
+/// there's no "did it notice" signal to read at all. What *is*
+/// measurable without a second model call: whether the wrong tool's
+/// response is structurally empty/negative for these arguments — a
+/// signal any downstream consumer could act on without knowing the right
+/// answer, unlike a populated-but-wrong response (still scored
+/// `SilentWrong`), which looks exactly as plausible as a correct one.
+/// This deliberately does **not** try to catch the broader "populated,
+/// but obviously about a different subject" case (e.g. a `stats`
+/// breakdown returned for a "who calls X" question) — that's real
+/// information a downstream consumer might also use, but it needs a
+/// notion of expected response *shape* per question this benchmark
+/// doesn't build, so it stays `SilentWrong` rather than being folded into
+/// a heuristic broad enough to risk false positives.
+///
+/// Matched against an exhaustive list of `okf-query`'s actual sentinel
+/// prefixes (one per `graph_*` empty-result branch,
+/// `crates/okf-query/src/lib.rs`), not a bare `starts_with("No ")` — a
+/// generic "No "-prefix check would also match any future *populated*
+/// response that happens to start with those two characters (e.g. a
+/// concept description, or new response text prefixed "No wait, ..."),
+/// silently misclassifying a real `SilentWrong` as `DetectableWrong` and
+/// undermining the exact distinction this scoring rule exists to keep
+/// trustworthy. Update this list alongside any new/changed empty-result
+/// message in `okf-query`, the same way `questions()` above is kept in
+/// sync with `graph`'s own relation enum.
+const NEGATIVE_RESPONSE_PREFIXES: &[&str] = &[
+    "No callers found for",
+    "No public concepts found",
+    "No cycles found in the call graph",
+    "No isolated concepts found",
+    "No cross-module call dependencies found",
+    "No packages found to layer",
+    "No packages found (no Package concepts in the bundle)",
+    "No design patterns detected",
+    "No REST endpoints, database models, or event-flow participants detected",
+    "No call path found from",
+];
+
+pub fn is_negative_response(response: &str) -> bool {
+    NEGATIVE_RESPONSE_PREFIXES
+        .iter()
+        .any(|prefix| response.starts_with(prefix))
+        || response.contains("doesn't call anything")
+}
+
 /// The shared ground-truth fixture every [`Question`] above is checked
 /// against — two packages/modules with a real cross-package call (for
 /// `callers`/`callees`/`path`/`explain`/`api`/`modules`/`layers`/
@@ -429,6 +486,73 @@ mod tests {
         assert!(scores_correctly("callers", "callers"));
         assert!(!scores_correctly("callees", "callers"));
         assert!(!scores_correctly("graph_callers", "callers"));
+    }
+
+    #[test]
+    fn is_negative_response_recognizes_the_okf_query_empty_result_sentinels() {
+        assert!(is_negative_response(
+            "No callers found for `functions/pkg-a/foo`"
+        ));
+        assert!(is_negative_response("No cycles found in the call graph"));
+        assert!(is_negative_response("No isolated concepts found"));
+        assert!(is_negative_response(
+            "`functions/pkg-b/bar` doesn't call anything (or only calls unresolved/ambiguous targets)"
+        ));
+        assert!(!is_negative_response("functions/pkg-a/foo — Rust Function"));
+        assert!(!is_negative_response(
+            "3 public concepts:\n  Function     functions/pkg-a/foo"
+        ));
+    }
+
+    /// Regression test for the exact false-positive risk a bare
+    /// `starts_with("No ")` heuristic would have: real, populated content
+    /// that happens to start with "No " (e.g. a concept description, or
+    /// unrelated response text) is never one of `okf-query`'s actual
+    /// sentinels, and must not be misclassified as `DetectableWrong`.
+    #[test]
+    fn is_negative_response_does_not_false_positive_on_populated_text_starting_with_no() {
+        assert!(!is_negative_response(
+            "No description available for functions/pkg-a/foo — see the source instead"
+        ));
+        assert!(!is_negative_response(
+            "No wait, this bundle actually has 3 packages"
+        ));
+    }
+
+    /// The real behavioral distinction [`is_negative_response`] exists to
+    /// detect, verified directly against the fixture rather than assumed:
+    /// on this bundle, swapping `callers`/`callees` for either of the two
+    /// questions built around the `foo -> bar` edge produces a genuine
+    /// empty-result sentinel (`bar` has no outgoing calls of its own;
+    /// `foo` has no callers of its own) -- confirming there's a real
+    /// signal here to classify `DetectableWrong` against, not a heuristic
+    /// that would never fire on this benchmark's own fixture.
+    #[test]
+    fn callers_callees_swap_on_this_fixture_produces_a_real_negative_response() {
+        let dir = fixture_bundle();
+        let cache = BundleCache::new();
+
+        // "Who calls bar?" (correct: callers) answered with `callees`
+        // instead: bar has no outgoing calls at all.
+        let wrong_callees_for_bar = tools::call(
+            "graph",
+            &serde_json::json!({ "relation": "callees", "id": "functions/pkg-b/bar" }),
+            dir.path(),
+            &cache,
+        )
+        .unwrap();
+        assert!(is_negative_response(&wrong_callees_for_bar));
+
+        // "What does foo call?" (correct: callees) answered with
+        // `callers` instead: nothing in the fixture calls foo.
+        let wrong_callers_for_foo = tools::call(
+            "graph",
+            &serde_json::json!({ "relation": "callers", "id": "functions/pkg-a/foo" }),
+            dir.path(),
+            &cache,
+        )
+        .unwrap();
+        assert!(is_negative_response(&wrong_callers_for_foo));
     }
 
     /// The claim this whole benchmark's fixed question set rests on:

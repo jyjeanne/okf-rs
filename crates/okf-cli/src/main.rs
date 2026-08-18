@@ -271,6 +271,33 @@ enum Command {
         #[arg(long)]
         ci: bool,
     },
+    /// Compares two already-generated OKF bundle directories directly,
+    /// with the same provenance-aware classification `diff --ci` reports
+    /// (source/resolver/confidence changes, plus the resolver-only rate).
+    /// Unlike `diff`, this never touches git: `diff`'s two-git-ref
+    /// comparison has nothing to check out when the two bundles being
+    /// compared came from the *same* source snapshot re-analyzed under
+    /// different conditions — most concretely, two `generate --lsp` runs
+    /// against two different installed resolver versions, the exact
+    /// measurement `docs/improvement-plan-provenance-diff.md`'s Phase G
+    /// asks a project to run on its own corpus to decide whether
+    /// `DiffPolicy::resolver_changes` can safely default to `"ignore"`.
+    /// Not limited to that one use case, though: any two independently
+    /// generated bundles of conceptually the same project (e.g. `--lsp`
+    /// on vs. off) can be compared the same way.
+    DiffBundles {
+        /// The "before" bundle directory (e.g. generated with the older
+        /// resolver version).
+        bundle_a: PathBuf,
+        /// The "after" bundle directory (e.g. generated with the newer
+        /// resolver version).
+        bundle_b: PathBuf,
+        /// Project directory to load `okf.toml`'s `[diff]` policy from
+        /// (the same policy `diff --ci` reads) — not where either bundle
+        /// lives, since a bundle directory has no `okf.toml` of its own.
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
     /// Renders the same change-impact analysis as `impact`, but as a
     /// Markdown report meant to be posted as a pull-request comment (a
     /// leading HTML marker comment lets a bot find and update its own
@@ -610,6 +637,11 @@ fn run(command: Command) -> Result<ExitCode> {
             path,
             ci,
         } => cmd_diff(&from_ref, &to_ref, &path, ci),
+        Command::DiffBundles {
+            bundle_a,
+            bundle_b,
+            project,
+        } => cmd_diff_bundles(&bundle_a, &bundle_b, &project),
         Command::Impact {
             from_ref,
             to_ref,
@@ -1569,6 +1601,50 @@ fn cmd_diff(from_ref: &str, to_ref: &str, path: &std::path::Path, ci: bool) -> R
     Ok(ExitCode::SUCCESS)
 }
 
+/// `okf-rs diff-bundles <bundle-a> <bundle-b>`: the same provenance-aware
+/// classification `diff --ci` reports, but comparing two bundle
+/// directories already on disk instead of re-analyzing two git refs — see
+/// the `DiffBundles` variant's own doc comment for why this needs to
+/// exist as a separate command rather than another `diff` flag (there is
+/// no git ref to check out when the two bundles came from the same source
+/// snapshot under two different resolver versions).
+///
+/// Always renders the `--ci`-style classified report (reusing
+/// `render_ci_report` unchanged) rather than `diff`'s own plain
+/// added/removed/changed listing: a bare list of "changed" concepts with
+/// no provenance context would defeat the one thing this command exists
+/// to surface, and — for its primary use case, comparing two resolver
+/// versions against identical source — `added`/`removed` are expected to
+/// always be empty anyway.
+fn cmd_diff_bundles(
+    bundle_a: &std::path::Path,
+    bundle_b: &std::path::Path,
+    project: &std::path::Path,
+) -> Result<ExitCode> {
+    let concepts_a = okf_parser::read_bundle(bundle_a)
+        .with_context(|| format!("reading bundle at {}", bundle_a.display()))?;
+    let concepts_b = okf_parser::read_bundle(bundle_b)
+        .with_context(|| format!("reading bundle at {}", bundle_b.display()))?;
+
+    let report = okf_analyzer::diff(&concepts_a, &concepts_b);
+    let policy = okf_core::config::load(project).diff;
+    let summary = okf_analyzer::ci_summary(&report);
+    let resolver_only_rate = okf_analyzer::resolver_only_rate(&report);
+    let (text, failed) = render_ci_report(
+        &summary,
+        resolver_only_rate,
+        policy,
+        &bundle_a.display().to_string(),
+        &bundle_b.display().to_string(),
+    );
+    println!("{text}");
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 /// `okf-rs diff --ci`: classifies `report` into source/resolver/confidence
 /// counts (`okf_analyzer::ci_summary`), evaluates them against `okf.toml`'s
 /// `[diff]` policy (`okf_core::config::DiffPolicy`), and prints/returns
@@ -1583,7 +1659,12 @@ fn cmd_diff_ci(
 ) -> Result<ExitCode> {
     let policy = okf_core::config::load(path).diff;
     let summary = okf_analyzer::ci_summary(report);
-    let (text, failed) = render_ci_report(&summary, policy, from_ref, to_ref);
+    // Computed from the full `DiffReport` (not `summary`) -- see
+    // `okf_analyzer::resolver_only_rate`'s own docs for why: `CiSummary`'s
+    // `source_changes` also folds in whole-concept adds/removes and
+    // signature-only changes, which would dilute this rate.
+    let resolver_only_rate = okf_analyzer::resolver_only_rate(report);
+    let (text, failed) = render_ci_report(&summary, resolver_only_rate, policy, from_ref, to_ref);
     println!("{text}");
     Ok(if failed {
         ExitCode::FAILURE
@@ -1598,6 +1679,12 @@ fn cmd_diff_ci(
 /// (`docs/improvement-plan-provenance-diff.md`'s Phase C) is directly
 /// unit-testable without a real git repository or language server,
 /// the same reason `render_review_markdown` is split out from `cmd_review`.
+/// `resolver_only_rate` is a separate parameter rather than a field this
+/// function derives from `summary` itself: `okf_analyzer::resolver_only_rate`
+/// needs the full `DiffReport` (not `CiSummary`'s reduced counts) to avoid
+/// concept-level churn diluting it — see that function's own docs — and
+/// threading it through as plain data keeps this function exactly as
+/// unit-testable against hand-built values as it was before.
 ///
 /// Source changes are never configurable — always reported (❌) and
 /// always failure-worthy. Resolver/confidence changes are reported with
@@ -1605,6 +1692,7 @@ fn cmd_diff_ci(
 /// `"ignore"`) and fail the exit code only under `"fail"`.
 fn render_ci_report(
     summary: &okf_analyzer::CiSummary,
+    resolver_only_rate: Option<f64>,
     policy: okf_core::config::DiffPolicy,
     from_ref: &str,
     to_ref: &str,
@@ -1630,6 +1718,23 @@ fn render_ci_report(
             "{icon} RESOLVER CHANGES: {}",
             summary.resolver_changes
         ));
+        // See `okf_analyzer::resolver_only_rate`'s own docs: the empirical
+        // number that decides whether `resolver_changes` is worth
+        // defaulting to "ignore" in this project's own `okf.toml`, rather
+        // than guessing from one worked example. `{:.1}`, not `{:.0}`:
+        // found by actually running `diff-bundles` against a real pair of
+        // resolver-version bundles (see `docs/improvement-plan-provenance-diff.md`'s
+        // Phase G) -- a real 99.85% (2 genuine source changes out of 1294
+        // relationship-level changes) rounded to a bare "100%" at zero
+        // decimal places, indistinguishable from an actually-clean diff
+        // with zero source changes, which is exactly the distinction this
+        // number exists to preserve.
+        if let Some(rate) = resolver_only_rate {
+            lines.push(format!(
+                "   ({:.1}% of relationship-level changes in this diff were resolver-only)",
+                rate * 100.0
+            ));
+        }
     }
     if summary.confidence_changes > 0 {
         let (icon, fails) = policy_icon(policy.confidence_changes);
@@ -1870,7 +1975,7 @@ mod diff_ci_tests {
     #[test]
     fn no_changes_exits_zero() {
         let (text, failed) =
-            render_ci_report(&CiSummary::default(), DiffPolicy::default(), "a", "b");
+            render_ci_report(&CiSummary::default(), None, DiffPolicy::default(), "a", "b");
         assert!(!failed);
         assert!(text.contains("No changes between a and b"));
         assert!(text.contains("exit code: 0"));
@@ -1882,7 +1987,7 @@ mod diff_ci_tests {
             confidence_changes: 2,
             ..Default::default()
         };
-        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        let (text, failed) = render_ci_report(&summary, None, DiffPolicy::default(), "a", "b");
         assert!(!failed);
         assert!(text.contains("ℹ️"));
         assert!(text.contains("CONFIDENCE CHANGES: 2"));
@@ -1895,11 +2000,92 @@ mod diff_ci_tests {
             resolver_changes: 4,
             ..Default::default()
         };
-        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        let (text, failed) = render_ci_report(&summary, Some(1.0), DiffPolicy::default(), "a", "b");
         assert!(!failed);
         assert!(text.contains("⚠️"));
         assert!(text.contains("RESOLVER CHANGES: 4"));
         assert!(text.contains("exit code: 0"));
+    }
+
+    /// The empirical number `docs/improvement-plan-provenance-diff.md`'s
+    /// Phase G adds: when every relationship-level change in the diff is
+    /// resolver-only, `--ci` says so as a rate, not just a bare count --
+    /// the number a project would actually watch across real resolver
+    /// version bumps to decide whether `resolver_changes` can default to
+    /// `"ignore"` in its own `okf.toml`. `resolver_only_rate` is passed in
+    /// directly here (not derived from `summary`) -- see `render_ci_report`'s
+    /// own docs for why -- so this test locks in only the rendering, not
+    /// the rate computation itself (covered by `okf_analyzer::resolver_only_rate`'s
+    /// own tests against a real `DiffReport`).
+    #[test]
+    fn resolver_only_change_reports_its_share_of_relationship_level_changes() {
+        let summary = CiSummary {
+            resolver_changes: 4,
+            ..Default::default()
+        };
+        let (text, _) = render_ci_report(&summary, Some(1.0), DiffPolicy::default(), "a", "b");
+        assert!(
+            text.contains("100.0% of relationship-level changes in this diff were resolver-only")
+        );
+    }
+
+    /// A rate that isn't a round number renders at one decimal place, not
+    /// rounded to a bare "100%" that would be indistinguishable from an
+    /// actually-perfect rate -- the exact bug found by running
+    /// `diff-bundles` against a real pair of resolver-version bundles
+    /// (99.85% rounding to "100%" at zero decimal places, hiding that 2
+    /// real source changes were present). `0.998454...` is the literal
+    /// rate from that run (1292 resolver-only out of 1294 total
+    /// relationship-level changes).
+    #[test]
+    fn resolver_only_rate_renders_at_one_decimal_place_not_rounded_to_a_bare_100_percent() {
+        let summary = CiSummary {
+            source_changes: 2,
+            resolver_changes: 1292,
+            ..Default::default()
+        };
+        let (text, _) = render_ci_report(
+            &summary,
+            Some(1292.0 / 1294.0),
+            DiffPolicy::default(),
+            "a",
+            "b",
+        );
+        assert!(
+            text.contains("99.8% of relationship-level changes in this diff were resolver-only")
+        );
+        assert!(!text.contains("100% of relationship-level changes"));
+    }
+
+    /// A resolver-only change mixed with a genuine source rewire reports a
+    /// rate below 100% -- confirming this isn't just "resolver_changes >
+    /// 0 -> print 100%" but an actual share of the total.
+    #[test]
+    fn resolver_only_rate_is_below_100_percent_when_source_changes_also_present() {
+        let summary = CiSummary {
+            source_changes: 1,
+            resolver_changes: 1,
+            ..Default::default()
+        };
+        let (text, _) = render_ci_report(&summary, Some(0.5), DiffPolicy::default(), "a", "b");
+        assert!(
+            text.contains("50.0% of relationship-level changes in this diff were resolver-only")
+        );
+    }
+
+    /// `resolver_only_rate: None` (the "no relationship-level change pair
+    /// to take a rate over" case) renders no rate line at all, rather than
+    /// e.g. printing "0%" or panicking on the `None` -- `render_ci_report`
+    /// only ever prints the rate line when it actually has one.
+    #[test]
+    fn no_rate_line_is_rendered_when_resolver_only_rate_is_none() {
+        let summary = CiSummary {
+            resolver_changes: 4,
+            ..Default::default()
+        };
+        let (text, _) = render_ci_report(&summary, None, DiffPolicy::default(), "a", "b");
+        assert!(text.contains("RESOLVER CHANGES: 4"));
+        assert!(!text.contains("resolver-only"));
     }
 
     #[test]
@@ -1908,7 +2094,7 @@ mod diff_ci_tests {
             source_changes: 1,
             ..Default::default()
         };
-        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        let (text, failed) = render_ci_report(&summary, None, DiffPolicy::default(), "a", "b");
         assert!(failed);
         assert!(text.contains("❌ SOURCE CHANGES: 1"));
         assert!(text.contains("exit code: 1"));
@@ -1926,7 +2112,7 @@ mod diff_ci_tests {
             source_changes: 1,
             ..Default::default()
         };
-        let (_, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        let (_, failed) = render_ci_report(&summary, None, DiffPolicy::default(), "a", "b");
         assert!(failed);
     }
 
@@ -1939,7 +2125,7 @@ mod diff_ci_tests {
             source_changes: 2,
             ..Default::default()
         };
-        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        let (text, failed) = render_ci_report(&summary, None, DiffPolicy::default(), "a", "b");
         assert!(failed);
         assert!(text.contains("SOURCE CHANGES: 2"));
     }
@@ -1951,7 +2137,7 @@ mod diff_ci_tests {
             resolver_changes: 1,
             ..Default::default()
         };
-        let (text, failed) = render_ci_report(&summary, DiffPolicy::default(), "a", "b");
+        let (text, failed) = render_ci_report(&summary, Some(0.5), DiffPolicy::default(), "a", "b");
         assert!(
             failed,
             "a source change fails regardless of the resolver change's own policy"
@@ -1970,7 +2156,7 @@ mod diff_ci_tests {
             resolver_changes: PolicyAction::Fail,
             confidence_changes: PolicyAction::Ignore,
         };
-        let (text, failed) = render_ci_report(&summary, policy, "a", "b");
+        let (text, failed) = render_ci_report(&summary, Some(1.0), policy, "a", "b");
         assert!(failed);
         assert!(text.contains("❌"));
         assert!(text.contains("RESOLVER CHANGES: 4"));
@@ -1987,7 +2173,7 @@ mod diff_ci_tests {
             resolver_changes: PolicyAction::Ignore,
             confidence_changes: PolicyAction::Ignore,
         };
-        let (text, failed) = render_ci_report(&summary, policy, "a", "b");
+        let (text, failed) = render_ci_report(&summary, Some(1.0), policy, "a", "b");
         assert!(!failed);
         assert!(text.contains("ℹ️"));
         assert!(text.contains("RESOLVER CHANGES: 3"));
@@ -2003,7 +2189,7 @@ mod diff_ci_tests {
             resolver_changes: PolicyAction::Warn,
             confidence_changes: PolicyAction::Fail,
         };
-        let (text, failed) = render_ci_report(&summary, policy, "a", "b");
+        let (text, failed) = render_ci_report(&summary, None, policy, "a", "b");
         assert!(failed);
         assert!(text.contains("❌"));
         assert!(text.contains("exit code: 1"));
@@ -2025,7 +2211,7 @@ mod diff_ci_tests {
             resolver_changes: PolicyAction::Fail,
             confidence_changes: PolicyAction::Warn,
         };
-        let (_, failed) = render_ci_report(&summary, policy, "a", "b");
+        let (_, failed) = render_ci_report(&summary, Some(1.0), policy, "a", "b");
         assert!(
             failed,
             "resolver_changes = \"fail\" should gate a ProvenanceChange-derived count too"

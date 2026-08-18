@@ -383,6 +383,43 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   literals in Rust test code rather than being force-relocated here — this phase only moved what's
   genuinely more natural as data than code (real fixture bundles, portable JSON), matching its own
   stated scope rather than relocating everything for its own sake.
+- [x] ✅ **Phase G — Benchmark-scoring and CI-signal follow-up** (a later, third round of external
+  review — [`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`](docs/feedback/2026-08-tool-consolidation-benchmark-review.md)):
+  Phase E's live benchmark now distinguishes four outcomes instead of one undifferentiated "wrong"
+  bucket: `Correct`; a *loud* failure (no tool matched, or a schema/argument the model or tool
+  itself rejected); a *detectable-wrong* one (the wrong tool/relation, but its response is itself
+  one of `okf-query`'s own empty/negative "nothing found" sentinels — a signal a downstream consumer
+  could act on without knowing the right answer); and a *silent-wrong* one (a well-formed call to
+  the wrong tool/relation whose response is real, populated data, indistinguishable in shape from a
+  correct answer) — `FailureMode`, `DesignReport::{loud_failures, detectable_wrong, silent_wrong}`,
+  and `[LOUD-FAIL]`/`[DETECTABLE-WRONG]`/`[SILENT-WRONG]` per-question report lines, each also shown
+  as a percentage of the sample alongside the raw count. Making `DetectableWrong` real (not just
+  approximated) required two real code changes: `run_consolidated`/`run_specialized` now always
+  dispatch whichever tool the model actually picked, right or wrong (previously the wrong tool was
+  never even called, so its response was never observed), and `QuestionOutcome::failure_mode` now
+  checks `error` before `tool_selection_correct` — closing, for real, an ordering gap external code
+  review had already flagged as a latent risk once a correct selection could also carry an error. It
+  also
+  reports `requests_per_answered_question()` (`1 / final_answer_accuracy`) — cost expressed in
+  requests, the unit that stays comparable across sessions of any length, rather than tokens.
+  Separately, `okf_analyzer::resolver_only_rate(&DiffReport)` and `okf-rs diff --ci` now surface
+  the share of a diff's relationship-*pair* changes that were resolver-only, so a project can watch
+  that number across its own real resolver-version bumps and decide for itself whether
+  `DiffPolicy::resolver_changes` can default to `ignore` — computed straight from the diff's
+  relationship changes rather than `CiSummary`'s aggregate counts, so unrelated concept-level churn
+  in the same diff can't dilute it. A new `okf-rs diff-bundles <bundle-a> <bundle-b>` command makes
+  that measurement actually runnable: it compares two already-generated bundle directories directly
+  (no git ref to check out when the source never changed, only the resolver version did) with the
+  same `--ci`-style classified report. Run for real against this repository's own source under
+  `rust-analyzer` 1.90.0 vs. 1.94.1: 99.8% of relationship-level changes were resolver-only, and the
+  exercise also caught that `--lsp` resolution isn't fully deterministic run-to-run even holding the
+  resolver version fixed (1.94.1 disagreed with itself on 2/2 repeated `--check-determinism --lsp`
+  runs, 1.90.0 on 1/3) — a real number for a real known limitation, not just an assertion — see
+  [`docs/improvement-plan-provenance-diff.md`](docs/improvement-plan-provenance-diff.md#11-phase-g--benchmark-scoring-and-ci-signal-follow-up-medium-review-august-2026--shipped)
+  for the full writeup, including the `{:.0}%`→`{:.1}%` rounding bug that same run caught (a genuine
+  99.85% was rounding to a bare, misleadingly-clean "100%"). Every benchmark this phase and Phase E
+  ship — MCP tool-selection, MCP session-cost, and resolver-stability — now has a discoverable,
+  how-to-run-it index at [`benchmarks/`](benchmarks/), including the real results above.
 
 Verified by dogfooding. Unit tests cover the new field end-to-end: `okf-lsp` parses `serverInfo.version`
 from a real `initialize` response and — genuinely exercised in this environment, not skipped —

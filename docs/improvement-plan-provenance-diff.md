@@ -726,6 +726,7 @@ table marks ❌, versus how speculative it is.
 | D | Artifact-level reproducibility metadata (no timestamp) | S | Medium — genuinely useful for CI audit ("which okf-rs, which commit, built this bundle"), but scoped down from the reviewer's ask specifically to avoid the determinism regression a naive implementation would cause | Medium — the risk isn't the feature, it's a future contributor "fixing" the missing timestamp back in; mitigated by testing `--check-determinism`/`--check-fresh` directly against this phase and documenting the cut in the module itself | **GO**, with the no-timestamp scope cut as a hard constraint, not a suggestion — ✅ shipped |
 | E | Specialized-vs-consolidated tool-*selection* benchmark | M-L | Medium — genuinely validates (or falsifies) a decision already shipped and already justified on schema-size grounds alone; real value is closing that specific "did we trade selection accuracy for schema size and never check" open question | Medium-High — the only item in this plan requiring a live LLM call, breaking this project's until-now-consistent "every benchmark is offline and deterministic" posture; must stay explicitly opt-in/non-CI to avoid becoming a flaky, costly, silently-skipped test | **CONDITIONAL GO** — build the harness and question set (fully testable without a model) first; only wire up a real endpoint call once someone is prepared to own interpreting a non-deterministic result, matching how `--enrich`'s own network dependency was scoped in from day one — ✅ both halves shipped: harness first, live-endpoint runner (`okf-mcp --benchmark-tool-selection`) once the endpoint/env-var decision was made |
 | F | Golden fixture dataset | S | Low-Medium — organizational, not a new capability; mainly pays for itself by giving Phases B/C's own tests a less ad hoc home | Low — pure relocation/addition, no behavior change | **GO**, opportunistically alongside B/C rather than as a blocking prerequisite — ✅ shipped, and additively (not a relocation of existing tests, which stayed as-is) |
+| G | Failure-mode split, requests-per-answered-question, resolver-only rate (Medium review follow-up) | S | High — directly fixes a real scoring blind spot in E (one accuracy number hiding two different-cost failure modes) and gives C's own policy knob an actual instrument to justify itself with, both from data already collected | Low — pure derived metrics/rendering on already-shipped structs, no new fields, no new network dependency | **GO** — ✅ shipped |
 
 ### Net recommendation
 
@@ -747,11 +748,253 @@ them.
 
 **Where this plan stands:** every phase this document proposed has shipped in full — A, B, C, D,
 E (both the harness and, once its own conditional verdict's deliberate decision was made, the
-live-endpoint runner), and F.
+live-endpoint runner), and F. Phase G below is a follow-up driven by a later round of external
+review of Phases B/C/E specifically, not part of the original proposal.
+
+---
+
+## 11. Phase G — Benchmark-scoring and CI-signal follow-up (Medium review, August 2026) ✅ Shipped
+
+### Objective
+
+A third round of external review (recorded verbatim in
+[`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`](feedback/2026-08-tool-consolidation-benchmark-review.md))
+raised two concrete gaps in what Phases B/C/E shipped, not new features:
+
+1. Phase E's live benchmark reports one selection-accuracy percentage, but the two designs fail in
+   different registers — a specialized tool name a model hallucinates fails loudly (no matching
+   tool, or a schema the model can't satisfy), while a wrong `relation` value inside the
+   consolidated `graph` tool still produces a well-formed call that returns real, just-wrong, data.
+   Collapsing both into one "wrong" count flatters whichever design happens to fail in the cheap
+   (loud) register more often.
+2. Phase E's own break-even reasoning (and `benchmark.rs`'s separate token-based break-even) never
+   expressed cost in the unit the reviewer argues actually matters: tool schemas are re-serialized
+   into every request in a session, so consolidation's savings scale predictably with request
+   count — but the cost of a wrong selection doesn't scale with tokens at all, since one bad
+   selection costs a full extra round trip regardless of how large the conversation prefix is.
+3. Phase B/C's `RelationshipChangeKind::ResolverChange`/`CiSummary.resolver_changes` classification
+   makes "did the resolver change something?" observable, but nothing computed the empirical rate
+   a project would actually need to decide whether `DiffPolicy::resolver_changes` can safely
+   default to `ignore` instead of `warn`.
+
+### What shipped
+
+**Failure-mode split** (`crates/okf-mcp/src/tool_selection_live.rs`): a `FailureMode` enum
+(`Correct`/`LoudFailure`/`SilentWrong`) and `QuestionOutcome::failure_mode()`, derived from data
+each outcome already carried (`error.is_some()` is exactly the loud/silent boundary — no new field
+needed, since every path that fails to produce a usable call already set `error`, and a
+well-formed call to the wrong tool/relation never does). `DesignReport` gained
+`loud_failures()`/`silent_wrong()` counts, and `render()`'s per-question lines are now tagged
+`[LOUD-FAIL]`/`[SILENT-WRONG]` instead of one undifferentiated `[WRONG]`/`[ERROR]` pair, plus a
+breakdown line under the headline selection-accuracy percentage.
+
+**`requests_per_answered_question()`** (same module): `1 / final_answer_accuracy`, i.e. how many
+requests this design spent per question it actually answered correctly — the reviewer's proposed
+unit, computed from data the benchmark already collects rather than a new measurement. `None` when
+no question in the sample was answered correctly (a rate has nothing meaningful to report there;
+the failure-mode breakdown above is the more useful number in that case). Rendered alongside the
+existing token/latency totals.
+
+**`okf_analyzer::resolver_only_rate(&DiffReport)`** (`crates/okf-analyzer/src/lib.rs`): the share
+of relationship-*pair* changes in a diff that were resolver-only (`ResolverChange`/
+`ProvenanceChange`). `None` on an empty diff or one with no `Changed` concepts carrying a
+relationship-level change at all. `okf-rs diff --ci` prints this rate alongside the
+`RESOLVER CHANGES` count (`crates/okf-cli/src/main.rs`'s `render_ci_report`) whenever
+`resolver_changes > 0`, so a project gets the exact number the reviewer's "measure on your own
+corpus" ask calls for on every CI run that has any resolver-only changes to report — rather than
+needing a bespoke script to compute it.
+
+**Correction during review** (a further round of feedback on this same Phase G, also recorded in
+`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`): this function originally shipped
+as a `CiSummary` method, deriving its rate from `CiSummary`'s own three aggregate counters
+(`resolver_changes / (source_changes + resolver_changes + confidence_changes)`). That's a real bug,
+not just a documentation gap — `CiSummary::source_changes` also folds in whole-concept adds/removes
+and signature-only changes (see `ci_summary`), none of which are relationship-*pair* changes at
+all. Any concept churn elsewhere in the same diff inflated that denominator and understated the
+resolver-only rate for reasons that have nothing to do with resolver behavior — exactly the kind of
+silent bias that would lead a project to keep `resolver_changes: warn` when the real, relationship-
+level rate was actually near 100%. Fixed by reading `report.changed[..].relationship_changes`
+directly (the same source `ci_summary` itself reduces from) instead of going through `CiSummary` at
+all: `okf_analyzer::resolver_only_rate` is now a free function taking the full `&DiffReport`, and
+`okf-cli`'s `cmd_diff_ci` (which already has the full report in scope before reducing it to a
+`CiSummary`) computes it there and threads it into `render_ci_report` as a plain `Option<f64>`
+parameter, keeping that function exactly as unit-testable against hand-built values as it was
+before.
+
+This project still hasn't run the actual measurement across a real `rust-analyzer` minor-version
+bump on its own corpus (that needs two pinned toolchain installs, the same cost noted against
+Phase A's own integration-test scenario) — `resolver_only_rate` is the instrument, not the
+measurement itself. `DiffPolicy::resolver_changes`'s own default stays `Warn` (not `Ignore`) until
+a project actually collects that number and finds it consistently near zero.
+
+**Percentages on the failure-mode breakdown**: `LiveReport::render()`'s loud-failure/silent-wrong
+counts are now also rendered as a percentage of the design's sample size (e.g. `1 (7%)`), not just
+a bare count — the accuracy lines already reported percentages, and the failure-mode breakdown
+existed specifically so the two failure costs could be compared at a glance, which a bare count
+doesn't support as directly across sample sizes of different size.
+
+**A fourth failure mode, `DetectableWrong`** (a further round of feedback on this same Phase G,
+recorded in `docs/feedback/2026-08-tool-consolidation-benchmark-review.md`): the original review
+named a third category between loud and silent — a wrong tool a model "might realize" was wrong —
+that Phase G deliberately left unmodeled at first, since this benchmark scores one tool call per
+question and never asks a model to reflect on its own answer, so there's no "did it notice" signal
+to read at all. What *is* measurable without a second model call: whether the wrong tool's response
+is itself one of `okf-query`'s own empty/negative "nothing found" sentinels (`"No callers found for
+..."`, `` "`id` doesn't call anything..." ``, and the rest of that family —
+`okf_mcp::tool_selection_benchmark::is_negative_response`) — a signal any downstream consumer could
+act on without knowing the right answer, unlike a populated-but-wrong response, which looks exactly
+as plausible as a correct one. `FailureMode` gained a fourth variant, `DetectableWrong`, between
+`LoudFailure` and `SilentWrong`; `DesignReport::detectable_wrong()`, a `[DETECTABLE-WRONG]` report
+line (which also prints the actual negative response text, unlike `[SILENT-WRONG]`), and its own
+percentage in the breakdown.
+
+Two real code changes had to happen for this to be honest rather than approximated. First,
+`run_consolidated`/`run_specialized` previously only ever called the *chosen* tool when selection
+was correct (`final_correct = selection_correct && tools::call(...)`) — a wrong selection's actual
+response was never observed at all, so there was no response text for `DetectableWrong` to classify
+against. Both now always dispatch whichever tool/relation the model actually picked, right or
+wrong, and thread the real response (or error) through a new `QuestionOutcome::response:
+Option<String>` field. Second, that same change makes a previously-only-theoretical state
+reachable for real: a *correct* relation selection whose underlying call still errors (e.g. the
+right relation, wrong argument) now genuinely occurs, and `QuestionOutcome::failure_mode` had to
+check `error` *before* `tool_selection_correct` to classify it `LoudFailure` rather than silently
+`Correct` — external code review had already flagged this exact ordering as a latent gap when only
+`error`/`tool_selection_correct` existed and could never actually disagree; adding `response` and
+always calling the tool is what turned that from a theoretical concern into a real, now-fixed, one.
+
+`is_negative_response` is deliberately narrow, and says so in its own doc comment: it only catches
+the case where the *wrong* tool happens to have nothing to report for these specific arguments, not
+the broader "populated, but obviously about a different subject" case (e.g. a `stats` breakdown
+returned for a "who calls X" question) — that stays `SilentWrong`, since building a general notion
+of "expected response shape per question" risks false positives a narrower, verified-against-the-
+real-fixture rule avoids. Verified directly, not assumed: on the shared fixture, swapping
+`callers`/`callees` for either of the two questions built around the `foo -> bar` edge produces a
+genuine empty-result sentinel (`bar` has no outgoing calls of its own; `foo` has no callers of its
+own), confirming there's a real behavioral distinction here to classify against.
+
+### Tests
+
+- `tool_selection_benchmark::tests`: `is_negative_response_recognizes_the_okf_query_empty_result_sentinels`
+  (the sentinel strings, checked against literal `okf-query` output shapes),
+  `callers_callees_swap_on_this_fixture_produces_a_real_negative_response` (verifies the real
+  behavioral distinction against the actual fixture bundle, not just the string-matching rule in
+  isolation).
+- `tool_selection_live::tests`: `failure_mode_distinguishes_all_four_outcomes` (all four
+  `FailureMode` variants, including `DetectableWrong`, against hand-built outcomes),
+  `failure_mode_treats_a_correct_selection_whose_call_still_errored_as_loud_not_correct` (the
+  invariant-ordering fix — `error` checked before `tool_selection_correct`),
+  `design_report_counts_failure_modes_and_requests_per_answered_question` (a 5-outcome design —
+  two correct, one silent-wrong, one detectable-wrong, one loud-failure — asserts all four counts
+  and the resulting `2.5` requests-per-answered-question),
+  `render_shows_failure_mode_counts_as_a_percentage_of_the_whole_sample` (now covering all three
+  wrong-outcome percentages, not just loud/silent),
+  `requests_per_answered_question_is_none_when_nothing_was_answered_correctly`. The pre-existing
+  `live_report_render_includes_the_model_and_both_designs` test is updated to assert the new
+  `[SILENT-WRONG]` tag rather than the old undifferentiated `[WRONG]`, with a response chosen
+  deliberately non-negative so it doesn't accidentally classify as `DetectableWrong`.
+- `okf-analyzer::tests`: `resolver_only_rate_is_none_on_an_empty_diff`,
+  `resolver_only_rate_reports_the_share_of_relationship_level_changes` (a mixed diff — one genuine
+  rewire, one resolver-only pair — asserts the rate is exactly `1/3`, not just "some resolver
+  changes happened"), `resolver_only_rate_is_not_diluted_by_unrelated_whole_concept_churn` (the
+  regression test for the bug described above — a diff with an added whole concept *and* a
+  resolver-only relationship pair still reports `Some(1.0)`, not diluted by the added concept),
+  plus an existing resolver-only-change test extended to assert `Some(1.0)`.
+- `okf-cli::diff_ci_tests`: `resolver_only_change_reports_its_share_of_relationship_level_changes`,
+  `resolver_only_rate_is_below_100_percent_when_source_changes_also_present`,
+  `no_rate_line_is_rendered_when_resolver_only_rate_is_none` — `render_ci_report` now takes the
+  rate as an explicit parameter, so these lock in only the rendering, not the (now separately
+  tested) rate computation itself.
+
+### Acceptance criteria
+
+- A silent-wrong, detectable-wrong, and loud-failure outcome are never counted in more than one
+  bucket, in either the live benchmark's aggregate counts or its per-question rendered lines — the
+  four `FailureMode` variants partition `DesignReport::outcomes` exactly.
+- `DetectableWrong`'s classification is based on the wrong tool's *real* response, actually
+  dispatched (never skipped just because the selection was wrong), not approximated or left unset.
+- A correct relation selection whose underlying tool call still errors is classified `LoudFailure`,
+  never silently `Correct` — `error` is checked before `tool_selection_correct` in
+  `QuestionOutcome::failure_mode`.
+- `requests_per_answered_question()` is derivable from data the benchmark already collects (no new
+  network calls or fields), and reports `None` rather than dividing by zero when nothing was
+  answered correctly.
+- `resolver_only_rate` is visible on every `okf-rs diff --ci` run with a nonzero resolver-change
+  count, with no extra flag needed to see it, and is unaffected by concept-level churn (adds,
+  removes, signature-only changes) elsewhere in the same diff.
+- Every existing Phase A-F test keeps passing unchanged — this phase adds detail and derived
+  metrics to already-shipped surfaces, the same additive posture every earlier phase in this
+  document took (§9).
+
+### `diff-bundles`, and the real measurement it made possible
+
+`resolver_only_rate` and `okf-rs diff --ci` are the *instrument* Phase G shipped; running the actual
+measurement across two real resolver versions on a real corpus — the reviewer's explicit ask — needs
+a way to compare two bundles generated from the identical source snapshot under two different
+resolver versions, which `okf-rs diff`'s two-git-ref comparison can't express at all (the source
+never changed; there's no second ref to check out). `okf-rs diff-bundles <bundle-a> <bundle-b>`
+closes that gap: it reads two bundle directories directly off disk (`okf_parser::read_bundle` on
+each side) and renders the exact same `--ci`-style classified report `diff --ci` does — reusing
+`render_ci_report` unchanged, just fed `Option<f64>` computed from a `DiffReport` built from two
+already-generated bundles instead of two freshly-analyzed git refs. Not limited to the
+resolver-version use case: any two independently generated bundles of conceptually the same project
+(`--lsp` on vs. off, two different `okf-rs` versions, ...) compare the same way.
+
+**The measurement, run for real** (not just described): two real `rust-analyzer` installs via
+`rustup toolchain install`/`rustup component add rust-analyzer` (1.90.0 and 1.94.1 — GitHub release
+downloads are blocked by this environment's egress policy, but `static.rust-lang.org`, which `rustup`
+itself uses, isn't), `okf-rs generate . --lsp --no-cache` against this repository's own 1153-concept
+source snapshot under each, then `okf-rs diff-bundles` between the two resulting bundles:
+
+```
+❌ SOURCE CHANGES: 2
+⚠️  RESOLVER CHANGES: 1292
+   (99.8% of relationship-level changes in this diff were resolver-only)
+
+exit code: 1
+```
+
+1292 of 1294 relationship-level changes between the two versions were purely `resolver_version`
+metadata — real, if modest, evidence that `resolver_changes: "ignore"` is a defensible policy choice
+for a project willing to accept the confound described next. The 2 remaining `SourceChange` entries
+(both directions of one edge: `cmd_check_determinism → Project::load`) looked, at first, like a
+genuine cross-version resolution disagreement — until the obvious control experiment
+(`okf-rs generate --lsp --check-determinism`, which re-runs analysis twice *independently under the
+same resolver version* and diffs byte-for-byte) showed `--lsp` resolution on this codebase isn't
+fully deterministic run-to-run even holding the resolver version fixed: 1.94.1 disagreed with itself
+on 2/2 repeated runs (on two different call sites each time), and 1.90.0 disagreed with itself on
+1/3. That means the one real `SourceChange` found between versions can't be confidently attributed to
+the version bump at all — it's at least as well explained by this baseline indexing noise, already
+named as a known limitation in this ROADMAP's Phase 2 section, now quantified rather than just
+asserted. The more solidly reproducible finding here is the non-determinism itself, present in both
+tested versions, not a 1.90.0-vs-1.94.1 semantic disagreement.
+
+**A real bug this run caught**: `render_ci_report`'s resolver-only-rate line originally formatted at
+zero decimal places (`{:.0}%`), which rounds a genuine 99.8454...% up to a bare "100%" —
+indistinguishable from an actually-clean diff with zero source changes, exactly the distinction this
+number exists to preserve. Found only by running the real tool against real data, not by any of the
+hand-picked round-number test cases (100%, 50%) already in place; fixed to one decimal place, with a
+regression test (`resolver_only_rate_renders_at_one_decimal_place_not_rounded_to_a_bare_100_percent`)
+that reproduces the exact 1292/1294 ratio from this run.
+
+### Tests (continued)
+
+- `okf-cli::diff_ci_tests::resolver_only_rate_renders_at_one_decimal_place_not_rounded_to_a_bare_100_percent`
+  — the regression test for the rounding bug above.
+- `okf-cli` e2e (`tests/e2e.rs`): `standalone_binary_diff_bundles_reports_the_resolver_only_rate_from_a_real_fixture_pair`
+  runs the real compiled binary against Phase F's own checked-in
+  `tests/fixtures/diff/resolver-change/{before,after}/` fixture (no live resolver install needed —
+  the fixture already encodes a resolver-version-only change);
+  `standalone_binary_diff_bundles_reports_no_changes_for_identical_bundles` covers the
+  no-difference-at-all case. The two-real-resolver-versions measurement itself isn't a repository
+  test (no more feasible to pin two `rust-analyzer` installs in CI than Phase A's own integration
+  scenario already noted) — it was run once, by hand, exactly as this section describes, and
+  `diff-bundles` is what a project would run to repeat it.
 
 ## References
 
 - [`docs/feedback/2026-08-provenance-graph-diff-review.md`](feedback/2026-08-provenance-graph-diff-review.md) — the raw feedback this plan distills
 - [`docs/feedback/2026-08-community-roadmap-review.md`](feedback/2026-08-community-roadmap-review.md) — the reviewer's first-round feedback, already delivered
+- [`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`](feedback/2026-08-tool-consolidation-benchmark-review.md) — the reviewer's third-round feedback (Medium), driving Phase G
 - [`ROADMAP.md` — Improvement Plan (AI-native platform maturity)](../ROADMAP.md#improvement-plan--ai-native-platform-maturity-community-feedback) — what's already shipped from the first round
 - [`docs/improvement-plan.md`](improvement-plan.md) — the competitive gap-analysis plan this document's phase/test/acceptance-criteria structure follows
+- [`benchmarks/`](../benchmarks/) — the discoverable, reproducible-run companion to this document's design writeups: how to actually run each of Phase E/G's benchmarks, and the real results collected against real corpora so far

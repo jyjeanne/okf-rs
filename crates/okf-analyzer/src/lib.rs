@@ -474,6 +474,58 @@ impl CiSummary {
     }
 }
 
+/// The share of purely relationship-level change *pairs* in `report` that
+/// were resolver-only (`ResolverChange`/`ProvenanceChange`) — the
+/// empirical number `docs/improvement-plan-provenance-diff.md`'s Phase G
+/// asks a project to watch on its own corpus: external review argued that
+/// if this rate stays near zero across a real resolver-version bump,
+/// resolver-class changes can safely default to `ignore` in that
+/// project's own `okf.toml` (`DiffPolicy::resolver_changes`) instead of
+/// `warn`, and a rate that *isn't* near zero is itself a resolver finding
+/// worth reporting upstream. `None` when there's no relationship-level
+/// change pair to take a rate over (an empty diff, or one containing only
+/// whole-concept adds/removes with no `Changed` concepts at all).
+///
+/// Deliberately **not** a `CiSummary` method, and not derived from
+/// `CiSummary`'s counts: an earlier version of this function did exactly
+/// that (`resolver_changes / (source_changes + resolver_changes +
+/// confidence_changes)`), but `CiSummary::source_changes` also folds in
+/// whole-concept adds/removes and signature-only changes — real changes,
+/// but not relationship-*pair* changes — which dilutes the denominator
+/// and understates this rate on any diff with real concept churn
+/// alongside a resolver bump, exactly the reasoning error this rate
+/// exists to prevent a project from making. Reading directly from
+/// `report.changed[..].relationship_changes` (the same source
+/// [`ci_summary`] itself reduces from) counts only genuine relationship
+/// pairs, so concept-level churn elsewhere in the same diff can't skew
+/// the result either direction.
+pub fn resolver_only_rate(report: &DiffReport) -> Option<f64> {
+    let mut resolver_only = 0usize;
+    let mut total = 0usize;
+    for changed in &report.changed {
+        for (_, _, kind) in &changed.relationship_changes {
+            match kind {
+                RelationshipChangeKind::ResolverChange
+                | RelationshipChangeKind::ProvenanceChange => {
+                    resolver_only += 1;
+                    total += 1;
+                }
+                RelationshipChangeKind::SourceChange | RelationshipChangeKind::ConfidenceChange => {
+                    total += 1;
+                }
+                // Never actually stored in `relationship_changes` (see
+                // `diff_relationships`), matched explicitly for the same
+                // reason `ci_summary` does.
+                RelationshipChangeKind::Unchanged => {}
+            }
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    Some(resolver_only as f64 / total as f64)
+}
+
 /// Reduces a [`DiffReport`] to the three counts [`CiSummary`] holds.
 pub fn ci_summary(report: &DiffReport) -> CiSummary {
     let mut summary = CiSummary::default();
@@ -1603,6 +1655,106 @@ mod tests {
         assert_eq!(summary.source_changes, 0);
         assert_eq!(summary.resolver_changes, 1);
         assert_eq!(summary.confidence_changes, 0);
+        // The whole diff is one resolver-only pair -- 100% of it.
+        assert_eq!(resolver_only_rate(&report), Some(1.0));
+    }
+
+    #[test]
+    fn resolver_only_rate_is_none_on_an_empty_diff() {
+        let before = make_concept("functions/foo", "fn foo()");
+        let after = make_concept("functions/foo", "fn foo()");
+        let report = diff(&[before], &[after]);
+        assert_eq!(resolver_only_rate(&report), None);
+    }
+
+    /// A diff mixing one genuine source rewire with one resolver-only pair
+    /// reports the resolver-only share of relationship-level changes, not
+    /// just a bare "some resolver changes happened" boolean -- the number
+    /// `docs/improvement-plan-provenance-diff.md`'s Phase G asks a project
+    /// to watch across real resolver-version bumps on its own corpus.
+    #[test]
+    fn resolver_only_rate_reports_the_share_of_relationship_level_changes() {
+        let mut before = make_concept("functions/foo", "fn foo()");
+        before.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "functions/bar",
+            "bar",
+        ));
+        before.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/baz",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.88.0"),
+        ));
+        let mut after = make_concept("functions/foo", "fn foo()");
+        // functions/bar -> functions/qux: a genuine rewire (2 SourceChange
+        // pairs, remove + add).
+        after.relationships.push(Relationship::new(
+            RelationKind::Calls,
+            "functions/qux",
+            "qux",
+        ));
+        // functions/baz unchanged except the resolver version bumped.
+        after.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/baz",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.89.0"),
+        ));
+
+        let report = diff(&[before], &[after]);
+        let summary = ci_summary(&report);
+        assert_eq!(summary.source_changes, 2);
+        assert_eq!(summary.resolver_changes, 1);
+        // 1 resolver-only pair out of 3 total relationship-level changes.
+        let rate = resolver_only_rate(&report).unwrap();
+        assert!((rate - (1.0 / 3.0)).abs() < 1e-9);
+    }
+
+    /// The reason `resolver_only_rate` reads `report.changed[..]
+    /// .relationship_changes` directly instead of `CiSummary`'s counts:
+    /// `CiSummary::source_changes` also folds in whole-concept adds and
+    /// signature-only changes, which are real changes but not
+    /// relationship-*pair* changes. A diff with concept-level churn
+    /// alongside a resolver-only bump must not have that unrelated churn
+    /// dilute the rate -- here, one whole concept is added (a `CiSummary`-
+    /// based rate would divide by an inflated denominator that includes
+    /// it) alongside one purely resolver-only relationship pair, and the
+    /// rate is still exactly 100%, not diluted by the added concept.
+    #[test]
+    fn resolver_only_rate_is_not_diluted_by_unrelated_whole_concept_churn() {
+        let mut before = make_concept("functions/foo", "fn foo()");
+        before.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/bar",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.88.0"),
+        ));
+        let mut after = make_concept("functions/foo", "fn foo()");
+        after.relationships.push(provenance_relationship(
+            RelationKind::Calls,
+            "functions/bar",
+            "rust-analyzer",
+            Confidence::Semantic,
+            Some("1.89.0"),
+        ));
+        // An unrelated brand-new concept, present only in `after` -- pure
+        // concept-level churn, no relationship-pair change of its own.
+        let new_concept = make_concept("functions/new_thing", "fn new_thing()");
+
+        let report = diff(&[before], &[after, new_concept]);
+        let summary = ci_summary(&report);
+        // CiSummary's own source_changes count is inflated by the added
+        // concept (matching its documented "a concept's own existence is
+        // the change" behavior) -- exactly the dilution this function
+        // exists to avoid.
+        assert_eq!(summary.source_changes, 1);
+        assert_eq!(summary.resolver_changes, 1);
+        // The relationship-pair-only rate is unaffected by that churn.
+        assert_eq!(resolver_only_rate(&report), Some(1.0));
     }
 
     #[test]
