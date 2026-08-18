@@ -572,12 +572,13 @@ that merged to `main` in the meantime — clean throughout, zero failures.
 
 ## Phase 4 — Ecosystem
 
-Both items below build directly on Phase 3's stable `okf-graph`/`okf-query` library API rather than re-implementing graph access.
+The items below build directly on Phase 3's stable `okf-graph`/`okf-query` library API rather than re-implementing graph access.
 
 - [ ] `okf-server`: REST + GraphQL API over the knowledge graph — multi-repository, organization-wide serving
 - [ ] `okf-rs` as an LSP server: hover, go-to-definition, and find-references backed by the OKF bundle, reachable from any LSP-capable editor through one server implementation rather than a bespoke plugin per IDE; dedicated VS Code/JetBrains extensions remain useful afterward as thin wrappers around it
 - [ ] Visualization: interactive graph explorer over `okf-server`
 - [ ] Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
+- [ ] Extended language coverage: **Elixir** — joins Phase 1's initial set (Rust, Python, TypeScript/JavaScript, Go) and Phase 2's extension (Java, C#, PHP, Kotlin, C/C++, Swift) as the next `okf-tree-sitter` language module. Elixir's own shape needs its own extraction rules, not a reused heuristic: `defmodule` for modules, `def`/`defp` for functions (opt-out-by-default visibility — a `def` is public, `defp` is private, the same polarity PHP/Kotlin already established, not the explicit-`pub` polarity Rust/Java/C#/Swift use), and call-graph edges for both a local bare call and a remote `Module.function(...)` call (the qualified-call shape Elixir uses in place of `self.method()`/`Type::method()`). Would also need an `okf_lsp::server_command` entry for `elixir-ls`/`expert` to participate in `--lsp` disambiguation the same way Rust/Python already do, and a decision on how (or whether) to model `defmacro`/behaviours/protocols, none of which have an equivalent in any language `okf-tree-sitter` currently supports.
 
 The improvement plan's remaining conditional-GO/no-go items — bundled local embedding runtime, persisted query cache, static SVG export, multi-repo/daemon serving — stay deliberately out of scope; see [`docs/improvement-plan.md`](docs/improvement-plan.md#6-costbenefit-study-and-gonogo) for why each was scored that way.
 
