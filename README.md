@@ -5,6 +5,7 @@
 [![CI](https://github.com/jyjeanne/okf-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/jyjeanne/okf-rs/actions/workflows/ci.yml)
 [![Release](https://github.com/jyjeanne/okf-rs/actions/workflows/release.yml/badge.svg)](https://github.com/jyjeanne/okf-rs/actions/workflows/release.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![OKF BundleDex](https://bundledex.net/static-badge.svg)](https://bundledex.net)
 
 **A fast, open-source Rust CLI that turns a codebase into a portable [Open Knowledge Format](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing) (OKF) knowledge base — plain markdown files with YAML frontmatter, cross-linked into a real call graph, readable by humans and AI coding agents alike.**
 
