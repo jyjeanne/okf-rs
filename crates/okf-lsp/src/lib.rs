@@ -259,6 +259,7 @@ impl LspClient {
     /// `okf_analyzer::lsp::resolve_ambiguous_calls`.
     pub fn wait_until_ready(&mut self) {
         let deadline = Instant::now() + READY_TIMEOUT;
+        let mut pending_tokens = HashSet::new();
         let mut active_tokens = HashSet::new();
         let mut seen_any_progress = false;
 
@@ -271,6 +272,7 @@ impl LspClient {
                 Ok(Ok(message)) => {
                     if let Some(ack) = observe_progress_message(
                         &message,
+                        &mut pending_tokens,
                         &mut active_tokens,
                         &mut seen_any_progress,
                     ) {
@@ -282,8 +284,18 @@ impl LspClient {
                     // A full quiet-period slice passed with no message at
                     // all: ready if either nothing has ever indicated
                     // progress support, or every token seen so far has
-                    // already reported "end".
-                    if !seen_any_progress || active_tokens.is_empty() {
+                    // already reported "end" -- and none is still merely
+                    // *pending* (created via `window/workDoneProgress/create`
+                    // but not yet `begin`-ed). Checking `active_tokens`
+                    // alone here would be wrong: it's empty both when every
+                    // started token has finished *and* when none has
+                    // started yet, and a server can create a token well
+                    // before it actually begins the work it announces --
+                    // treating that gap as "ready" would reintroduce the
+                    // exact first-response race this method exists to
+                    // close, just one message later.
+                    if !seen_any_progress || (active_tokens.is_empty() && pending_tokens.is_empty())
+                    {
                         return;
                     }
                 }
@@ -425,18 +437,36 @@ fn wait_for_response(
 /// Pure per-message step for [`LspClient::wait_until_ready`], factored out
 /// as a free function (same reasoning as [`wait_for_response`]) so its
 /// `$/progress` token bookkeeping is directly unit-testable without a real
-/// language server process. Updates `active_tokens`/`seen_any_progress` in
-/// place and, for a `window/workDoneProgress/create` request -- which,
-/// per the LSP spec, the client must acknowledge -- returns the
-/// `{id, result: null}` reply for the caller to send back over the wire.
+/// language server process. Updates `pending_tokens`/`active_tokens`/
+/// `seen_any_progress` in place and, for a `window/workDoneProgress/create`
+/// request -- which, per the LSP spec, the client must acknowledge --
+/// returns the `{id, result: null}` reply for the caller to send back over
+/// the wire.
+///
+/// `pending_tokens` (created via `window/workDoneProgress/create` but not
+/// yet `begin`-ed) is tracked separately from `active_tokens` (`begin`-ed
+/// but not yet `end`-ed) because a server is free to create a token well
+/// before it actually starts the work it announces -- a token sitting in
+/// `pending_tokens` must still block readiness, even though it's not (yet)
+/// in `active_tokens` either. Collapsing the two would make "no token has
+/// started" indistinguishable from "every started token has finished," the
+/// exact ambiguity `wait_until_ready`'s caller depends on this function to
+/// resolve.
 fn observe_progress_message(
     message: &Value,
+    pending_tokens: &mut HashSet<String>,
     active_tokens: &mut HashSet<String>,
     seen_any_progress: &mut bool,
 ) -> Option<Value> {
     match message.get("method").and_then(Value::as_str) {
         Some("window/workDoneProgress/create") => {
             *seen_any_progress = true;
+            if let Some(token) = message
+                .pointer("/params/token")
+                .and_then(progress_token_string)
+            {
+                pending_tokens.insert(token);
+            }
             let id = message.get("id")?.clone();
             Some(json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }))
         }
@@ -451,9 +481,11 @@ fn observe_progress_message(
                     .and_then(Value::as_str)
                 {
                     Some("end") => {
+                        pending_tokens.remove(&token);
                         active_tokens.remove(&token);
                     }
                     Some("begin") | Some("report") => {
+                        pending_tokens.remove(&token);
                         active_tokens.insert(token);
                     }
                     _ => {}
@@ -750,7 +782,8 @@ mod tests {
     }
 
     #[test]
-    fn observe_progress_message_acks_workdoneprogress_create_and_tracks_no_token_yet() {
+    fn observe_progress_message_acks_workdoneprogress_create_and_tracks_it_as_pending() {
+        let mut pending = HashSet::new();
         let mut active = HashSet::new();
         let mut seen = false;
         let message = json!({
@@ -758,9 +791,13 @@ mod tests {
             "method": "window/workDoneProgress/create",
             "params": { "token": "rustAnalyzer/Indexing" },
         });
-        let ack = observe_progress_message(&message, &mut active, &mut seen).unwrap();
+        let ack = observe_progress_message(&message, &mut pending, &mut active, &mut seen).unwrap();
         assert_eq!(ack, json!({ "jsonrpc": "2.0", "id": 7, "result": null }));
         assert!(seen, "a create request itself counts as progress activity");
+        assert!(
+            pending.contains("rustAnalyzer/Indexing"),
+            "a created-but-not-yet-begun token must still block readiness"
+        );
         assert!(
             active.is_empty(),
             "no token is active until a `begin` progress arrives"
@@ -769,6 +806,7 @@ mod tests {
 
     #[test]
     fn observe_progress_message_tracks_the_begin_report_end_lifecycle() {
+        let mut pending = HashSet::new();
         let mut active = HashSet::new();
         let mut seen = false;
 
@@ -776,7 +814,7 @@ mod tests {
             "jsonrpc": "2.0", "method": "$/progress",
             "params": { "token": "rustAnalyzer/Indexing", "value": { "kind": "begin" } },
         });
-        assert!(observe_progress_message(&begin, &mut active, &mut seen).is_none());
+        assert!(observe_progress_message(&begin, &mut pending, &mut active, &mut seen).is_none());
         assert!(seen);
         assert!(active.contains("rustAnalyzer/Indexing"));
 
@@ -784,7 +822,7 @@ mod tests {
             "jsonrpc": "2.0", "method": "$/progress",
             "params": { "token": "rustAnalyzer/Indexing", "value": { "kind": "report" } },
         });
-        observe_progress_message(&report, &mut active, &mut seen);
+        observe_progress_message(&report, &mut pending, &mut active, &mut seen);
         assert!(
             active.contains("rustAnalyzer/Indexing"),
             "still active after a `report`"
@@ -794,8 +832,48 @@ mod tests {
             "jsonrpc": "2.0", "method": "$/progress",
             "params": { "token": "rustAnalyzer/Indexing", "value": { "kind": "end" } },
         });
-        observe_progress_message(&end, &mut active, &mut seen);
+        observe_progress_message(&end, &mut pending, &mut active, &mut seen);
         assert!(active.is_empty(), "`end` retires the token");
+        assert!(pending.is_empty());
+    }
+
+    /// Regression test for a real bug in an earlier version of this
+    /// function: `window/workDoneProgress/create` was tracked only via
+    /// `seen_any_progress`, not in any token set, so a token that had been
+    /// created but not yet `begin`-ed was indistinguishable from one that
+    /// had already `begin`-ed *and* `end`-ed -- both left `active_tokens`
+    /// empty. `wait_until_ready` would then declare the server ready
+    /// during the create-to-begin gap, reintroducing the exact
+    /// query-before-indexing-is-done race this whole mechanism exists to
+    /// close.
+    #[test]
+    fn observe_progress_message_keeps_a_created_but_not_yet_begun_token_pending() {
+        let mut pending = HashSet::new();
+        let mut active = HashSet::new();
+        let mut seen = false;
+
+        let create = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "window/workDoneProgress/create",
+            "params": { "token": "rustAnalyzer/Indexing" },
+        });
+        observe_progress_message(&create, &mut pending, &mut active, &mut seen);
+        // The exact bug: both sets must NOT be simultaneously "nothing to
+        // wait for" here -- `pending` is what a caller checks in addition
+        // to `active` to avoid declaring readiness too early.
+        assert!(active.is_empty(), "not begun yet, so not active");
+        assert!(
+            !pending.is_empty(),
+            "but not \"nothing outstanding\" either -- it's pending"
+        );
+
+        let begin = json!({
+            "jsonrpc": "2.0", "method": "$/progress",
+            "params": { "token": "rustAnalyzer/Indexing", "value": { "kind": "begin" } },
+        });
+        observe_progress_message(&begin, &mut pending, &mut active, &mut seen);
+        assert!(pending.is_empty(), "begin moves the token out of pending");
+        assert!(active.contains("rustAnalyzer/Indexing"));
     }
 
     #[test]
@@ -804,6 +882,7 @@ mod tests {
         // for: one token ("roots scanned") ends right as another
         // ("cachePriming") begins -- readiness must wait for both, not
         // declare victory the instant the first one is gone.
+        let mut pending = HashSet::new();
         let mut active = HashSet::new();
         let mut seen = false;
         let begin = |token: &str| {
@@ -819,44 +898,54 @@ mod tests {
             })
         };
 
-        observe_progress_message(&begin("roots-scanned"), &mut active, &mut seen);
-        observe_progress_message(&begin("cachePriming"), &mut active, &mut seen);
+        observe_progress_message(
+            &begin("roots-scanned"),
+            &mut pending,
+            &mut active,
+            &mut seen,
+        );
+        observe_progress_message(&begin("cachePriming"), &mut pending, &mut active, &mut seen);
         assert_eq!(active.len(), 2);
 
-        observe_progress_message(&end("roots-scanned"), &mut active, &mut seen);
+        observe_progress_message(&end("roots-scanned"), &mut pending, &mut active, &mut seen);
         assert_eq!(
             active.len(),
             1,
             "`cachePriming` is still active after `roots-scanned` ends"
         );
 
-        observe_progress_message(&end("cachePriming"), &mut active, &mut seen);
+        observe_progress_message(&end("cachePriming"), &mut pending, &mut active, &mut seen);
         assert!(active.is_empty());
     }
 
     #[test]
     fn observe_progress_message_ignores_unrelated_notifications() {
+        let mut pending = HashSet::new();
         let mut active = HashSet::new();
         let mut seen = false;
         let unrelated = json!({
             "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
             "params": { "uri": "file:///a.rs", "diagnostics": [] },
         });
-        assert!(observe_progress_message(&unrelated, &mut active, &mut seen).is_none());
+        assert!(
+            observe_progress_message(&unrelated, &mut pending, &mut active, &mut seen).is_none()
+        );
         assert!(!seen, "an unrelated notification isn't progress activity");
         assert!(active.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
     fn observe_progress_message_accepts_a_numeric_token() {
         // `ProgressToken` is `integer | string` per the LSP spec.
+        let mut pending = HashSet::new();
         let mut active = HashSet::new();
         let mut seen = false;
         let begin = json!({
             "jsonrpc": "2.0", "method": "$/progress",
             "params": { "token": 42, "value": { "kind": "begin" } },
         });
-        observe_progress_message(&begin, &mut active, &mut seen);
+        observe_progress_message(&begin, &mut pending, &mut active, &mut seen);
         assert!(active.contains("42"));
     }
 

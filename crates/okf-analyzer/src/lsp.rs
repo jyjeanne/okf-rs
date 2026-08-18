@@ -27,7 +27,17 @@ use std::time::Duration;
 /// intra-crate first query could mark the whole client warmed up while a
 /// later, slower cross-crate query right behind it got zero retry budget
 /// — the same race being guarded against, just moved one layer up.
-const DEFINITION_RETRIES: u32 = 4;
+///
+/// Deliberately small (one retry, one short sleep): unlike the old
+/// first-query budget, this one is now paid by *every* call this
+/// ambiguous, including ones the server can never resolve at all (e.g. a
+/// call dispatched through a trait or generic parameter) — a project with
+/// many such calls would otherwise pay the full budget's sleep on each one
+/// forever, not just during startup. `LspClient::start`'s own
+/// `wait_until_ready` already closes most of the readiness race up front;
+/// this only needs to hedge against what that workspace-level wait can't
+/// see, not re-absorb a real indexing delay on every lookup.
+const DEFINITION_RETRIES: u32 = 2;
 const DEFINITION_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 /// Attempts to resolve each of `ambiguous` (calls already known to match

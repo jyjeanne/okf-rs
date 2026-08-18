@@ -940,17 +940,19 @@ fn cmd_check_determinism(
     // pairwise comparisons total, not one. `flip_counts` tallies, per
     // relative path, how many of those comparisons it differed in;
     // `disagreeing_runs` counts how many *runs* (not files) disagreed with
-    // run 1 on at least one file.
+    // run 1 on at least one file. Run 1's own files are collected once
+    // (`run1_files`) and reused for every comparison via `diff_file_maps`
+    // rather than re-reading and re-hashing run 1's whole rendered tree
+    // from disk on each of the `comparisons` comparisons.
     let comparisons = runs.len() - 1;
+    let mut run1_files = BTreeMap::new();
+    collect_files(runs[0].path(), runs[0].path(), &mut run1_files)?;
     let mut flip_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut disagreeing_runs = 0usize;
     for (i, run) in runs.iter().enumerate().skip(1) {
-        let diffs = diff_dirs(
-            runs[0].path(),
-            run.path(),
-            "run 1",
-            &format!("run {}", i + 1),
-        )?;
+        let mut run_files = BTreeMap::new();
+        collect_files(run.path(), run.path(), &mut run_files)?;
+        let diffs = diff_file_maps(&run1_files, &run_files, "run 1", &format!("run {}", i + 1));
         if diffs.is_empty() {
             continue;
         }
@@ -1109,7 +1111,20 @@ fn diff_dirs(
     collect_files(a, a, &mut a_files)?;
     let mut b_files = BTreeMap::new();
     collect_files(b, b, &mut b_files)?;
+    Ok(diff_file_maps(&a_files, &b_files, label_a, label_b))
+}
 
+/// The comparison core of [`diff_dirs`], factored out so a caller that
+/// needs to diff the *same* side against several others (e.g.
+/// `cmd_check_determinism` comparing run 1 against every later run) can
+/// call [`collect_files`] on that shared side exactly once instead of
+/// paying disk I/O to re-read and re-hash it on every comparison.
+fn diff_file_maps(
+    a_files: &BTreeMap<String, Vec<u8>>,
+    b_files: &BTreeMap<String, Vec<u8>>,
+    label_a: &str,
+    label_b: &str,
+) -> Vec<String> {
     let all_paths: std::collections::BTreeSet<&String> =
         a_files.keys().chain(b_files.keys()).collect();
     let mut diffs = Vec::new();
@@ -1124,7 +1139,7 @@ fn diff_dirs(
             (None, None) => unreachable!("path came from one of the two maps"),
         }
     }
-    Ok(diffs)
+    diffs
 }
 
 fn collect_files(

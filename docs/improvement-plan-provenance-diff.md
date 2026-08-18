@@ -1083,14 +1083,40 @@ plain source, so not "something more interesting than a version diff." It confir
 review named while showing that readiness gating narrows the window without closing it under
 sustained, adversarial CPU contention — an honest remaining gap, not a claim of having eliminated
 non-determinism outright. `benchmarks/resolver-stability/README.md` records both results (ordinary
-and stress-test) as the reproducible instructions for running this measurement again.
+and stress-test) as the reproducible instructions for running this measurement again. (The
+measurement above was run against the initial `DEFINITION_RETRIES: 4` this phase shipped with —
+see the correction directly below for why that constant changed after the fact, without any need
+to re-run the measurement itself: the stress-test run had already exhausted all 4 retries and
+failed regardless.)
+
+**Correction from `/code-review`, applied the same day**: `wait_until_ready` had a real bug of its
+own, in the exact spirit of the race this phase set out to fix. It tracked only `active_tokens`
+(`begin`-ed but not yet `end`-ed) and `seen_any_progress`, and declared the server ready once
+`active_tokens` was empty — but `active_tokens` is empty both *after* every started token has
+finished *and* before any token has started at all. A server can send
+`window/workDoneProgress/create` well before it actually begins the work that token announces;
+during that gap, `seen_any_progress` was already `true` (set by the create message itself) and
+`active_tokens` was still empty, so a quiet-period timeout in that window declared the server ready
+before indexing had even started — the first-response race reappearing one message later. Fixed by
+tracking created-but-not-`begin`-ed tokens in a separate `pending_tokens` set that also has to be
+empty before readiness is declared (`observe_progress_message_keeps_a_created_but_not_yet_begun_token_pending`
+is the regression test). Separately, `DEFINITION_RETRIES` was reduced from 4 to 2: at 4, the retry
+budget's cost (up to 3 sleeps of 300ms, ~900ms) is paid by *every* ambiguous call the resolver can
+never answer at all (trait dispatch, generics — not a timing issue, a genuine "no answer"), not
+just ones caught mid-race; a real project with many such calls would pay that repeatedly, forever,
+not just during startup. The stress-test run's own failure wasn't weakened by the smaller budget —
+it had already exhausted the full 4-retry budget and failed regardless, so the workspace-level
+`wait_until_ready` fix above, not the per-query retry count, is what actually does the load-bearing
+work here.
 
 ### Tests
 
 - `okf-lsp`: `observe_progress_message_tracks_the_begin_report_end_lifecycle`,
   `observe_progress_message_tracks_multiple_overlapping_tokens_independently` (the two-sequential-token
-  case `READY_QUIET_PERIOD` exists for), `observe_progress_message_acks_workdoneprogress_create_and_tracks_no_token_yet`,
-  `observe_progress_message_ignores_unrelated_notifications`, `observe_progress_message_accepts_a_numeric_token`
+  case `READY_QUIET_PERIOD` exists for), `observe_progress_message_acks_workdoneprogress_create_and_tracks_it_as_pending`,
+  `observe_progress_message_keeps_a_created_but_not_yet_begun_token_pending` (the regression test for
+  the correction above), `observe_progress_message_ignores_unrelated_notifications`,
+  `observe_progress_message_accepts_a_numeric_token`
   — the token-bookkeeping logic, unit-tested directly (same pattern as the pre-existing
   `wait_for_response` tests) without spawning a real server process. The pre-existing
   `resolves_a_definition_via_a_real_rust_analyzer`/`resolves_an_ambiguous_call_via_a_real_rust_analyzer_when_scoping_disambiguates_it`
@@ -1100,6 +1126,10 @@ and stress-test) as the reproducible instructions for running this measurement a
   `standalone_binary_check_determinism_repeats_rejects_fewer_than_two`,
   `standalone_binary_check_determinism_reports_deterministic_across_more_than_two_repeats` — the new
   flag's validation and its tree-sitter-only-path report format.
+- `okf-cli`: `diff_file_maps` is the pre-existing `diff_dirs` test coverage exercising the same
+  comparison logic, now shared instead of duplicated — `cmd_check_determinism` collects run 1's
+  rendered files once and reuses them across every comparison instead of re-reading them from disk
+  on each one (a `/code-review` efficiency finding, not a correctness bug).
 
 ## References
 
