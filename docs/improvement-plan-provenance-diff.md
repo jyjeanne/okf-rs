@@ -10,9 +10,10 @@ automatically verifiable, not another prose roadmap.
 
 **Delivery status:** tracked in
 [`ROADMAP.md`](../ROADMAP.md#improvement-plan--provenance-depth-graph-diff--mcp-tool-selection).
-All six phases have now shipped in full: A (resolver version), B (provenance-aware graph diff), C
+All eight phases have now shipped in full: A (resolver version), B (provenance-aware graph diff), C
 (`diff --ci` policy), D (reproducibility metadata), E (tool-selection benchmark, offline harness
-*and* live-endpoint wiring), and F (golden fixture dataset).
+*and* live-endpoint wiring), F (golden fixture dataset), G (benchmark scoring/CI-signal follow-up),
+and H (rust-analyzer readiness gating).
 
 ## 0. What's already shipped, and what's actually new here
 
@@ -748,8 +749,9 @@ them.
 
 **Where this plan stands:** every phase this document proposed has shipped in full — A, B, C, D,
 E (both the harness and, once its own conditional verdict's deliberate decision was made, the
-live-endpoint runner), and F. Phase G below is a follow-up driven by a later round of external
-review of Phases B/C/E specifically, not part of the original proposal.
+live-endpoint runner), and F. Phases G and H below are follow-ups driven by later rounds of external
+review — of Phases B/C/E specifically for G, of Phase G's own two-version measurement run for H —
+not part of the original proposal.
 
 ---
 
@@ -990,11 +992,121 @@ that reproduces the exact 1292/1294 ratio from this run.
   scenario already noted) — it was run once, by hand, exactly as this section describes, and
   `diff-bundles` is what a project would run to repeat it.
 
+---
+
+## 12. Phase H — rust-analyzer readiness gating, not first-success (Medium review, August 2026) ✅ Shipped
+
+### Objective
+
+A fourth round of external review (recorded verbatim in
+[`docs/feedback/2026-08-rust-analyzer-self-disagreement-review.md`](feedback/2026-08-rust-analyzer-self-disagreement-review.md))
+on the within-version `--lsp` non-determinism Phase G's own measurement run surfaced but didn't
+explain: `1.94.1` disagreeing with itself on 2/2 repeated `--check-determinism --lsp` runs, `1.90.0`
+on 1/3. The review named a concrete mechanism to rule in or out — a query landing before the
+server has finished loading the workspace — and two checks to separate that from "just noise": gate
+each run on the server's own readiness signal rather than on whether some arbitrary first query
+happened to succeed, and run more than two repeats, since two repeats is one sample pair, not a
+distribution.
+
+### What the mechanism actually was, read from the client rather than guessed
+
+`okf_analyzer::lsp::resolve_ambiguous_calls` retried the *first* `textDocument/definition` query per
+language up to 20 times (10s total, in 500ms steps) — a real wait, but gated on the wrong thing: as
+soon as *any* query for that language returned a real answer, a `warmed_up` flag flipped and every
+later query, for the rest of that run, got exactly one attempt with zero retry. That flag used "an
+earlier query already succeeded" as a proxy for "the workspace has finished loading" — the same
+first-response heuristic the review named, one layer removed from being visible as such. The proxy
+was itself a source of disagreement, not just a missed opportunity to avoid one: a fast, intra-crate
+first query could mark the whole client warmed up while a slower, cross-crate query right behind it
+— exactly the shape of the one real `SourceChange` Phase G's own two-version run found
+(`cmd_check_determinism → Project::load`) — got zero budget to wait out its own, later readiness.
+
+### What shipped
+
+1. **Real readiness gating in `okf_lsp::LspClient`** (`crates/okf-lsp/src/lib.rs`). `initialize` now
+   advertises the `window.workDoneProgress` client capability (without it, a server may not send
+   `$/progress` at all — declaring it wasn't already done, so a spec-conformant server had nothing
+   telling it this client could receive progress). A new `LspClient::wait_until_ready`, called once
+   right after `initialize`/`initialized` and before any real query, tracks `$/progress`
+   `begin`/`report`/`end` tokens (acking each `window/workDoneProgress/create` request, which the
+   spec requires a reply to) and returns once every token it has seen has ended and stayed quiet for
+   `READY_QUIET_PERIOD` (500ms) — not the instant the *first* token ends, since real servers report
+   indexing as more than one sequential phase (`rust-analyzer` alone: roots-scanned, indexing,
+   proc-macro/build-script cache priming). Bounded by `READY_TIMEOUT` (15s) and, for a server that
+   never reports `$/progress` at all — most servers besides `rust-analyzer` don't — returns almost
+   immediately once one quiet-period window passes with no progress activity ever seen, rather than
+   always paying the full timeout.
+2. **The per-query retry budget now applies to every query, not just the first one per language**
+   (`crates/okf-analyzer/src/lsp.rs`). `ClientState`/`warmed_up` are gone; every ambiguous-call
+   lookup gets up to `DEFINITION_RETRIES` (4, at 300ms) attempts. Smaller than the old first-query
+   budget on purpose — the expensive, workspace-wide wait already happened once, up front, via
+   `wait_until_ready`; this budget only needs to cover residual, per-lookup lag a workspace-level
+   signal can't see.
+3. **`okf-rs generate --check-determinism --check-determinism-repeats N`**
+   (`crates/okf-cli/src/main.rs`), turning "two repeats gives you one pair" into an actual
+   within-version disagreement distribution: `N` independent analyses, every run after the first
+   diffed against run 1, reporting how many of the `N-1` comparisons each concept flipped in and how
+   many runs disagreed with run 1 on at least one file. Requires `--check-determinism`; rejects
+   `N < 2` up front.
+
+### The measurement, run for real, against this repository's own source
+
+**Ordinary conditions** (`--check-determinism`, the default two repeats, one run at a time, nothing
+else competing for the CPU): three separate invocations, all clean —
+`Deterministic: 2 independent generate --lsp runs on . all produced byte-identical output (1173
+concepts)` every time. Compare against Phase G's pre-fix numbers on the same default (1.94.1
+disagreeing 2/2, 1.90.0 disagreeing 1/3): a real improvement at the repeat count most projects would
+actually run in CI.
+
+**Stress test** (`--check-determinism-repeats`, well beyond two, deliberately run *concurrently with
+a second, independent instance of the same command* on this environment's 4-core sandbox — the
+harshest, not the typical, case): non-determinism still found. Across 6 repeats, run 1 (the very
+first `LspClient` started in the process, cold-starting directly into contention from the second
+concurrent job) disagreed with all 5 later runs on exactly two files, both `okf-graph` concepts, in
+a single edge:
+
+```
+Non-deterministic: 2 file(s) flipped across 6 independent `generate --lsp` runs on . (expected culprit: language-server index state, not source text):
+  5/5 repeat run(s) disagreed with run 1 on at least one file
+  functions/crates/okf-graph/src/Graph/get.md: differed in 5/5 comparison(s) against run 1
+  functions/crates/okf-graph/src/Graph/transitive_callers.md: differed in 5/5 comparison(s) against run 1
+```
+
+The actual content diff (inspected directly, not inferred): run 1's render is missing one edge every
+other run found — `Graph::get → Graph::transitive_callers`, `resolved_by: rust-analyzer, confidence:
+semantic` — the two directions of one `textDocument/definition` answer that came back empty on run
+1's first attempt and stayed empty through all 4 retries, roughly 1.2s, while the second concurrent
+job starved it of CPU. Read against the review's own diagnostic ("look at which concepts flipped: if
+they cluster... it is a race with load state and it is fixable"): this flip is a single, tightly
+clustered pair, reproducible, and consistent with exactly that race — not scattered across unrelated
+plain source, so not "something more interesting than a version diff." It confirms the mechanism the
+review named while showing that readiness gating narrows the window without closing it under
+sustained, adversarial CPU contention — an honest remaining gap, not a claim of having eliminated
+non-determinism outright. `benchmarks/resolver-stability/README.md` records both results (ordinary
+and stress-test) as the reproducible instructions for running this measurement again.
+
+### Tests
+
+- `okf-lsp`: `observe_progress_message_tracks_the_begin_report_end_lifecycle`,
+  `observe_progress_message_tracks_multiple_overlapping_tokens_independently` (the two-sequential-token
+  case `READY_QUIET_PERIOD` exists for), `observe_progress_message_acks_workdoneprogress_create_and_tracks_no_token_yet`,
+  `observe_progress_message_ignores_unrelated_notifications`, `observe_progress_message_accepts_a_numeric_token`
+  — the token-bookkeeping logic, unit-tested directly (same pattern as the pre-existing
+  `wait_for_response` tests) without spawning a real server process. The pre-existing
+  `resolves_a_definition_via_a_real_rust_analyzer`/`resolves_an_ambiguous_call_via_a_real_rust_analyzer_when_scoping_disambiguates_it`
+  smoke tests exercise `wait_until_ready` for real whenever `rust-analyzer` is actually installed
+  (genuinely run, not skipped, in this environment).
+- `okf-cli` e2e: `standalone_binary_check_determinism_repeats_requires_check_determinism`,
+  `standalone_binary_check_determinism_repeats_rejects_fewer_than_two`,
+  `standalone_binary_check_determinism_reports_deterministic_across_more_than_two_repeats` — the new
+  flag's validation and its tree-sitter-only-path report format.
+
 ## References
 
 - [`docs/feedback/2026-08-provenance-graph-diff-review.md`](feedback/2026-08-provenance-graph-diff-review.md) — the raw feedback this plan distills
 - [`docs/feedback/2026-08-community-roadmap-review.md`](feedback/2026-08-community-roadmap-review.md) — the reviewer's first-round feedback, already delivered
 - [`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`](feedback/2026-08-tool-consolidation-benchmark-review.md) — the reviewer's third-round feedback (Medium), driving Phase G
+- [`docs/feedback/2026-08-rust-analyzer-self-disagreement-review.md`](feedback/2026-08-rust-analyzer-self-disagreement-review.md) — the reviewer's fourth-round feedback (Medium), driving Phase H
 - [`ROADMAP.md` — Improvement Plan (AI-native platform maturity)](../ROADMAP.md#improvement-plan--ai-native-platform-maturity-community-feedback) — what's already shipped from the first round
 - [`docs/improvement-plan.md`](improvement-plan.md) — the competitive gap-analysis plan this document's phase/test/acceptance-criteria structure follows
 - [`benchmarks/`](../benchmarks/) — the discoverable, reproducible-run companion to this document's design writeups: how to actually run each of Phase E/G's benchmarks, and the real results collected against real corpora so far

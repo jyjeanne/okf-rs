@@ -1043,6 +1043,102 @@ fn standalone_binary_check_determinism_rejects_enrich() {
     );
 }
 
+/// `--check-determinism-repeats` without `--check-determinism` is
+/// rejected up front, before any analysis: the flag only means anything
+/// as a modifier of `--check-determinism`.
+#[test]
+fn standalone_binary_check_determinism_repeats_requires_check_determinism() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let check = run(
+        &project,
+        &["generate", ".", "--check-determinism-repeats", "5"],
+    );
+    assert!(
+        !check.status.success(),
+        "expected --check-determinism-repeats without --check-determinism to fail"
+    );
+    let err = stderr_of(&check);
+    assert!(
+        err.contains("--check-determinism-repeats") && err.contains("--check-determinism"),
+        "unexpected stderr: {err}"
+    );
+}
+
+/// `--check-determinism-repeats` needs at least two runs to compare
+/// anything -- `0` or `1` is rejected rather than silently treated as
+/// trivially deterministic.
+#[test]
+fn standalone_binary_check_determinism_repeats_rejects_fewer_than_two() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let check = run(
+        &project,
+        &[
+            "generate",
+            ".",
+            "--check-determinism",
+            "--check-determinism-repeats",
+            "1",
+        ],
+    );
+    assert!(
+        !check.status.success(),
+        "expected --check-determinism-repeats 1 to fail"
+    );
+    let err = stderr_of(&check);
+    assert!(err.contains("at least 2"), "unexpected stderr: {err}");
+}
+
+/// `--check-determinism --check-determinism-repeats N` on the
+/// tree-sitter-only path: N independent runs, all expected to agree since
+/// the only input is source text, and the report names the run count
+/// rather than hard-coding "two".
+#[test]
+fn standalone_binary_check_determinism_reports_deterministic_across_more_than_two_repeats() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn callee() {}\npub fn caller() { callee(); }\n",
+    )
+    .unwrap();
+
+    let check = run(
+        &project,
+        &[
+            "generate",
+            ".",
+            "--check-determinism",
+            "--check-determinism-repeats",
+            "5",
+        ],
+    );
+    assert_success(
+        &check,
+        &["generate --check-determinism --check-determinism-repeats 5"],
+    );
+    let out = stdout_of(&check);
+    assert!(out.contains("Deterministic"), "unexpected output: {out}");
+    assert!(
+        out.contains('5'),
+        "expected the repeat count in the report: {out}"
+    );
+    assert!(out.contains("4 concepts"), "unexpected output: {out}");
+}
+
 /// `--check-fresh` verifies the bundle already on disk still matches a
 /// fresh `generate` — the "bundle is up to date with source" CI check.
 /// Right after a real `generate`, the two must agree.

@@ -17,6 +17,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use okf_parser::Language;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -28,6 +29,24 @@ use std::time::{Duration, Instant};
 /// giving up -- guards against a hung or misbehaving language server
 /// blocking a caller forever with no diagnostic.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overall bound on [`LspClient::wait_until_ready`] -- a server that never
+/// settles (or never reports `$/progress` at all in the first place) can't
+/// block a caller forever with no diagnostic, any more than a single
+/// request can.
+const READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long [`LspClient::wait_until_ready`] waits, with no new progress
+/// activity, before declaring the server ready. Indexing is often reported
+/// as more than one sequential `$/progress` token -- e.g. "roots scanned"
+/// ending right before "indexing" (and, for `rust-analyzer` specifically,
+/// proc-macro/build-script "cachePriming") begins -- so declaring victory
+/// the instant the first token ends would race the exact same way the
+/// heuristic this replaces did. Also doubles as the probe window used to
+/// detect a server that doesn't implement `$/progress` at all (most
+/// servers besides `rust-analyzer` don't): if nothing arrives in one
+/// window and nothing ever has, there's nothing to wait for.
+const READY_QUIET_PERIOD: Duration = Duration::from_millis(500);
 
 /// The command, its arguments, and the LSP `languageId` for the one
 /// dominant language server this crate knows how to drive for `language`.
@@ -190,6 +209,7 @@ impl LspClient {
             server_version: None,
         };
         client.initialize()?;
+        client.wait_until_ready();
         Ok(Some(client))
     }
 
@@ -200,13 +220,75 @@ impl LspClient {
             json!({
                 "processId": std::process::id(),
                 "rootUri": root_uri,
-                "capabilities": {},
+                // Advertised specifically so a server that supports
+                // `$/progress` (rust-analyzer does; most others don't)
+                // actually sends it -- without this capability, servers
+                // that gate progress reporting on client support (as the
+                // spec permits) would stay silent and `wait_until_ready`
+                // would fall back to its "no progress at all" path even
+                // though the server just wasn't told it could report any.
+                "capabilities": { "window": { "workDoneProgress": true } },
             }),
         )?;
         let result = self.read_response(id)?;
         self.server_version = parse_server_version(&result);
         self.notify("initialized", json!({}))?;
         Ok(())
+    }
+
+    /// Waits for the server's own startup-indexing signal (`$/progress`)
+    /// to settle, instead of inferring readiness from whether some
+    /// arbitrary first query happened to succeed. A query fired before
+    /// indexing (crate-graph loading, proc-macro/build-script expansion,
+    /// cross-crate symbol resolution, ...) has finished can miss a symbol
+    /// that simply hasn't landed yet and get a different answer than the
+    /// same query fired a moment later -- see
+    /// `benchmarks/resolver-stability/README.md` for a real, reproduced
+    /// case of exactly this against this project's own source.
+    ///
+    /// Best-effort and bounded, never an error: a server that doesn't
+    /// implement `$/progress` at all (most servers besides `rust-analyzer`
+    /// don't) is indistinguishable from "still working" by token
+    /// bookkeeping alone, so this also returns as soon as
+    /// [`READY_QUIET_PERIOD`] passes with *no* progress activity ever
+    /// seen, rather than always burning the full [`READY_TIMEOUT`]. A
+    /// caller that needs to tolerate residual, per-query lag this can't
+    /// see (a single crate among many still finishing its own index after
+    /// the workspace overall reports ready, say) should still retry
+    /// individual queries on top of this -- see
+    /// `okf_analyzer::lsp::resolve_ambiguous_calls`.
+    pub fn wait_until_ready(&mut self) {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        let mut active_tokens = HashSet::new();
+        let mut seen_any_progress = false;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match self.rx.recv_timeout(remaining.min(READY_QUIET_PERIOD)) {
+                Ok(Ok(message)) => {
+                    if let Some(ack) = observe_progress_message(
+                        &message,
+                        &mut active_tokens,
+                        &mut seen_any_progress,
+                    ) {
+                        let _ = self.write_message(&ack);
+                    }
+                }
+                Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Timeout) => {
+                    // A full quiet-period slice passed with no message at
+                    // all: ready if either nothing has ever indicated
+                    // progress support, or every token seen so far has
+                    // already reported "end".
+                    if !seen_any_progress || active_tokens.is_empty() {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /// The language server's own reported version, if it included one in
@@ -337,6 +419,59 @@ fn wait_for_response(
                 bail!("language server closed its output stream")
             }
         }
+    }
+}
+
+/// Pure per-message step for [`LspClient::wait_until_ready`], factored out
+/// as a free function (same reasoning as [`wait_for_response`]) so its
+/// `$/progress` token bookkeeping is directly unit-testable without a real
+/// language server process. Updates `active_tokens`/`seen_any_progress` in
+/// place and, for a `window/workDoneProgress/create` request -- which,
+/// per the LSP spec, the client must acknowledge -- returns the
+/// `{id, result: null}` reply for the caller to send back over the wire.
+fn observe_progress_message(
+    message: &Value,
+    active_tokens: &mut HashSet<String>,
+    seen_any_progress: &mut bool,
+) -> Option<Value> {
+    match message.get("method").and_then(Value::as_str) {
+        Some("window/workDoneProgress/create") => {
+            *seen_any_progress = true;
+            let id = message.get("id")?.clone();
+            Some(json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }))
+        }
+        Some("$/progress") => {
+            *seen_any_progress = true;
+            if let Some(token) = message
+                .pointer("/params/token")
+                .and_then(progress_token_string)
+            {
+                match message
+                    .pointer("/params/value/kind")
+                    .and_then(Value::as_str)
+                {
+                    Some("end") => {
+                        active_tokens.remove(&token);
+                    }
+                    Some("begin") | Some("report") => {
+                        active_tokens.insert(token);
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `ProgressToken` per the LSP spec is `integer | string` -- normalized to
+/// a `String` here since it's only ever used as a `HashSet` key.
+fn progress_token_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
     }
 }
 
@@ -612,6 +747,117 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "should not block far past the timeout"
         );
+    }
+
+    #[test]
+    fn observe_progress_message_acks_workdoneprogress_create_and_tracks_no_token_yet() {
+        let mut active = HashSet::new();
+        let mut seen = false;
+        let message = json!({
+            "jsonrpc": "2.0", "id": 7,
+            "method": "window/workDoneProgress/create",
+            "params": { "token": "rustAnalyzer/Indexing" },
+        });
+        let ack = observe_progress_message(&message, &mut active, &mut seen).unwrap();
+        assert_eq!(ack, json!({ "jsonrpc": "2.0", "id": 7, "result": null }));
+        assert!(seen, "a create request itself counts as progress activity");
+        assert!(
+            active.is_empty(),
+            "no token is active until a `begin` progress arrives"
+        );
+    }
+
+    #[test]
+    fn observe_progress_message_tracks_the_begin_report_end_lifecycle() {
+        let mut active = HashSet::new();
+        let mut seen = false;
+
+        let begin = json!({
+            "jsonrpc": "2.0", "method": "$/progress",
+            "params": { "token": "rustAnalyzer/Indexing", "value": { "kind": "begin" } },
+        });
+        assert!(observe_progress_message(&begin, &mut active, &mut seen).is_none());
+        assert!(seen);
+        assert!(active.contains("rustAnalyzer/Indexing"));
+
+        let report = json!({
+            "jsonrpc": "2.0", "method": "$/progress",
+            "params": { "token": "rustAnalyzer/Indexing", "value": { "kind": "report" } },
+        });
+        observe_progress_message(&report, &mut active, &mut seen);
+        assert!(
+            active.contains("rustAnalyzer/Indexing"),
+            "still active after a `report`"
+        );
+
+        let end = json!({
+            "jsonrpc": "2.0", "method": "$/progress",
+            "params": { "token": "rustAnalyzer/Indexing", "value": { "kind": "end" } },
+        });
+        observe_progress_message(&end, &mut active, &mut seen);
+        assert!(active.is_empty(), "`end` retires the token");
+    }
+
+    #[test]
+    fn observe_progress_message_tracks_multiple_overlapping_tokens_independently() {
+        // The real-world case `wait_until_ready`'s quiet period exists
+        // for: one token ("roots scanned") ends right as another
+        // ("cachePriming") begins -- readiness must wait for both, not
+        // declare victory the instant the first one is gone.
+        let mut active = HashSet::new();
+        let mut seen = false;
+        let begin = |token: &str| {
+            json!({
+                "jsonrpc": "2.0", "method": "$/progress",
+                "params": { "token": token, "value": { "kind": "begin" } },
+            })
+        };
+        let end = |token: &str| {
+            json!({
+                "jsonrpc": "2.0", "method": "$/progress",
+                "params": { "token": token, "value": { "kind": "end" } },
+            })
+        };
+
+        observe_progress_message(&begin("roots-scanned"), &mut active, &mut seen);
+        observe_progress_message(&begin("cachePriming"), &mut active, &mut seen);
+        assert_eq!(active.len(), 2);
+
+        observe_progress_message(&end("roots-scanned"), &mut active, &mut seen);
+        assert_eq!(
+            active.len(),
+            1,
+            "`cachePriming` is still active after `roots-scanned` ends"
+        );
+
+        observe_progress_message(&end("cachePriming"), &mut active, &mut seen);
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn observe_progress_message_ignores_unrelated_notifications() {
+        let mut active = HashSet::new();
+        let mut seen = false;
+        let unrelated = json!({
+            "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+            "params": { "uri": "file:///a.rs", "diagnostics": [] },
+        });
+        assert!(observe_progress_message(&unrelated, &mut active, &mut seen).is_none());
+        assert!(!seen, "an unrelated notification isn't progress activity");
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn observe_progress_message_accepts_a_numeric_token() {
+        // `ProgressToken` is `integer | string` per the LSP spec.
+        let mut active = HashSet::new();
+        let mut seen = false;
+        let begin = json!({
+            "jsonrpc": "2.0", "method": "$/progress",
+            "params": { "token": 42, "value": { "kind": "begin" } },
+        });
+        observe_progress_message(&begin, &mut active, &mut seen);
+        assert!(active.contains("42"));
     }
 
     #[test]
