@@ -448,7 +448,7 @@ The items below build directly on Phase 3's stable `okf-graph`/`okf-query` libra
 - `okf-rs` as an LSP server: hover, go-to-definition, and find-references backed by the OKF bundle, reachable from any LSP-capable editor (VS Code, JetBrains, Neovim, ...) through one server implementation rather than a bespoke plugin per IDE; dedicated VS Code/JetBrains extensions remain useful afterward as thin, editor-native wrappers around it
 - Visualization: interactive graph explorer over `okf-server`
 - Continuous/distributed indexing at organization scale (beyond the local `okf-watch` from Phase 2)
-- Extended language coverage: Elixir — module (`defmodule`)/function (`def`/`defp`) extraction, opt-out-by-default public API detection matching Elixir's actual visibility model (a `def` is public, `defp` is private — the same polarity PHP/Kotlin already established in Phase 2), and call-graph edges for both local and remote (`Module.function(...)`) calls
+- Extended language coverage: Elixir — module (`defmodule`)/function (`def`/`defp`) extraction, opt-out-by-default public API detection matching Elixir's actual visibility model (a `def` is public, `defp` is private — the same polarity PHP/Kotlin already established in Phase 2), and call-graph edges for both local and remote (`Module.function(...)`) calls; see [`ROADMAP.md`'s Phase 4](../ROADMAP.md#phase-4--ecosystem) for candidate `--lsp` servers ([`expert`](https://github.com/expert-lsp/expert), [`dexter`](https://github.com/remoteoss/dexter))
 
 ---
 
