@@ -1109,6 +1109,24 @@ it had already exhausted the full 4-retry budget and failed regardless, so the w
 `wait_until_ready` fix above, not the per-query retry count, is what actually does the load-bearing
 work here.
 
+### A fifth round of feedback on the stress-test survivor, and why it didn't change anything here
+
+A follow-up review (recorded in
+[`docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`](feedback/2026-08-rust-analyzer-salsa-readiness-review.md))
+proposed a more precise mechanism for the one stress-test flip above: rust-analyzer's analysis is
+demand-driven through salsa, so a workspace can report fully indexed via `$/progress` while a
+specific crate's def-map lowering still hasn't happened, deferred to whichever query touches that
+crate first — making readiness a per-crate property the global signal can't fully see. That's a real
+property of salsa-backed servers in general. Checked against this specific incident, though, it
+doesn't hold: `Graph::get` and `Graph::transitive_callers` are both defined in the same
+`impl<'a> Graph<'a>` block in `crates/okf-graph/src/lib.rs`, not different crates, and `okf-graph`
+was already a repeatedly-queried, warm crate by the time this query landed in the same run — not one
+paying a first-touch lowering cost. The flip stays best explained by what Phase H already measured:
+a query landing on a CPU-starved process during the stress test's deliberate concurrent-load
+condition, exhausting its 4-retry budget without an answer. No further code change follows; the
+per-crate distinction is worth keeping in mind if a future run turns up a flip that actually lands on
+a crate's first-ever query.
+
 ### Tests
 
 - `okf-lsp`: `observe_progress_message_tracks_the_begin_report_end_lifecycle`,
@@ -1137,6 +1155,7 @@ work here.
 - [`docs/feedback/2026-08-community-roadmap-review.md`](feedback/2026-08-community-roadmap-review.md) — the reviewer's first-round feedback, already delivered
 - [`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`](feedback/2026-08-tool-consolidation-benchmark-review.md) — the reviewer's third-round feedback (Medium), driving Phase G
 - [`docs/feedback/2026-08-rust-analyzer-self-disagreement-review.md`](feedback/2026-08-rust-analyzer-self-disagreement-review.md) — the reviewer's fourth-round feedback (Medium), driving Phase H
+- [`docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`](feedback/2026-08-rust-analyzer-salsa-readiness-review.md) — the reviewer's fifth-round feedback (Medium) on Phase H's stress-test result, checked against the source and not actioned
 - [`ROADMAP.md` — Improvement Plan (AI-native platform maturity)](../ROADMAP.md#improvement-plan--ai-native-platform-maturity-community-feedback) — what's already shipped from the first round
 - [`docs/improvement-plan.md`](improvement-plan.md) — the competitive gap-analysis plan this document's phase/test/acceptance-criteria structure follows
 - [`benchmarks/`](../benchmarks/) — the discoverable, reproducible-run companion to this document's design writeups: how to actually run each of Phase E/G's benchmarks, and the real results collected against real corpora so far

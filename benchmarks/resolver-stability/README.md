@@ -136,6 +136,15 @@ Measured again, for real, after the fix:
   sustained, adversarial CPU contention, and this benchmark now says so with a number instead of a
   guess.
 
+  A follow-up review proposed a sharper mechanism for this specific flip — salsa's per-crate,
+  demand-driven lowering rather than a readiness-detection gap, since `$/progress` covers indexing,
+  not necessarily every crate's first-touch analysis cost. Checked against the source, it doesn't
+  fit this incident: `Graph::get` and `Graph::transitive_callers` are the same `impl` block in the
+  same crate (`okf-graph`), not a cross-crate call, and that crate was already warm from earlier
+  queries in the same run. The CPU-contention explanation above still stands; see
+  [`docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`](../../docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md)
+  for the full exchange.
+
 **Open**: this measurement hasn't been run on a corpus other than okf-rs's own source, or across a
 wider resolver-version gap. A different codebase's ambiguous-call density could plausibly show a
 different rate — that's exactly the kind of project-specific number this benchmark exists to let a

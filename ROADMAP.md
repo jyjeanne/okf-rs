@@ -439,7 +439,12 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   eliminated the race outright. See
   [`docs/improvement-plan-provenance-diff.md`](docs/improvement-plan-provenance-diff.md#12-phase-h--rust-analyzer-readiness-gating-not-first-success-medium-review-august-2026--shipped)
   for the full writeup and [`benchmarks/resolver-stability/README.md`](benchmarks/resolver-stability/README.md)
-  for the reproducible run.
+  for the reproducible run. A fifth-round follow-up proposed a more precise mechanism for that
+  survivor (salsa's per-crate, demand-driven lowering rather than a readiness-detection gap) —
+  checked against the source, `Graph::get`/`Graph::transitive_callers` are the same `impl` block in
+  the same crate, already warm by the time the query landed, so the flip stays best explained by CPU
+  contention exhausting the retry budget, not a first-touch lowering cost; see
+  [`docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`](docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md).
 
 Verified by dogfooding. Unit tests cover the new field end-to-end: `okf-lsp` parses `serverInfo.version`
 from a real `initialize` response and — genuinely exercised in this environment, not skipped —
