@@ -1139,6 +1139,91 @@ fn standalone_binary_check_determinism_reports_deterministic_across_more_than_tw
     assert!(out.contains("4 concepts"), "unexpected output: {out}");
 }
 
+/// `--warm-crate` without `--check-determinism` is rejected up front — it
+/// only means anything as a modifier of a determinism check.
+#[test]
+fn standalone_binary_warm_crate_requires_check_determinism() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let check = run(
+        &project,
+        &["generate", ".", "--lsp", "--warm-crate", "okf-graph"],
+    );
+    assert!(
+        !check.status.success(),
+        "expected --warm-crate without --check-determinism to fail"
+    );
+    let err = stderr_of(&check);
+    assert!(
+        err.contains("--warm-crate") && err.contains("--check-determinism"),
+        "unexpected stderr: {err}"
+    );
+}
+
+/// `--warm-crate` without `--lsp` is rejected up front — there's no
+/// language-server analysis to warm up on the tree-sitter-only path.
+#[test]
+fn standalone_binary_warm_crate_requires_lsp() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let check = run(
+        &project,
+        &[
+            "generate",
+            ".",
+            "--check-determinism",
+            "--warm-crate",
+            "okf-graph",
+        ],
+    );
+    assert!(
+        !check.status.success(),
+        "expected --warm-crate without --lsp to fail"
+    );
+    let err = stderr_of(&check);
+    assert!(
+        err.contains("--warm-crate") && err.contains("--lsp"),
+        "unexpected stderr: {err}"
+    );
+}
+
+/// `--warm-queries` without `--warm-crate` is rejected up front — the
+/// query budget only means anything alongside a target crate.
+#[test]
+fn standalone_binary_warm_queries_requires_warm_crate() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let check = run(
+        &project,
+        &[
+            "generate",
+            ".",
+            "--check-determinism",
+            "--lsp",
+            "--warm-queries",
+            "5",
+        ],
+    );
+    assert!(
+        !check.status.success(),
+        "expected --warm-queries without --warm-crate to fail"
+    );
+    let err = stderr_of(&check);
+    assert!(
+        err.contains("--warm-queries") && err.contains("--warm-crate"),
+        "unexpected stderr: {err}"
+    );
+}
+
 /// `--check-fresh` verifies the bundle already on disk still matches a
 /// fresh `generate` — the "bundle is up to date with source" CI check.
 /// Right after a real `generate`, the two must agree.

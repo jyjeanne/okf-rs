@@ -23,6 +23,7 @@ mod cache;
 mod lsp;
 
 pub use cache::AnalysisCache;
+pub use lsp::CrateWarmup;
 
 use anyhow::{Context, Result};
 use okf_core::{ManifestKind, Project};
@@ -122,6 +123,22 @@ pub fn analyze_with_cache_lsp(
     project: &Project,
     cache: &mut AnalysisCache,
     use_lsp: bool,
+) -> Result<(AnalysisResult, IncrementalStats)> {
+    analyze_with_cache_lsp_warmed(project, cache, use_lsp, None)
+}
+
+/// Like [`analyze_with_cache_lsp`], but with `warmup` set, deliberately
+/// forces one crate's own lazy semantic analysis (see [`CrateWarmup`])
+/// before the real LSP resolution pass runs — an experimental knob for
+/// `okf-rs generate --check-determinism-repeats --warm-crate`, not
+/// something ordinary `generate`/`generate --lsp` callers need. No-op
+/// (identical to [`analyze_with_cache_lsp`]) when `use_lsp` is false or
+/// `warmup` is `None`.
+pub fn analyze_with_cache_lsp_warmed(
+    project: &Project,
+    cache: &mut AnalysisCache,
+    use_lsp: bool,
+    warmup: Option<CrateWarmup>,
 ) -> Result<(AnalysisResult, IncrementalStats)> {
     let mut concepts = detect_packages(project)?;
 
@@ -259,6 +276,7 @@ pub fn analyze_with_cache_lsp(
             &id_to_location,
             &symbol_table,
             &mut resolved_edges,
+            warmup.as_ref(),
         );
     }
 

@@ -40,6 +40,50 @@ use std::time::Duration;
 const DEFINITION_RETRIES: u32 = 2;
 const DEFINITION_RETRY_DELAY: Duration = Duration::from_millis(300);
 
+/// Deliberately forces a target crate's own lazy analysis (def-map
+/// lowering, type inference — whatever a salsa-backed server like
+/// rust-analyzer defers to the first query that actually touches a given
+/// crate, rather than doing it during the workspace-wide indexing pass
+/// `okf_lsp::LspClient::wait_until_ready` waits on) to happen *before* the
+/// real, measured resolution pass in [`resolve_ambiguous_calls`], instead
+/// of leaving it to chance which crate a stress test's first real query
+/// happens to land in.
+///
+/// Exists so `okf-rs generate --check-determinism-repeats --warm-crate
+/// <name>` can test the demand-driven-analysis hypothesis directly,
+/// isolated from the CPU-contention one both share a stress-test run
+/// otherwise conflates — see
+/// `docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md` and
+/// `benchmarks/resolver-stability/README.md`.
+#[derive(Debug, Clone)]
+pub struct CrateWarmup {
+    /// A crate directory name under `crates/` (e.g. `okf-graph`) —
+    /// matched against each ambiguous call's relative path by the prefix
+    /// `crates/{crate_name}/`.
+    pub crate_name: String,
+    /// How many throwaway `textDocument/definition` queries into the
+    /// target crate to send before the real resolution pass starts.
+    pub queries: usize,
+}
+
+/// Selects up to `warmup.queries` entries from `ambiguous` whose file lies
+/// under `warmup.crate_name`, in the same order `ambiguous` already has —
+/// the set [`resolve_ambiguous_calls`] fires throwaway queries at to warm
+/// that crate up. Pulled out as a pure function so the selection logic is
+/// unit-testable without spawning a real language server.
+fn warmup_targets<'a>(
+    ambiguous: &[&'a (CallCandidate, Language, String)],
+    warmup: &CrateWarmup,
+) -> Vec<&'a (CallCandidate, Language, String)> {
+    let prefix = format!("crates/{}/", warmup.crate_name);
+    ambiguous
+        .iter()
+        .filter(|(_, _, relative_path)| relative_path.starts_with(&prefix))
+        .take(warmup.queries)
+        .copied()
+        .collect()
+}
+
 /// Attempts to resolve each of `ambiguous` (calls already known to match
 /// more than one candidate by name) via that call's own language server,
 /// appending any edge it can precisely confirm to `resolved_edges`.
@@ -54,6 +98,12 @@ const DEFINITION_RETRY_DELAY: Duration = Duration::from_millis(300);
 /// `ambiguous` (keyed by relative path) — reusing the source text the
 /// caller already read once, rather than this function reading each file
 /// from disk again itself.
+///
+/// `warmup`, when set, is applied once — right after the *first* client
+/// for a language starts — by firing its throwaway queries (see
+/// [`CrateWarmup`]) before the real per-call loop below reaches any of
+/// them for real. A no-op for a project with only one language client,
+/// beyond that one warm-up pass.
 pub(crate) fn resolve_ambiguous_calls(
     project: &Project,
     ambiguous: &[&(CallCandidate, Language, String)],
@@ -61,10 +111,12 @@ pub(crate) fn resolve_ambiguous_calls(
     id_to_location: &HashMap<&str, &Location>,
     candidates_by_name: &HashMap<&str, Vec<&str>>,
     resolved_edges: &mut Vec<ResolvedEdge>,
+    warmup: Option<&CrateWarmup>,
 ) {
     let mut clients: HashMap<Language, Option<okf_lsp::LspClient>> = HashMap::new();
 
     for (call, language, relative_path) in ambiguous {
+        let is_first_use = !clients.contains_key(language);
         let client_slot =
             clients.entry(*language).or_insert_with(|| {
                 match okf_lsp::LspClient::start(*language, &project.root) {
@@ -82,6 +134,29 @@ pub(crate) fn resolve_ambiguous_calls(
         let Some(client) = client_slot.as_mut() else {
             continue;
         };
+
+        if is_first_use {
+            if let Some(warmup) = warmup {
+                for (warm_call, _, warm_path) in warmup_targets(ambiguous, warmup) {
+                    let Some(source) = file_sources.get(warm_path.as_str()) else {
+                        continue;
+                    };
+                    let Ok(uri) = client.ensure_open(warm_path, source) else {
+                        continue;
+                    };
+                    // Best-effort, single attempt, result discarded: this
+                    // exists purely to force the server's own lazy
+                    // analysis of this crate before the measured queries
+                    // below, not to resolve anything itself.
+                    let _ = client.definition(
+                        &uri,
+                        warm_call.call_site.line,
+                        warm_call.call_site.character,
+                    );
+                }
+            }
+        }
+
         let Some(source) = file_sources.get(relative_path.as_str()) else {
             continue;
         };
@@ -137,5 +212,75 @@ pub(crate) fn resolve_ambiguous_calls(
 
     for client in clients.into_values().flatten() {
         client.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(caller_id: &str, path: &str) -> (CallCandidate, Language, String) {
+        (
+            CallCandidate {
+                caller_id: caller_id.to_string(),
+                callee_name: "get".to_string(),
+                call_site: okf_tree_sitter::CallSite {
+                    line: 0,
+                    character: 0,
+                },
+            },
+            Language::Rust,
+            path.to_string(),
+        )
+    }
+
+    #[test]
+    fn warmup_targets_only_selects_the_named_crate() {
+        let a = candidate("functions/a", "crates/okf-graph/src/lib.rs");
+        let b = candidate("functions/b", "crates/okf-lsp/src/lib.rs");
+        let c = candidate("functions/c", "crates/okf-graph/src/other.rs");
+        let ambiguous: Vec<&(CallCandidate, Language, String)> = vec![&a, &b, &c];
+        let warmup = CrateWarmup {
+            crate_name: "okf-graph".to_string(),
+            queries: 10,
+        };
+
+        let targets = warmup_targets(&ambiguous, &warmup);
+
+        assert_eq!(targets.len(), 2);
+        assert!(targets
+            .iter()
+            .all(|(_, _, path)| path.starts_with("crates/okf-graph/")));
+    }
+
+    #[test]
+    fn warmup_targets_respects_the_query_budget() {
+        let a = candidate("functions/a", "crates/okf-graph/src/a.rs");
+        let b = candidate("functions/b", "crates/okf-graph/src/b.rs");
+        let ambiguous: Vec<&(CallCandidate, Language, String)> = vec![&a, &b];
+        let warmup = CrateWarmup {
+            crate_name: "okf-graph".to_string(),
+            queries: 1,
+        };
+
+        let targets = warmup_targets(&ambiguous, &warmup);
+
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn warmup_targets_does_not_match_a_crate_name_that_is_only_a_prefix() {
+        // "okf-graph" must not match "okf-graph-extra"'s files -- a naive
+        // substring match would.
+        let a = candidate("functions/a", "crates/okf-graph-extra/src/lib.rs");
+        let ambiguous: Vec<&(CallCandidate, Language, String)> = vec![&a];
+        let warmup = CrateWarmup {
+            crate_name: "okf-graph".to_string(),
+            queries: 10,
+        };
+
+        let targets = warmup_targets(&ambiguous, &warmup);
+
+        assert!(targets.is_empty());
     }
 }
