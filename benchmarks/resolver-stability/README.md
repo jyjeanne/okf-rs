@@ -145,6 +145,42 @@ Measured again, for real, after the fix:
   [`docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`](../../docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md)
   for the full exchange.
 
+### Testing the lazy-analysis theory directly: `--warm-crate`
+
+`okf-rs generate --check-determinism --lsp --warm-crate <name> [--warm-queries N]` exists to test
+the salsa demand-driven-lowering theory on its own terms, separated from CPU contention: before the
+real, measured resolution pass, it fires `N` throwaway `textDocument/definition` queries into the
+named crate, forcing whatever lazy analysis a salsa-backed server defers to first contact before
+anything is timed. Comparing a `--warm-crate` run against an otherwise-identical run without it, if
+a flip only appears cold, that's real evidence for the lowering theory; if it appears either way
+(or not at all), contention is still the better explanation.
+
+Run for real against this repository, on the same 4-core sandbox as the measurements above, without
+any deliberately concurrent second job this time — the sandbox's own baseline load turned out to be
+enough on its own: a plain `generate --lsp --check-determinism-repeats 6` (no `--warm-crate`, no
+extra concurrent process) produced a fresh, genuinely **cross-crate** flip on the very first attempt
+— unlike the intra-crate `Graph::get`/`transitive_callers` case above, this one really does cross a
+crate boundary (`okf-cli` → `okf-core`):
+
+```
+Non-deterministic: 2 file(s) flipped across 6 independent `generate --lsp` runs on . :
+  5/5 repeat run(s) disagreed with run 1 on at least one file
+  functions/crates/okf-cli/src/cmd_scan.md: differed in 5/5 comparison(s) against run 1
+  functions/crates/okf-core/src/Project/load.md: differed in 5/5 comparison(s) against run 1
+```
+
+Three more plain (cold) repeats of the same command came back clean; three `--warm-crate okf-core
+--warm-queries 30` repeats also came back clean. So the observed rate across this small batch was 1
+flip in 3 cold attempts vs. 0 in 3 warm ones — a direction consistent with the lazy-analysis theory,
+but from a single event, nowhere near enough to say the warm-up is what prevented the other two. A
+flip that only shows up once in 6 total attempts needs a real distribution (10+ of each, matching
+this benchmark's own stated rationale for `--check-determinism-repeats` over a single pair) before
+"warm-crate reduces the rate" is a claim this benchmark can actually back, rather than "it ran clean
+three times," which a low base rate would also produce with no warm-up doing anything at all.
+
+**Open**: whether `--warm-crate` measurably changes the flip rate hasn't been established yet — the
+batch above is a feasibility check for the tool, not the experiment itself.
+
 **Open**: this measurement hasn't been run on a corpus other than okf-rs's own source, or across a
 wider resolver-version gap. A different codebase's ambiguous-call density could plausibly show a
 different rate — that's exactly the kind of project-specific number this benchmark exists to let a

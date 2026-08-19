@@ -69,10 +69,28 @@ genuinely first query.
 
 ## Response
 
-No code change follows from this round: the incident it's diagnosing doesn't match the diagnosis,
-and Phase H's own explanation (CPU contention exhausting the retry budget on an already-indexed,
-already-touched crate) still stands as the best-supported account of the one flip actually measured.
-The per-crate/salsa distinction is recorded here rather than acted on, in case a future
-`--check-determinism-repeats` run turns up a flip that *does* land on a crate's genuinely first
-query — at which point "prime every crate with a cheap query before running the real ones" would be
-the concrete follow-up, not a change to `wait_until_ready` itself.
+No code change follows from this round on the incident it's diagnosing: the diagnosis doesn't match
+the case (see above), and Phase H's own explanation (CPU contention exhausting the retry budget on
+an already-indexed, already-touched crate) still stands as the best-supported account of that flip.
+
+The general theory — readiness as a per-crate rather than per-server property — was still worth
+testing on its own terms rather than only filed away, since nothing this project had measured so far
+could actually distinguish it from CPU contention: every `--check-determinism-repeats` run to date
+conflated the two. `okf-rs generate --check-determinism --lsp --warm-crate <name> [--warm-queries
+N]` (`crates/okf-analyzer/src/lsp.rs`'s `CrateWarmup`, threaded through
+`analyze_with_cache_lsp_warmed`) now provides that control: it fires throwaway
+`textDocument/definition` queries into a named crate before the real, measured resolution pass, so
+a run with it can be compared directly against an otherwise-identical run without it.
+
+Run for real against this repository (see
+[`benchmarks/resolver-stability/README.md`](../../benchmarks/resolver-stability/README.md)'s
+"Testing the lazy-analysis theory directly" section for the full output): a plain run, no
+`--warm-crate` and no deliberately concurrent second process this time, turned up a fresh flip on
+its own — and this one *is* genuinely cross-crate (`okf-cli::cmd_scan` → `okf-core::Project::load`),
+unlike the intra-crate case this document is otherwise about. Three more cold repeats came back
+clean; three `--warm-crate okf-core --warm-queries 30` repeats also came back clean — 1 flip in 3
+cold attempts vs. 0 in 3 warm ones. That direction is consistent with the lazy-analysis theory, but
+a single event is nowhere near a distribution: this batch establishes that the tool works and that a
+real cross-crate flip exists to test against, not that warm-up changes the rate. A proper answer
+needs 10+ repeats of each condition, the same bar this project already holds
+`--check-determinism-repeats` itself to before trusting a rate.
