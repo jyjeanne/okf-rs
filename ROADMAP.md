@@ -446,10 +446,15 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   explained by CPU contention exhausting the retry budget, not a first-touch lowering cost. The
   general theory was still worth a real test, though: `generate --check-determinism --lsp
   --warm-crate <name> [--warm-queries N]` now forces a named crate's lazy analysis before the
-  measured resolution pass, so a warm run can be compared directly against a cold one. Run for real,
-  a plain (no-warmup) invocation turned up a fresh, genuinely cross-crate flip
-  (`okf-cli::cmd_scan` → `okf-core::Project::load`) on its own; a small follow-up batch (1 flip in 3
-  cold attempts vs. 0 in 3 warm ones) points the right direction but isn't a distribution yet — see
+  measured resolution pass, so a warm run can be compared directly against a cold one. Run for real
+  — a plain (no-warmup) invocation turned up a fresh, genuinely cross-crate flip
+  (`okf-cli::cmd_scan` → `okf-core::Project::load`) on its own, then a full 10-vs-10 batch: cold
+  flipped 1/10, warm 0/10 (2/13 vs. 0/13 combined with the earlier feasibility check), and every
+  flip observed in either batch was specifically `okf-core::Project::load` going missing as a
+  callee — the exact crate `--warm-crate` targets. Real, mechanistically coherent corroboration for
+  the lazy-analysis theory on this crate/symbol, but not proof: a one-sided Fisher's exact test on
+  2/13 vs. 0/13 gives p ≈ 0.24, short of significance at this sample size — a 25-30-per-arm batch is
+  the next step if this needs to move from "consistent with" to "established." See
   [`docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`](docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md)
   and `benchmarks/resolver-stability/README.md`.
 

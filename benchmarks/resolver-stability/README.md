@@ -170,16 +170,47 @@ Non-deterministic: 2 file(s) flipped across 6 independent `generate --lsp` runs 
 ```
 
 Three more plain (cold) repeats of the same command came back clean; three `--warm-crate okf-core
---warm-queries 30` repeats also came back clean. So the observed rate across this small batch was 1
-flip in 3 cold attempts vs. 0 in 3 warm ones — a direction consistent with the lazy-analysis theory,
-but from a single event, nowhere near enough to say the warm-up is what prevented the other two. A
-flip that only shows up once in 6 total attempts needs a real distribution (10+ of each, matching
-this benchmark's own stated rationale for `--check-determinism-repeats` over a single pair) before
-"warm-crate reduces the rate" is a claim this benchmark can actually back, rather than "it ran clean
-three times," which a low base rate would also produce with no warm-up doing anything at all.
+--warm-queries 30` repeats also came back clean — 1 flip in 3 cold attempts vs. 0 in 3 warm ones, a
+direction consistent with the lazy-analysis theory but nowhere near a real distribution from a
+single event.
 
-**Open**: whether `--warm-crate` measurably changes the flip rate hasn't been established yet — the
-batch above is a feasibility check for the tool, not the experiment itself.
+A full 10-vs-10 batch followed (still this same 4-core sandbox, no artificial contention — its own
+baseline load is what produces flips here): **10 plain `--check-determinism-repeats 6` runs, then 10
+`--warm-crate okf-core --warm-queries 30` runs.** Cold: 1 of the 10 flipped —
+
+```
+Non-deterministic: 5 file(s) flipped across 6 independent `generate --lsp` runs on . :
+  5/5 repeat run(s) disagreed with run 1 on at least one file
+  functions/crates/okf-analyzer/src/cache/AnalysisCache/load.md: differed in 5/5 comparison(s) against run 1
+  functions/crates/okf-analyzer/src/cache/round_trips_through_save_and_load.md: differed in 5/5 comparison(s) against run 1
+  functions/crates/okf-cli/src/cmd_check_determinism.md: differed in 1/5 comparison(s) against run 1
+  functions/crates/okf-cli/src/cmd_generate.md: differed in 5/5 comparison(s) against run 1
+  functions/crates/okf-core/src/Project/load.md: differed in 5/5 comparison(s) against run 1
+```
+
+— every one of those five files is a *different caller* (from `okf-analyzer` and `okf-cli`, two
+different crates) missing an edge into the exact same callee: `okf-core::Project::load`. Warm: 0 of
+the 10 flipped, none of them on `Project::load` or anything else.
+
+Combined across both batches (the earlier 3-vs-3 feasibility check plus this 10-vs-10 run): **2
+flips in 13 cold attempts (15%) vs. 0 in 13 warm ones (0%)**, and — this is the more specific claim —
+*every single flip observed, in either batch, lands on `okf-core::Project::load` specifically, the
+exact crate `--warm-crate okf-core` targets.* That specificity is more mechanistically telling than
+the raw 2-vs-0 count: it isn't "cold runs are generally flakier," it's "the one callee that keeps
+going missing is the one crate being warmed makes disappear entirely."
+
+That said, the raw count alone is not statistically significant — a one-sided Fisher's exact test on
+the 2/13 vs. 0/13 table gives p ≈ 0.24, comfortably above conventional significance thresholds. A
+15% base rate producing zero flips in 13 tries by chance alone is not remarkable. So: real,
+mechanistically coherent corroborating evidence for the lazy-analysis theory (specifically for
+`okf-core::Project::load` as a genuine first-touch cold crate, distinct from the `Graph::get` case
+this document otherwise concerns), but not proof — a larger batch (25-30 per arm, the point at which
+a 15%-vs-0% true difference would clear conventional significance) is the next step if this needs to
+move from "consistent with" to "established."
+
+**Open**: whether the 2/13-vs-0/13 `--warm-crate` gap holds up at a size that clears statistical
+significance (p ≈ 0.24 at n=13 per arm; a 25-30-per-arm batch is the next step) is still open — see
+above.
 
 **Open**: this measurement hasn't been run on a corpus other than okf-rs's own source, or across a
 wider resolver-version gap. A different codebase's ambiguous-call density could plausibly show a

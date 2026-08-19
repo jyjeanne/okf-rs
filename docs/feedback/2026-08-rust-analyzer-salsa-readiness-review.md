@@ -84,13 +84,21 @@ a run with it can be compared directly against an otherwise-identical run withou
 
 Run for real against this repository (see
 [`benchmarks/resolver-stability/README.md`](../../benchmarks/resolver-stability/README.md)'s
-"Testing the lazy-analysis theory directly" section for the full output): a plain run, no
-`--warm-crate` and no deliberately concurrent second process this time, turned up a fresh flip on
-its own — and this one *is* genuinely cross-crate (`okf-cli::cmd_scan` → `okf-core::Project::load`),
-unlike the intra-crate case this document is otherwise about. Three more cold repeats came back
-clean; three `--warm-crate okf-core --warm-queries 30` repeats also came back clean — 1 flip in 3
-cold attempts vs. 0 in 3 warm ones. That direction is consistent with the lazy-analysis theory, but
-a single event is nowhere near a distribution: this batch establishes that the tool works and that a
-real cross-crate flip exists to test against, not that warm-up changes the rate. A proper answer
-needs 10+ repeats of each condition, the same bar this project already holds
-`--check-determinism-repeats` itself to before trusting a rate.
+"Testing the lazy-analysis theory directly" section for the full output, including every run's raw
+result): a plain run, no `--warm-crate` and no deliberately concurrent second process, turned up a
+fresh flip on its own — and this one *is* genuinely cross-crate (`okf-cli::cmd_scan` →
+`okf-core::Project::load`), unlike the intra-crate case this document is otherwise about. A
+follow-up 10-vs-10 batch (10 plain repeats, then 10 `--warm-crate okf-core --warm-queries 30`
+repeats, `--check-determinism-repeats 6` each) gave the real distribution the theory needed to be
+tested against: cold flipped 1/10, warm 0/10. Combined with the 3-vs-3 feasibility batch that came
+before it, **2/13 cold vs. 0/13 warm**, and — the more specific finding — *every flip observed, in
+either batch, was `okf-core::Project::load` missing as a callee from a different cross-crate caller
+each time*, exactly the crate `--warm-crate okf-core` targets. That's real, mechanistically coherent
+corroboration for the lazy-analysis theory, applied to this one crate/symbol specifically.
+
+It isn't proof, though: a one-sided Fisher's exact test on 2/13 vs. 0/13 gives p ≈ 0.24, well short
+of significance — a 15% base rate can produce zero flips in 13 tries by chance alone often enough
+that this result alone doesn't establish the warm-up caused the difference. A batch large enough to
+actually clear significance (25-30 repeats per arm) is the next step if this needs to move from
+"consistent with" to "established" — recorded as open work in the benchmark README rather than
+claimed here.
