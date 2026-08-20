@@ -181,31 +181,33 @@ impl Project {
 /// Reads a source file's contents, tolerating files that aren't valid
 /// UTF-8.
 ///
-/// Legacy single-byte encodings (Windows-1254, Latin-1, Shift-JIS, ...)
-/// are still common in codebases that predate UTF-8 adoption, and a
-/// single such file used to abort analysis of the entire project (see
-/// <https://github.com/jyjeanne/okf-rs/issues/35>). Rather than fail the
-/// read outright, invalid byte sequences are replaced with U+FFFD, and a
-/// warning naming the file is printed once so the substitution isn't
-/// silent. This is a lossy but workable trade-off for source-code
-/// analysis specifically: identifiers and structural syntax are
-/// near-universally ASCII, so the tree-sitter parse that follows is
-/// unaffected even though non-ASCII text inside string literals and
-/// comments renders as replacement characters instead of its original
-/// form.
+/// Legacy single-byte encodings are still common in codebases that
+/// predate UTF-8 adoption -- Windows-1254 (Turkish) in particular, per
+/// <https://github.com/jyjeanne/okf-rs/issues/35> -- and a single such
+/// file used to abort analysis of the entire project. When the bytes
+/// aren't valid UTF-8, this falls back to decoding them as Windows-1254:
+/// unlike a blind lossy UTF-8 read, that recovers the file's actual
+/// non-ASCII text (Turkish letters like `ş`/`ğ`/`ı` and the Windows-1252-
+/// compatible range they share with other Western European legacy
+/// encodings) instead of replacing every such byte with U+FFFD. Every
+/// byte value has some mapping under Windows-1254 (unassigned bytes pass
+/// through to their C1 control code point), so this fallback always
+/// succeeds -- it never itself produces U+FFFD. A warning naming the
+/// file is printed once so the fallback isn't silent.
 pub fn read_source_lossy(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
-    Ok(match String::from_utf8(bytes) {
-        Ok(content) => content,
+    match String::from_utf8(bytes) {
+        Ok(content) => Ok(content),
         Err(e) => {
+            let bytes = e.into_bytes();
+            let (content, _, _had_errors) = encoding_rs::WINDOWS_1254.decode(&bytes);
             eprintln!(
-                "warning: {} is not valid UTF-8; reading it lossily (invalid bytes become \
-                 U+FFFD) -- non-ASCII text in string literals/comments may look garbled",
+                "warning: {} is not valid UTF-8; decoded it as Windows-1254",
                 path.display()
             );
-            String::from_utf8_lossy(&e.into_bytes()).into_owned()
+            Ok(content.into_owned())
         }
-    })
+    }
 }
 
 fn is_ignored_package_dir(dir: &str) -> bool {
@@ -356,25 +358,40 @@ mod tests {
     }
 
     #[test]
-    fn read_source_lossy_substitutes_invalid_utf8_instead_of_failing() {
-        // 0xFD is a valid Windows-1254 byte (it maps to 'ý') but not a
-        // valid standalone UTF-8 lead byte -- exactly the kind of file
-        // https://github.com/jyjeanne/okf-rs/issues/35 reported.
+    fn read_source_lossy_decodes_windows_1254_instead_of_mangling_it() {
+        // 0xFD is a valid Windows-1254 byte (it maps to 'ı', the Turkish
+        // dotless i) but not a valid standalone UTF-8 lead byte -- exactly
+        // the kind of file https://github.com/jyjeanne/okf-rs/issues/35
+        // reported. It should decode to its real character, not U+FFFD.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.cs");
-        let mut bytes = b"// caf\xfd\n".to_vec();
+        let mut bytes = b"// yaz\xfd\n".to_vec();
+        bytes.extend_from_slice(b"class Program {}");
+        fs::write(&path, &bytes).unwrap();
+
+        let content = read_source_lossy(&path).unwrap();
+
+        assert_eq!(content, "// yazı\nclass Program {}");
+    }
+
+    #[test]
+    fn read_source_lossy_never_produces_replacement_characters_for_windows_1254() {
+        // Every byte value 0x00-0xFF has some mapping under Windows-1254
+        // (unassigned bytes like 0x81 pass through to their C1 control
+        // code point rather than erroring), so the fallback never itself
+        // introduces U+FFFD the way a blind lossy UTF-8 read would.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.cs");
+        let mut bytes = b"// caf\x81\n".to_vec();
         bytes.extend_from_slice(b"class Program {}");
         fs::write(&path, &bytes).unwrap();
 
         let content = read_source_lossy(&path).unwrap();
 
         assert!(
-            content.contains('\u{FFFD}'),
-            "invalid byte should become U+FFFD, got: {content:?}"
+            !content.contains('\u{FFFD}'),
+            "Windows-1254 decoding should never introduce U+FFFD, got: {content:?}"
         );
-        assert!(
-            content.contains("class Program {}"),
-            "ASCII structure surrounding the bad byte should survive intact, got: {content:?}"
-        );
+        assert_eq!(content, "// caf\u{81}\nclass Program {}");
     }
 }
