@@ -184,30 +184,65 @@ impl Project {
 /// Legacy single-byte encodings are still common in codebases that
 /// predate UTF-8 adoption -- Windows-1254 (Turkish) in particular, per
 /// <https://github.com/jyjeanne/okf-rs/issues/35> -- and a single such
-/// file used to abort analysis of the entire project. When the bytes
-/// aren't valid UTF-8, this falls back to decoding them as Windows-1254:
-/// unlike a blind lossy UTF-8 read, that recovers the file's actual
-/// non-ASCII text (Turkish letters like `ş`/`ğ`/`ı` and the Windows-1252-
-/// compatible range they share with other Western European legacy
-/// encodings) instead of replacing every such byte with U+FFFD. Every
-/// byte value has some mapping under Windows-1254 (unassigned bytes pass
-/// through to their C1 control code point), so this fallback always
-/// succeeds -- it never itself produces U+FFFD. A warning naming the
-/// file is printed once so the fallback isn't silent.
+/// file used to abort analysis of the entire project. Bytes are decoded
+/// incrementally rather than validated as UTF-8 all-or-nothing: each
+/// maximal run of valid UTF-8 is kept verbatim, and only the byte(s)
+/// that actually fail UTF-8 validation are decoded as Windows-1254 and
+/// spliced in. That matters for a file that's genuinely UTF-8 apart from
+/// a handful of stray legacy bytes (a pasted smart quote, say) -- naively
+/// re-decoding the *whole* file as Windows-1254 the moment any byte
+/// fails validation would mangle every other multi-byte UTF-8 sequence
+/// in it (e.g. "café" becoming "cafÃ©"). A genuinely Windows-1254-encoded
+/// file still comes out right: none of its non-ASCII bytes validate as
+/// UTF-8 in the first place, so the whole file effectively goes through
+/// the Windows-1254 path one invalid run at a time, recovering real
+/// characters like `ş`/`ğ`/`ı` instead of replacing them with U+FFFD.
+/// Every byte value has some mapping under Windows-1254 (unassigned
+/// bytes pass through to their C1 control code point), so the fallback
+/// always succeeds -- it never itself produces U+FFFD. A warning naming
+/// the file is printed once (not per invalid run) so the fallback isn't
+/// silent.
 pub fn read_source_lossy(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
-    match String::from_utf8(bytes) {
-        Ok(content) => Ok(content),
-        Err(e) => {
-            let bytes = e.into_bytes();
-            let (content, _, _had_errors) = encoding_rs::WINDOWS_1254.decode(&bytes);
-            eprintln!(
-                "warning: {} is not valid UTF-8; decoded it as Windows-1254",
-                path.display()
-            );
-            Ok(content.into_owned())
+    if std::str::from_utf8(&bytes).is_ok() {
+        // Just proved valid above, so this can't fail -- avoids cloning
+        // the whole buffer the way `String::from_utf8(bytes.clone())`
+        // would just to attempt the conversion.
+        return Ok(String::from_utf8(bytes).unwrap());
+    }
+
+    let mut content = String::with_capacity(bytes.len());
+    let mut rest = &bytes[..];
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                content.push_str(valid);
+                break;
+            }
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                // Safe: `valid_up_to` is exactly the length of the valid
+                // UTF-8 prefix `from_utf8` just found.
+                content.push_str(std::str::from_utf8(&rest[..valid_up_to]).unwrap());
+
+                // The invalid run: a malformed sequence has a known
+                // length (`error_len`); an incomplete one trailing off
+                // the end of the buffer (`error_len` is `None`) runs to
+                // the end of what's left.
+                let bad_len = e.error_len().unwrap_or(rest.len() - valid_up_to);
+                let bad_bytes = &rest[valid_up_to..valid_up_to + bad_len];
+                let (decoded, _, _) = encoding_rs::WINDOWS_1254.decode(bad_bytes);
+                content.push_str(&decoded);
+
+                rest = &rest[valid_up_to + bad_len..];
+            }
         }
     }
+    eprintln!(
+        "warning: {} is not valid UTF-8; decoded the non-UTF-8 portions as Windows-1254",
+        path.display()
+    );
+    Ok(content)
 }
 
 fn is_ignored_package_dir(dir: &str) -> bool {
@@ -393,5 +428,25 @@ mod tests {
             "Windows-1254 decoding should never introduce U+FFFD, got: {content:?}"
         );
         assert_eq!(content, "// caf\u{81}\nclass Program {}");
+    }
+
+    #[test]
+    fn read_source_lossy_preserves_valid_utf8_around_a_stray_bad_byte() {
+        // A file that's genuinely UTF-8 throughout except for one stray
+        // non-UTF-8 byte (e.g. a pasted Windows-1252 smart quote) must
+        // keep its real multi-byte UTF-8 text intact -- re-decoding the
+        // *whole* file as Windows-1254 the moment any byte fails
+        // validation would mangle "café" (0x63 0x61 0x66 0xc3 0xa9) into
+        // "cafÃ©" even though those bytes were valid UTF-8 all along.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.rs");
+        let mut bytes = b"// caf\xc3\xa9 note ".to_vec();
+        bytes.push(0x92); // lone Windows-1252 right single quote: invalid UTF-8 on its own
+        bytes.extend_from_slice(b" done\nfn main() {}");
+        fs::write(&path, &bytes).unwrap();
+
+        let content = read_source_lossy(&path).unwrap();
+
+        assert_eq!(content, "// café note \u{2019} done\nfn main() {}");
     }
 }
