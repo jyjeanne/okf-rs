@@ -157,7 +157,7 @@ pub fn analyze_with_cache_lsp(
         .files
         .par_iter()
         .map(|file| -> Result<FileParseResult> {
-            let source = fs::read_to_string(&file.absolute_path)
+            let source = okf_core::read_source_lossy(&file.absolute_path)
                 .with_context(|| format!("failed to read {}", file.relative_path))?;
             let hash = cache::hash_content(&source);
 
@@ -1061,6 +1061,33 @@ mod tests {
             .unwrap();
         assert_eq!(called_by_verify.resolved_by, "tree-sitter");
         assert_eq!(called_by_verify.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn analyzes_a_project_containing_a_non_utf8_source_file() {
+        // Regression test for https://github.com/jyjeanne/okf-rs/issues/35:
+        // a single Windows-1254-encoded file used to abort `analyze` for
+        // the whole project with "stream did not contain valid UTF-8".
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        // 0xFD is a valid Windows-1254 byte but not valid UTF-8 on its own.
+        let legacy = b"// caf\xfd\nclass Program {\n    void Run() {}\n}\n".to_vec();
+        assert!(String::from_utf8(legacy.clone()).is_err());
+        fs::write(dir.path().join("src/Legacy.cs"), &legacy).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "pub fn run() {}\n").unwrap();
+
+        let project = Project::load(dir.path()).unwrap();
+        let result =
+            analyze(&project).expect("non-UTF-8 file should be read lossily, not fail analysis");
+
+        assert!(
+            result.concepts.iter().any(|c| c.name == "Run"),
+            "the non-UTF-8 file's ASCII structure should still be parsed"
+        );
+        assert!(
+            result.concepts.iter().any(|c| c.name == "run"),
+            "other, valid-UTF-8 files in the same project should still be analyzed"
+        );
     }
 
     #[test]

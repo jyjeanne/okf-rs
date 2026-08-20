@@ -178,6 +178,36 @@ impl Project {
     }
 }
 
+/// Reads a source file's contents, tolerating files that aren't valid
+/// UTF-8.
+///
+/// Legacy single-byte encodings (Windows-1254, Latin-1, Shift-JIS, ...)
+/// are still common in codebases that predate UTF-8 adoption, and a
+/// single such file used to abort analysis of the entire project (see
+/// <https://github.com/jyjeanne/okf-rs/issues/35>). Rather than fail the
+/// read outright, invalid byte sequences are replaced with U+FFFD, and a
+/// warning naming the file is printed once so the substitution isn't
+/// silent. This is a lossy but workable trade-off for source-code
+/// analysis specifically: identifiers and structural syntax are
+/// near-universally ASCII, so the tree-sitter parse that follows is
+/// unaffected even though non-ASCII text inside string literals and
+/// comments renders as replacement characters instead of its original
+/// form.
+pub fn read_source_lossy(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!(
+                "warning: {} is not valid UTF-8; reading it lossily (invalid bytes become \
+                 U+FFFD) -- non-ASCII text in string literals/comments may look garbled",
+                path.display()
+            );
+            String::from_utf8_lossy(&e.into_bytes()).into_owned()
+        }
+    })
+}
+
 fn is_ignored_package_dir(dir: &str) -> bool {
     dir.split('/')
         .any(|part| IGNORED_PACKAGE_DIRS.contains(&part))
@@ -312,5 +342,39 @@ mod tests {
         let project = Project::load(dir.path()).unwrap();
         assert_eq!(project.files.len(), 3);
         assert_eq!(project.files_for(Language::Go).count(), 1);
+    }
+
+    #[test]
+    fn read_source_lossy_passes_through_valid_utf8_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() { println!(\"héllo\"); }").unwrap();
+
+        let content = read_source_lossy(&path).unwrap();
+
+        assert_eq!(content, "fn main() { println!(\"héllo\"); }");
+    }
+
+    #[test]
+    fn read_source_lossy_substitutes_invalid_utf8_instead_of_failing() {
+        // 0xFD is a valid Windows-1254 byte (it maps to 'ý') but not a
+        // valid standalone UTF-8 lead byte -- exactly the kind of file
+        // https://github.com/jyjeanne/okf-rs/issues/35 reported.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.cs");
+        let mut bytes = b"// caf\xfd\n".to_vec();
+        bytes.extend_from_slice(b"class Program {}");
+        fs::write(&path, &bytes).unwrap();
+
+        let content = read_source_lossy(&path).unwrap();
+
+        assert!(
+            content.contains('\u{FFFD}'),
+            "invalid byte should become U+FFFD, got: {content:?}"
+        );
+        assert!(
+            content.contains("class Program {}"),
+            "ASCII structure surrounding the bad byte should survive intact, got: {content:?}"
+        );
     }
 }

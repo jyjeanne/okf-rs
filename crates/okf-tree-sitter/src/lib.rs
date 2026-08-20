@@ -27,7 +27,6 @@ use anyhow::{Context, Result};
 use okf_core::SourceFile;
 use okf_parser::{Concept, Language};
 use serde::{Deserialize, Serialize};
-use std::fs;
 
 /// A call expression's position, 0-based in UTF-16 code units the way the
 /// Language Server Protocol's `Position` is — not tree-sitter's own byte-
@@ -75,7 +74,7 @@ pub struct FileExtraction {
 /// risks the two reads observing different content if the file is
 /// modified concurrently.
 pub fn extract_file(file: &SourceFile) -> Result<FileExtraction> {
-    let source = fs::read_to_string(&file.absolute_path)
+    let source = okf_core::read_source_lossy(&file.absolute_path)
         .with_context(|| format!("failed to read {}", file.relative_path))?;
     extract_source(&source, file)
 }
