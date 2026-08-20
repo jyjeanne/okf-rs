@@ -1029,6 +1029,7 @@ name = "okf-core"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "encoding_rs",
  "ignore",
  "okf-parser",
  "tempfile",
