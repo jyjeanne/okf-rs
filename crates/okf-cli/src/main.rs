@@ -37,6 +37,23 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Diagnostic: probe each crate's genuinely first `textDocument/definition`
+    /// query against an immediate repeat of the same query, one cold-vs-warm
+    /// pair per crate, in a single process with rust-analyzer's cache
+    /// priming turned off. Cache priming (on by default) walks the whole
+    /// crate graph and lowers every crate's def-map up front on workspace
+    /// load, which is why a genuinely cold crate is otherwise hard to catch
+    /// by chance -- with priming off, each crate's first query is reliably
+    /// cold rather than warm by luck of the indexing order, turning "wait
+    /// for a lucky flip every several runs" into one cold measurement per
+    /// crate, every run. Never writes a bundle or resolves an edge for
+    /// real; only meaningful for a language with a `$/progress`-capable,
+    /// cache-priming server (rust-analyzer). See
+    /// `docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`.
+    ColdCrateProbe {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Analyze a repository and write an OKF bundle.
     Generate {
         #[arg(default_value = ".")]
@@ -117,6 +134,27 @@ enum Command {
         /// `--check-determinism`; must be at least 2.
         #[arg(long, default_value_t = 2)]
         check_determinism_repeats: u32,
+        /// With `--check-determinism --lsp`, deliberately force this
+        /// crate's own lazy semantic analysis (def-map lowering, type
+        /// inference) before each run's real resolution pass, by firing
+        /// throwaway `textDocument/definition` queries into it first. An
+        /// experimental knob for isolating a demand-driven-analysis
+        /// (salsa) explanation for a residual flip from a CPU-contention
+        /// one — the two get conflated in an ordinary
+        /// `--check-determinism-repeats` stress run. Compare a run with
+        /// this set against an otherwise-identical run without it: if the
+        /// flip only appears when the target crate is left cold, that's
+        /// evidence for lazy analysis timing rather than contention alone.
+        /// Takes a crate directory name under `crates/` (e.g.
+        /// `okf-graph`), not a full path. Requires `--check-determinism`
+        /// and `--lsp`. See
+        /// `docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`.
+        #[arg(long)]
+        warm_crate: Option<String>,
+        /// How many throwaway queries `--warm-crate` sends before the real
+        /// resolution pass. Requires `--warm-crate`.
+        #[arg(long, default_value_t = 20)]
+        warm_queries: usize,
         /// Verify the bundle at `--output` is up to date with source
         /// instead of writing to it: re-analyzes the project fresh (always
         /// bypassing the incremental cache, regardless of `--no-cache`),
@@ -537,6 +575,7 @@ fn run(command: Command) -> Result<ExitCode> {
             no_agent_files,
         } => cmd_init(&path, &output, no_agent_files),
         Command::Scan { path } => cmd_scan(&path),
+        Command::ColdCrateProbe { path } => cmd_cold_crate_probe(&path),
         Command::Generate {
             path,
             output,
@@ -549,6 +588,8 @@ fn run(command: Command) -> Result<ExitCode> {
             dita,
             check_determinism,
             check_determinism_repeats,
+            warm_crate,
+            warm_queries,
             check_fresh,
         } => {
             if check_determinism && check_fresh {
@@ -558,6 +599,17 @@ fn run(command: Command) -> Result<ExitCode> {
             }
             if check_determinism_repeats != 2 && !check_determinism {
                 anyhow::bail!("--check-determinism-repeats requires --check-determinism");
+            }
+            if warm_queries != 20 && warm_crate.is_none() {
+                anyhow::bail!("--warm-queries requires --warm-crate");
+            }
+            if warm_crate.is_some() && !check_determinism {
+                anyhow::bail!("--warm-crate requires --check-determinism");
+            }
+            if warm_crate.is_some() && !lsp {
+                anyhow::bail!(
+                    "--warm-crate requires --lsp: there's no language-server analysis to warm up on the tree-sitter-only path"
+                );
             }
             if check_determinism {
                 if enrich {
@@ -570,7 +622,17 @@ fn run(command: Command) -> Result<ExitCode> {
                         "--check-determinism-repeats needs at least 2 runs to compare anything"
                     );
                 }
-                cmd_check_determinism(&path, lsp, dita.as_deref(), check_determinism_repeats)
+                let warmup = warm_crate.map(|crate_name| okf_analyzer::CrateWarmup {
+                    crate_name,
+                    queries: warm_queries,
+                });
+                cmd_check_determinism(
+                    &path,
+                    lsp,
+                    dita.as_deref(),
+                    check_determinism_repeats,
+                    warmup,
+                )
             } else if check_fresh {
                 if enrich {
                     anyhow::bail!(
@@ -751,6 +813,93 @@ fn cmd_scan(path: &std::path::Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `okf-rs cold-crate-probe`: probes each crate's genuinely first
+/// `textDocument/definition` query against an immediate repeat of the
+/// same query, one cold-vs-warm pair per crate, with the target
+/// language's cache priming turned off (see
+/// [`okf_analyzer::probe_cold_crates`] and
+/// `okf_lsp::disable_rust_analyzer_cache_priming`). Diagnostic-only:
+/// reports data, never fails the exit code -- a cold probe coming back
+/// empty isn't necessarily wrong, it's the measurement itself.
+fn cmd_cold_crate_probe(path: &std::path::Path) -> Result<ExitCode> {
+    let project = Project::load(path)?;
+    let (results, skips) = okf_analyzer::probe_cold_crates(&project)?;
+
+    if results.is_empty() && skips.total() == 0 {
+        println!(
+            "Cold-crate probe: no ambiguous, cross-file calls under a `crates/` directory found on {} -- nothing to probe.",
+            path.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if results.is_empty() {
+        println!(
+            "Cold-crate probe: {} crate(s) on {} had an ambiguous, cross-file call but couldn't be probed -- {}.",
+            skips.total(),
+            path.display(),
+            skip_reason_summary(&skips),
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!(
+        "Cold-crate probe: {} crate(s) probed on {} (cache priming disabled){}:",
+        results.len(),
+        path.display(),
+        if skips.total() > 0 {
+            format!(
+                ", {} more skipped ({})",
+                skips.total(),
+                skip_reason_summary(&skips)
+            )
+        } else {
+            String::new()
+        }
+    );
+    let mut cold_empty = 0usize;
+    let mut warm_empty = 0usize;
+    for r in &results {
+        if r.cold_empty {
+            cold_empty += 1;
+        }
+        if r.warm_empty {
+            warm_empty += 1;
+        }
+        println!(
+            "  {:<20} cold: {:<5} ({:>5}ms)   warm: {:<5} ({:>5}ms)",
+            r.crate_name,
+            if r.cold_empty { "empty" } else { "found" },
+            r.cold_elapsed.as_millis(),
+            if r.warm_empty { "empty" } else { "found" },
+            r.warm_elapsed.as_millis(),
+        );
+    }
+    println!(
+        "  {cold_empty}/{} cold probes came back empty, {warm_empty}/{} warm (immediate-repeat) probes did",
+        results.len(),
+        results.len(),
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A short, accurate clause describing why `skips.total()` crates were
+/// skipped, for [`cmd_cold_crate_probe`]'s report -- distinguishes a
+/// missing/unavailable language server (`skips.no_server`) from every
+/// other reason a probe might not run (`skips.other`, e.g. unreadable
+/// source text) instead of blaming every skip on the server, a real
+/// `/code-review` finding this fixes.
+fn skip_reason_summary(skips: &okf_analyzer::ProbeSkips) -> String {
+    match (skips.no_server, skips.other) {
+        (0, 0) => String::new(),
+        (n, 0) => format!("no language server available for that language ({n})"),
+        (0, n) => format!("source unavailable or rejected by the server ({n})"),
+        (n, m) => format!(
+            "no language server available for that language ({n}), source unavailable or rejected by the server ({m})"
+        ),
+    }
+}
+
 /// Where `generate` persists its incremental-indexing cache: a hidden
 /// file at the project root, sibling to `okf.toml`, so it survives
 /// between invocations regardless of `--output`. Not part of the OKF
@@ -906,11 +1055,19 @@ fn cmd_generate(
 /// higher `--check-determinism-repeats` builds an actual within-version
 /// disagreement distribution instead of one sample pair — see
 /// `benchmarks/resolver-stability/README.md`.
+///
+/// `warmup`, when set (`--warm-crate`), is applied to every run — see
+/// [`okf_analyzer::CrateWarmup`] and
+/// `docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md` for why
+/// this exists: isolating a demand-driven-analysis explanation for a
+/// residual flip from CPU contention, which an ordinary stress run
+/// conflates.
 fn cmd_check_determinism(
     path: &std::path::Path,
     lsp: bool,
     dita: Option<&std::path::Path>,
     repeats: u32,
+    warmup: Option<okf_analyzer::CrateWarmup>,
 ) -> Result<ExitCode> {
     let project = Project::load(path)?;
 
@@ -918,7 +1075,8 @@ fn cmd_check_determinism(
     let mut concept_count = 0usize;
     for i in 0..repeats {
         let mut cache = okf_analyzer::AnalysisCache::default();
-        let (mut result, _) = okf_analyzer::analyze_with_cache_lsp(&project, &mut cache, lsp)?;
+        let (mut result, _) =
+            okf_analyzer::analyze_with_cache_lsp_warmed(&project, &mut cache, lsp, warmup.clone())?;
 
         if let Some(dita_path) = dita {
             let (concepts, _) = okf_dita::import_dita(dita_path).with_context(|| {
@@ -964,9 +1122,19 @@ fn cmd_check_determinism(
     }
 
     let lsp_suffix = if lsp { " --lsp" } else { "" };
+    let warm_suffix = warmup
+        .map(|w| {
+            format!(
+                " (crate `{}` warmed up with {} throwaway quer{} first)",
+                w.crate_name,
+                w.queries,
+                if w.queries == 1 { "y" } else { "ies" }
+            )
+        })
+        .unwrap_or_default();
     if flip_counts.is_empty() {
         println!(
-            "Deterministic: {} independent `generate{lsp_suffix}` run{} on {} all produced byte-identical output ({concept_count} concepts).",
+            "Deterministic: {} independent `generate{lsp_suffix}` run{} on {} all produced byte-identical output ({concept_count} concepts){warm_suffix}.",
             runs.len(),
             if runs.len() == 1 { "" } else { "s" },
             path.display(),
@@ -974,7 +1142,7 @@ fn cmd_check_determinism(
         Ok(ExitCode::SUCCESS)
     } else {
         println!(
-            "Non-deterministic: {} file(s) flipped across {} independent `generate{lsp_suffix}` runs on {}{}:",
+            "Non-deterministic: {} file(s) flipped across {} independent `generate{lsp_suffix}` runs on {}{}{warm_suffix}:",
             flip_counts.len(),
             runs.len(),
             path.display(),

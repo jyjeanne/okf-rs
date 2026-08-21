@@ -1109,6 +1109,59 @@ it had already exhausted the full 4-retry budget and failed regardless, so the w
 `wait_until_ready` fix above, not the per-query retry count, is what actually does the load-bearing
 work here.
 
+### A fifth round of feedback on the stress-test survivor, and why it didn't change anything here
+
+A follow-up review (recorded in
+[`docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`](feedback/2026-08-rust-analyzer-salsa-readiness-review.md))
+proposed a more precise mechanism for the one stress-test flip above: rust-analyzer's analysis is
+demand-driven through salsa, so a workspace can report fully indexed via `$/progress` while a
+specific crate's def-map lowering still hasn't happened, deferred to whichever query touches that
+crate first — making readiness a per-crate property the global signal can't fully see. That's a real
+property of salsa-backed servers in general. Checked against this specific incident, though, it
+doesn't hold: `Graph::get` and `Graph::transitive_callers` are both defined in the same
+`impl<'a> Graph<'a>` block in `crates/okf-graph/src/lib.rs`, not different crates, and `okf-graph`
+was already a repeatedly-queried, warm crate by the time this query landed in the same run — not one
+paying a first-touch lowering cost. The flip stays best explained by what Phase H already measured:
+a query landing on a CPU-starved process during the stress test's deliberate concurrent-load
+condition, exhausting its 4-retry budget without an answer. The per-crate distinction was still worth
+testing on its own terms, though — see below, where it was.
+
+### A sixth round: `--warm-crate`, then `cold-crate-probe`, then a real number
+
+The per-crate theory got two rounds of real tooling built to test it rather than staying a filed-away
+idea. First, `generate --check-determinism --lsp --warm-crate <name> [--warm-queries N]`
+(`crates/okf-analyzer/src/lsp.rs`'s `CrateWarmup`) forces a named crate warm before a determinism
+run. Run for real: a plain invocation turned up a fresh, genuinely cross-crate flip on its own
+(`okf-cli::cmd_scan` → `okf-core::Project::load`), then a 10-vs-10 batch found cold flipping 1/10,
+warm 0/10 (2/13 vs. 0/13 combined with an earlier feasibility check) — real corroboration, but a
+one-sided Fisher's exact test put that at p ≈ 0.24, short of significance at this sample size.
+
+A follow-up review then named the concrete lever behind why a cold crate is so hard to catch by
+chance at all: `rust-analyzer.cachePriming.enable` (default `true`) walks the whole crate graph and
+lowers every crate up front on load — the same `$/progress` sequence `wait_until_ready` already waits
+through (its own doc comment, written before this exchange, already names cache priming as one of
+the phases). `okf-rs cold-crate-probe [path]` (`LspClient::start_with_init_options`,
+`disable_rust_analyzer_cache_priming`, `okf_analyzer::probe_cold_crates`) turns priming off and
+probes one cold-then-warm `textDocument/definition` pair per crate, in one run — the real
+distribution the earlier approach could only sample by luck.
+
+Run for real (18 crates, reproduced twice): 0/18 cold probes came back empty, but the *cost* of cold
+lowering is real and wildly uneven — most crates lower in under 250ms even stone cold, while
+`okf-cli` and `okf-analyzer` take **7-8 seconds**, far past the ~300ms retry budget
+`resolve_ambiguous_calls` has ever had. Every flip this project has observed had its *caller* inside
+one of those two crates — `textDocument/definition` is answered from the caller's position, so
+that's exactly the crate whose lowering a query needs first. This also reconciles the "starvation
+vs. lowering" tension the fifth round's CPU-contention read left open: without contention this probe
+shows `okf-cli` lowering slowly but *correctly*, so the stress test's four fast, *empty* retries in
+1.2s look like a query that never got scheduled to do that real 8-second work, not one that started
+it and ran out of time — and under ordinary conditions, `wait_until_ready`'s wait through cache
+priming already pays that cost once, up front, consistent with plain `--check-determinism` staying
+clean throughout this whole investigation. See
+[`docs/feedback/2026-08-rust-analyzer-cache-priming-review.md`](feedback/2026-08-rust-analyzer-cache-priming-review.md)
+for the full writeup. **Open**: a contended `cold-crate-probe` run, to test directly whether that
+~8-second job is what gets starved rather than inferring it from the retry pattern, hasn't been run
+yet.
+
 ### Tests
 
 - `okf-lsp`: `observe_progress_message_tracks_the_begin_report_end_lifecycle`,
@@ -1130,6 +1183,20 @@ work here.
   comparison logic, now shared instead of duplicated — `cmd_check_determinism` collects run 1's
   rendered files once and reuses them across every comparison instead of re-reading them from disk
   on each one (a `/code-review` efficiency finding, not a correctness bug).
+- `okf-analyzer` (`--warm-crate`): `warmup_targets_only_selects_the_named_crate`,
+  `warmup_targets_respects_the_query_budget`,
+  `warmup_targets_does_not_match_a_crate_name_that_is_only_a_prefix` — the pure selection logic,
+  unit-tested without a real server. `okf-cli` e2e: `standalone_binary_warm_crate_requires_check_determinism`,
+  `standalone_binary_warm_crate_requires_lsp`, `standalone_binary_warm_queries_requires_warm_crate`
+  — the flag's validation.
+- `okf-analyzer` (`cold-crate-probe`): `probe_targets_picks_one_entry_per_distinct_crate_at_its_first_appearance`,
+  `probe_targets_skips_entries_outside_crates`, `crate_name_from_path_extracts_the_crate_directory_name`,
+  `crate_name_from_path_is_none_outside_crates` — the pure per-crate selection logic shared with
+  `--warm-crate`, unit-tested the same way. `okf-cli` e2e:
+  `standalone_binary_cold_crate_probe_reports_one_pair_per_crate_with_an_ambiguous_call` — a real,
+  live-`rust-analyzer` run against a two-crate workspace fixture, confirming the one-probe-per-crate
+  report shape (skipped, not failed, when `rust-analyzer` isn't installed, matching this file's other
+  real-LSP tests).
 
 ## References
 
@@ -1137,6 +1204,8 @@ work here.
 - [`docs/feedback/2026-08-community-roadmap-review.md`](feedback/2026-08-community-roadmap-review.md) — the reviewer's first-round feedback, already delivered
 - [`docs/feedback/2026-08-tool-consolidation-benchmark-review.md`](feedback/2026-08-tool-consolidation-benchmark-review.md) — the reviewer's third-round feedback (Medium), driving Phase G
 - [`docs/feedback/2026-08-rust-analyzer-self-disagreement-review.md`](feedback/2026-08-rust-analyzer-self-disagreement-review.md) — the reviewer's fourth-round feedback (Medium), driving Phase H
+- [`docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`](feedback/2026-08-rust-analyzer-salsa-readiness-review.md) — the reviewer's fifth-round feedback (Medium) on Phase H's stress-test result, checked against the source and not actioned
+- [`docs/feedback/2026-08-rust-analyzer-cache-priming-review.md`](feedback/2026-08-rust-analyzer-cache-priming-review.md) — the reviewer's sixth-round feedback (Medium), naming `rust-analyzer.cachePriming.enable` and driving `okf-rs cold-crate-probe`
 - [`ROADMAP.md` — Improvement Plan (AI-native platform maturity)](../ROADMAP.md#improvement-plan--ai-native-platform-maturity-community-feedback) — what's already shipped from the first round
 - [`docs/improvement-plan.md`](improvement-plan.md) — the competitive gap-analysis plan this document's phase/test/acceptance-criteria structure follows
 - [`benchmarks/`](../benchmarks/) — the discoverable, reproducible-run companion to this document's design writeups: how to actually run each of Phase E/G's benchmarks, and the real results collected against real corpora so far

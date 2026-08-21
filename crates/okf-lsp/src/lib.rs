@@ -64,6 +64,16 @@ pub fn server_command(language: Language) -> Option<(&'static str, &'static [&'s
     }
 }
 
+/// `initializationOptions` that turn off `rust-analyzer`'s startup cache
+/// priming (`rust-analyzer.cachePriming.enable`, default `true`) -- for
+/// [`LspClient::start_with_init_options`]. rust-analyzer-specific and a
+/// no-op (silently ignored) for every other server this crate drives; only
+/// meaningful when `language` is [`Language::Rust`]. See
+/// [`LspClient::start_with_init_options`] for why this matters.
+pub fn disable_rust_analyzer_cache_priming() -> Value {
+    json!({ "cachePriming": { "enable": false } })
+}
+
 /// The LSP `languageId` string for `textDocument/didOpen`.
 fn language_id(language: Language) -> &'static str {
     match language {
@@ -162,6 +172,29 @@ impl LspClient {
     /// found nothing," since this feature is opt-in enrichment, never a
     /// hard requirement.
     pub fn start(language: Language, project_root: &Path) -> Result<Option<LspClient>> {
+        Self::start_with_init_options(language, project_root, None)
+    }
+
+    /// Like [`LspClient::start`], but with `init_options` set, forwards it
+    /// as the `initialize` request's `initializationOptions` -- server-
+    /// specific config the LSP spec passes through opaquely, rather than
+    /// the generic `capabilities` object every server understands.
+    /// [`disable_rust_analyzer_cache_priming`] is the one consumer this
+    /// crate ships: `rust-analyzer.cachePriming.enable` defaults to `true`,
+    /// and with it on, startup indexing (the same `$/progress` sequence
+    /// [`LspClient::wait_until_ready`] waits through) walks the whole crate
+    /// graph and lowers every crate's def-map up front -- which is exactly
+    /// why a genuinely cold, never-yet-queried crate is hard to catch by
+    /// chance once `wait_until_ready` returns: priming has already made
+    /// nearly everything warm. Turning it off makes lowering demand-driven
+    /// again, so a crate's first real query is reliably cold rather than
+    /// warm by luck of the indexing order. See
+    /// `docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`.
+    pub fn start_with_init_options(
+        language: Language,
+        project_root: &Path,
+        init_options: Option<Value>,
+    ) -> Result<Option<LspClient>> {
         let Some((cmd, args)) = server_command(language) else {
             return Ok(None);
         };
@@ -208,28 +241,29 @@ impl LspClient {
             opened: std::collections::HashSet::new(),
             server_version: None,
         };
-        client.initialize()?;
+        client.initialize(init_options)?;
         client.wait_until_ready();
         Ok(Some(client))
     }
 
-    fn initialize(&mut self) -> Result<()> {
+    fn initialize(&mut self, init_options: Option<Value>) -> Result<()> {
         let root_uri = path_to_uri(&self.project_root);
-        let id = self.request(
-            "initialize",
-            json!({
-                "processId": std::process::id(),
-                "rootUri": root_uri,
-                // Advertised specifically so a server that supports
-                // `$/progress` (rust-analyzer does; most others don't)
-                // actually sends it -- without this capability, servers
-                // that gate progress reporting on client support (as the
-                // spec permits) would stay silent and `wait_until_ready`
-                // would fall back to its "no progress at all" path even
-                // though the server just wasn't told it could report any.
-                "capabilities": { "window": { "workDoneProgress": true } },
-            }),
-        )?;
+        let mut params = json!({
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            // Advertised specifically so a server that supports
+            // `$/progress` (rust-analyzer does; most others don't)
+            // actually sends it -- without this capability, servers
+            // that gate progress reporting on client support (as the
+            // spec permits) would stay silent and `wait_until_ready`
+            // would fall back to its "no progress at all" path even
+            // though the server just wasn't told it could report any.
+            "capabilities": { "window": { "workDoneProgress": true } },
+        });
+        if let Some(options) = init_options {
+            params["initializationOptions"] = options;
+        }
+        let id = self.request("initialize", params)?;
         let result = self.read_response(id)?;
         self.server_version = parse_server_version(&result);
         self.notify("initialized", json!({}))?;
