@@ -823,9 +823,9 @@ fn cmd_scan(path: &std::path::Path) -> Result<ExitCode> {
 /// empty isn't necessarily wrong, it's the measurement itself.
 fn cmd_cold_crate_probe(path: &std::path::Path) -> Result<ExitCode> {
     let project = Project::load(path)?;
-    let results = okf_analyzer::probe_cold_crates(&project)?;
+    let (results, skipped) = okf_analyzer::probe_cold_crates(&project)?;
 
-    if results.is_empty() {
+    if results.is_empty() && skipped == 0 {
         println!(
             "Cold-crate probe: no ambiguous, cross-file calls under a `crates/` directory found on {} -- nothing to probe.",
             path.display()
@@ -833,10 +833,24 @@ fn cmd_cold_crate_probe(path: &std::path::Path) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    if results.is_empty() {
+        println!(
+            "Cold-crate probe: {skipped} crate(s) on {} had an ambiguous, cross-file call but couldn't be probed -- \
+             no language server available for that language (see warnings above).",
+            path.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
     println!(
-        "Cold-crate probe: {} crate(s) probed on {} (cache priming disabled):",
+        "Cold-crate probe: {} crate(s) probed on {} (cache priming disabled){}:",
         results.len(),
-        path.display()
+        path.display(),
+        if skipped > 0 {
+            format!(", {skipped} more skipped -- no language server available")
+        } else {
+            String::new()
+        }
     );
     let mut cold_empty = 0usize;
     let mut warm_empty = 0usize;

@@ -331,7 +331,11 @@ pub fn analyze_with_cache_lsp_warmed(
 /// measurement has no reason to touch the incremental cache real
 /// `generate` runs share) and never writes a bundle or resolves an edge
 /// for real.
-pub fn probe_cold_crates(project: &Project) -> Result<Vec<lsp::CrateProbeResult>> {
+///
+/// Returns the probe results alongside the number of crates that had an
+/// ambiguous call but were never actually probed (e.g. no language server
+/// available) — see [`lsp::probe_cold_crates`].
+pub fn probe_cold_crates(project: &Project) -> Result<(Vec<lsp::CrateProbeResult>, usize)> {
     let mut concepts = detect_packages(project)?;
     let mut calls: Vec<(CallCandidate, Language, String)> = Vec::new();
     let mut file_sources: HashMap<String, String> = HashMap::new();

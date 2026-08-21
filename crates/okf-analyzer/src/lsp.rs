@@ -254,12 +254,22 @@ pub struct CrateProbeResult {
 /// measurement. One `okf_lsp::LspClient` per distinct language, same as
 /// [`resolve_ambiguous_calls`]; probes run in `ambiguous`'s own order, one
 /// per crate, at that crate's first appearance.
+///
+/// Returns the probe results alongside the number of crates that had an
+/// ambiguous call (and so were eligible to probe) but were never actually
+/// probed — no language server available or installed for that crate's
+/// language, chief among the reasons (see the `eprintln!` warning below for
+/// specifics). Distinguishing that count from "no ambiguous calls existed
+/// at all" matters to the caller: without it, a project with plenty of
+/// ambiguous calls but no `rust-analyzer` on `PATH` would otherwise be
+/// reported identically to one with nothing ambiguous in it at all.
 pub(crate) fn probe_cold_crates(
     project: &Project,
     ambiguous: &[&(CallCandidate, Language, String)],
     file_sources: &HashMap<String, String>,
-) -> Vec<CrateProbeResult> {
+) -> (Vec<CrateProbeResult>, usize) {
     let targets = probe_targets(ambiguous);
+    let target_count = targets.len();
 
     let mut results = Vec::new();
     let mut clients: HashMap<Language, Option<okf_lsp::LspClient>> = HashMap::new();
@@ -315,7 +325,8 @@ pub(crate) fn probe_cold_crates(
         client.shutdown();
     }
 
-    results
+    let skipped = target_count - results.len();
+    (results, skipped)
 }
 
 /// Selects one entry from `ambiguous` per distinct crate — its first
