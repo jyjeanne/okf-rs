@@ -5,8 +5,8 @@ use crate::ResolvedEdge;
 use okf_core::Project;
 use okf_parser::{Confidence, Language, Location};
 use okf_tree_sitter::CallCandidate;
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 /// Small per-query retry budget applied to *every* ambiguous-call lookup,
 /// not just the first one for a given language. `okf_lsp::LspClient::start`
@@ -75,10 +75,11 @@ fn warmup_targets<'a>(
     ambiguous: &[&'a (CallCandidate, Language, String)],
     warmup: &CrateWarmup,
 ) -> Vec<&'a (CallCandidate, Language, String)> {
-    let prefix = format!("crates/{}/", warmup.crate_name);
     ambiguous
         .iter()
-        .filter(|(_, _, relative_path)| relative_path.starts_with(&prefix))
+        .filter(|(_, _, relative_path)| {
+            crate_name_from_path(relative_path).is_some_and(|name| name == warmup.crate_name)
+        })
         .take(warmup.queries)
         .copied()
         .collect()
@@ -215,6 +216,140 @@ pub(crate) fn resolve_ambiguous_calls(
     }
 }
 
+/// One crate's cold-vs-warm probe result: its genuinely first
+/// `textDocument/definition` query in the process (cache priming
+/// disabled, so this is demand-driven-lowering-cold rather than warm by
+/// luck of the indexing order) compared against an immediate repeat of
+/// the exact same query, which should hit the by-then-computed, memoized
+/// result if the crate's own lowering is what the cold attempt paid for.
+/// See [`probe_cold_crates`].
+#[derive(Debug, Clone)]
+pub struct CrateProbeResult {
+    /// A crate directory name under `crates/` (e.g. `okf-graph`).
+    pub crate_name: String,
+    /// Whether the cold (first-ever) query into this crate came back
+    /// with no candidate locations at all.
+    pub cold_empty: bool,
+    /// How long the cold query took to answer.
+    pub cold_elapsed: Duration,
+    /// Whether the immediate-repeat (warm) query came back empty.
+    pub warm_empty: bool,
+    /// How long the warm query took to answer.
+    pub warm_elapsed: Duration,
+}
+
+/// Probes each crate's genuinely first `textDocument/definition` query
+/// against an immediate repeat of the same query, one probe per distinct
+/// crate found in `ambiguous`, all within a single process with
+/// `rust-analyzer`'s cache priming turned off (see
+/// [`okf_lsp::disable_rust_analyzer_cache_priming`]) so demand-driven
+/// lowering is back in force and a crate's first touch is reliably cold
+/// rather than warm by luck of however much of the crate graph priming
+/// already walked before the probe started.
+///
+/// Turns "wait for a lucky flip once every several `--check-determinism`
+/// runs" into "one cold-first measurement per crate, every run" — see
+/// `docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`.
+/// Diagnostic-only: never resolves anything into `resolved_edges`, purely
+/// measurement. One `okf_lsp::LspClient` per distinct language, same as
+/// [`resolve_ambiguous_calls`]; probes run in `ambiguous`'s own order, one
+/// per crate, at that crate's first appearance.
+pub(crate) fn probe_cold_crates(
+    project: &Project,
+    ambiguous: &[&(CallCandidate, Language, String)],
+    file_sources: &HashMap<String, String>,
+) -> Vec<CrateProbeResult> {
+    let targets = probe_targets(ambiguous);
+
+    let mut results = Vec::new();
+    let mut clients: HashMap<Language, Option<okf_lsp::LspClient>> = HashMap::new();
+
+    for (call, language, relative_path) in targets {
+        let Some(crate_name) = crate_name_from_path(relative_path) else {
+            continue;
+        };
+        let client_slot = clients.entry(*language).or_insert_with(|| {
+            match okf_lsp::LspClient::start_with_init_options(
+                *language,
+                &project.root,
+                Some(okf_lsp::disable_rust_analyzer_cache_priming()),
+            ) {
+                Ok(client) => client,
+                Err(e) => {
+                    eprintln!(
+                        "warning: failed to start a language server for {language} \
+                     (cache priming disabled), skipping the cold-crate probe for it: {e:#}"
+                    );
+                    None
+                }
+            }
+        });
+        let Some(client) = client_slot.as_mut() else {
+            continue;
+        };
+        let Some(source) = file_sources.get(relative_path.as_str()) else {
+            continue;
+        };
+        let Ok(uri) = client.ensure_open(relative_path, source) else {
+            continue;
+        };
+
+        let cold_start = Instant::now();
+        let cold = client.definition(&uri, call.call_site.line, call.call_site.character);
+        let cold_elapsed = cold_start.elapsed();
+
+        let warm_start = Instant::now();
+        let warm = client.definition(&uri, call.call_site.line, call.call_site.character);
+        let warm_elapsed = warm_start.elapsed();
+
+        results.push(CrateProbeResult {
+            crate_name,
+            cold_empty: cold.is_err() || cold.is_ok_and(|v| v.is_empty()),
+            cold_elapsed,
+            warm_empty: warm.is_err() || warm.is_ok_and(|v| v.is_empty()),
+            warm_elapsed,
+        });
+    }
+
+    for client in clients.into_values().flatten() {
+        client.shutdown();
+    }
+
+    results
+}
+
+/// Selects one entry from `ambiguous` per distinct crate — its first
+/// appearance in `ambiguous`'s own order — the set [`probe_cold_crates`]
+/// fires its cold-then-warm query pair at. Pulled out as a pure function
+/// for the same reason [`warmup_targets`] is: unit-testable without
+/// spawning a real language server. Entries outside `crates/` (see
+/// [`crate_name_from_path`]) are skipped, not grouped into one bucket.
+fn probe_targets<'a>(
+    ambiguous: &[&'a (CallCandidate, Language, String)],
+) -> Vec<&'a (CallCandidate, Language, String)> {
+    let mut seen_crates: HashSet<String> = HashSet::new();
+    ambiguous
+        .iter()
+        .filter(|(_, _, relative_path)| {
+            crate_name_from_path(relative_path).is_some_and(|name| seen_crates.insert(name))
+        })
+        .copied()
+        .collect()
+}
+
+/// Extracts a crate directory name from a `crates/{name}/...`-shaped
+/// relative path, or `None` for anything outside `crates/` (a
+/// single-package project with no `crates/` layout, say). Shared by
+/// [`warmup_targets`], [`probe_targets`], and [`probe_cold_crates`].
+fn crate_name_from_path(relative_path: &str) -> Option<String> {
+    relative_path
+        .strip_prefix("crates/")?
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +415,49 @@ mod tests {
         };
 
         let targets = warmup_targets(&ambiguous, &warmup);
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn crate_name_from_path_extracts_the_crate_directory_name() {
+        assert_eq!(
+            crate_name_from_path("crates/okf-graph/src/lib.rs"),
+            Some("okf-graph".to_string())
+        );
+        assert_eq!(
+            crate_name_from_path("crates/okf-graph/src/nested/mod.rs"),
+            Some("okf-graph".to_string())
+        );
+    }
+
+    #[test]
+    fn crate_name_from_path_is_none_outside_crates() {
+        assert_eq!(crate_name_from_path("src/lib.rs"), None);
+        assert_eq!(crate_name_from_path("crates/"), None);
+        assert_eq!(crate_name_from_path("crates"), None);
+    }
+
+    #[test]
+    fn probe_targets_picks_one_entry_per_distinct_crate_at_its_first_appearance() {
+        let a1 = candidate("functions/a1", "crates/okf-graph/src/a.rs");
+        let a2 = candidate("functions/a2", "crates/okf-graph/src/b.rs");
+        let b1 = candidate("functions/b1", "crates/okf-core/src/lib.rs");
+        let ambiguous: Vec<&(CallCandidate, Language, String)> = vec![&a1, &a2, &b1];
+
+        let targets = probe_targets(&ambiguous);
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].0.caller_id, "functions/a1");
+        assert_eq!(targets[1].0.caller_id, "functions/b1");
+    }
+
+    #[test]
+    fn probe_targets_skips_entries_outside_crates() {
+        let outside = candidate("functions/c", "src/lib.rs");
+        let ambiguous: Vec<&(CallCandidate, Language, String)> = vec![&outside];
+
+        let targets = probe_targets(&ambiguous);
 
         assert!(targets.is_empty());
     }

@@ -322,6 +322,80 @@ pub fn analyze_with_cache_lsp_warmed(
     ))
 }
 
+/// Diagnostic-only, never used by `generate`/`generate --lsp`: probes each
+/// crate's genuinely first `textDocument/definition` query (cache priming
+/// disabled) against an immediate repeat of the same query, one probe per
+/// distinct crate an ambiguous call was found in — see
+/// [`lsp::CrateProbeResult`] and `okf-rs generate --cold-crate-probe`.
+/// Always does its own full, uncached extraction pass (a one-off
+/// measurement has no reason to touch the incremental cache real
+/// `generate` runs share) and never writes a bundle or resolves an edge
+/// for real.
+pub fn probe_cold_crates(project: &Project) -> Result<Vec<lsp::CrateProbeResult>> {
+    let mut concepts = detect_packages(project)?;
+    let mut calls: Vec<(CallCandidate, Language, String)> = Vec::new();
+    let mut file_sources: HashMap<String, String> = HashMap::new();
+
+    // Same per-file rayon extraction shape as `analyze_with_cache_lsp_warmed`,
+    // minus the incremental cache -- a one-off probe has no reused-run to
+    // benefit from it, and always needs every file's source text.
+    let file_results: Vec<FileParseResult> = project
+        .files
+        .par_iter()
+        .map(|file| -> Result<FileParseResult> {
+            let source = fs::read_to_string(&file.absolute_path)
+                .with_context(|| format!("failed to read {}", file.relative_path))?;
+            let hash = cache::hash_content(&source);
+            let extraction = okf_tree_sitter::extract_source(&source, file)
+                .with_context(|| format!("failed to analyze {}", file.relative_path))?;
+            Ok(FileParseResult {
+                relative_path: file.relative_path.clone(),
+                language: file.language,
+                hash,
+                extraction,
+                reused: false,
+                source: Some(source),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for result in file_results {
+        for call in result.extraction.calls {
+            calls.push((call, result.language, result.relative_path.clone()));
+        }
+        concepts.extend(result.extraction.concepts);
+        if let Some(source) = result.source {
+            file_sources.insert(result.relative_path, source);
+        }
+    }
+
+    Concept::disambiguate_ids(&mut concepts);
+    link_modules_to_packages(&mut concepts);
+
+    let mut symbol_table: HashMap<&str, Vec<&str>> = HashMap::new();
+    for concept in &concepts {
+        if matches!(concept.kind, ConceptKind::Function | ConceptKind::Method) {
+            symbol_table
+                .entry(concept.name.as_str())
+                .or_default()
+                .push(concept.id.as_str());
+        }
+    }
+
+    let mut ambiguous: Vec<&(CallCandidate, Language, String)> = Vec::new();
+    for entry in &calls {
+        let (call, _, _) = entry;
+        if symbol_table
+            .get(call.callee_name.as_str())
+            .is_some_and(|candidates| candidates.len() != 1)
+        {
+            ambiguous.push(entry);
+        }
+    }
+
+    Ok(lsp::probe_cold_crates(project, &ambiguous, &file_sources))
+}
+
 /// One file's read+extract outcome, produced in parallel by
 /// [`analyze_with_cache_lsp`]'s per-file rayon step and merged back
 /// sequentially afterward.

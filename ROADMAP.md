@@ -454,8 +454,26 @@ and 9 already shipped. Only the plan's six genuinely new phases (A-F) are tracke
   callee — the exact crate `--warm-crate` targets. Real, mechanistically coherent corroboration for
   the lazy-analysis theory on this crate/symbol, but not proof: a one-sided Fisher's exact test on
   2/13 vs. 0/13 gives p ≈ 0.24, short of significance at this sample size — a 25-30-per-arm batch is
-  the next step if this needs to move from "consistent with" to "established." See
-  [`docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`](docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md)
+  the next step if this needs to move from "consistent with" to "established." A sixth round named
+  the concrete lever behind why a cold crate is so hard to catch by chance at all:
+  `rust-analyzer.cachePriming.enable` (default `true`) walks the whole crate graph and lowers every
+  crate up front on load — the same `$/progress` sequence `wait_until_ready` already waits through.
+  `okf-rs cold-crate-probe [path]` turns that off via `initializationOptions`
+  (`LspClient::start_with_init_options`) and probes one genuinely-cold-then-warm pair per crate in a
+  single run. Run for real (18 crates, reproduced twice): 0/18 cold probes came back empty, but cold
+  lowering cost itself is real and wildly uneven — most crates lower in under 250ms even stone cold,
+  while `okf-cli` and `okf-analyzer` take **7-8 seconds**, far beyond the ~300ms retry budget
+  `resolve_ambiguous_calls` has ever had. Every flip this project has observed had its *caller*
+  inside one of those two crates — `textDocument/definition` is answered from the caller's position,
+  so that's exactly the crate whose lowering a query needs first. This also reconciles the earlier
+  "starvation vs. lowering" tension: without contention this probe shows `okf-cli` lowering slowly
+  but correctly, so the stress test's four *fast, empty* retries in 1.2s look like a query that never
+  got scheduled to do that real 8-second work, not one that started it and ran out of time — under
+  ordinary conditions `wait_until_ready`'s wait through cache priming already pays that cost once, up
+  front, which is consistent with plain `--check-determinism` staying clean throughout this
+  investigation. See
+  [`docs/feedback/2026-08-rust-analyzer-cache-priming-review.md`](docs/feedback/2026-08-rust-analyzer-cache-priming-review.md),
+  [`docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`](docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md),
   and `benchmarks/resolver-stability/README.md`.
 
 Verified by dogfooding. Unit tests cover the new field end-to-end: `okf-lsp` parses `serverInfo.version`

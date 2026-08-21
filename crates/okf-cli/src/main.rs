@@ -37,6 +37,23 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Diagnostic: probe each crate's genuinely first `textDocument/definition`
+    /// query against an immediate repeat of the same query, one cold-vs-warm
+    /// pair per crate, in a single process with rust-analyzer's cache
+    /// priming turned off. Cache priming (on by default) walks the whole
+    /// crate graph and lowers every crate's def-map up front on workspace
+    /// load, which is why a genuinely cold crate is otherwise hard to catch
+    /// by chance -- with priming off, each crate's first query is reliably
+    /// cold rather than warm by luck of the indexing order, turning "wait
+    /// for a lucky flip every several runs" into one cold measurement per
+    /// crate, every run. Never writes a bundle or resolves an edge for
+    /// real; only meaningful for a language with a `$/progress`-capable,
+    /// cache-priming server (rust-analyzer). See
+    /// `docs/feedback/2026-08-rust-analyzer-salsa-readiness-review.md`.
+    ColdCrateProbe {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Analyze a repository and write an OKF bundle.
     Generate {
         #[arg(default_value = ".")]
@@ -558,6 +575,7 @@ fn run(command: Command) -> Result<ExitCode> {
             no_agent_files,
         } => cmd_init(&path, &output, no_agent_files),
         Command::Scan { path } => cmd_scan(&path),
+        Command::ColdCrateProbe { path } => cmd_cold_crate_probe(&path),
         Command::Generate {
             path,
             output,
@@ -792,6 +810,57 @@ fn cmd_scan(path: &std::path::Path) -> Result<ExitCode> {
     for (language, count) in by_language {
         println!("  {language:<12} {count}");
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `okf-rs cold-crate-probe`: probes each crate's genuinely first
+/// `textDocument/definition` query against an immediate repeat of the
+/// same query, one cold-vs-warm pair per crate, with the target
+/// language's cache priming turned off (see
+/// [`okf_analyzer::probe_cold_crates`] and
+/// `okf_lsp::disable_rust_analyzer_cache_priming`). Diagnostic-only:
+/// reports data, never fails the exit code -- a cold probe coming back
+/// empty isn't necessarily wrong, it's the measurement itself.
+fn cmd_cold_crate_probe(path: &std::path::Path) -> Result<ExitCode> {
+    let project = Project::load(path)?;
+    let results = okf_analyzer::probe_cold_crates(&project)?;
+
+    if results.is_empty() {
+        println!(
+            "Cold-crate probe: no ambiguous, cross-file calls under a `crates/` directory found on {} -- nothing to probe.",
+            path.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!(
+        "Cold-crate probe: {} crate(s) probed on {} (cache priming disabled):",
+        results.len(),
+        path.display()
+    );
+    let mut cold_empty = 0usize;
+    let mut warm_empty = 0usize;
+    for r in &results {
+        if r.cold_empty {
+            cold_empty += 1;
+        }
+        if r.warm_empty {
+            warm_empty += 1;
+        }
+        println!(
+            "  {:<20} cold: {:<5} ({:>5}ms)   warm: {:<5} ({:>5}ms)",
+            r.crate_name,
+            if r.cold_empty { "empty" } else { "found" },
+            r.cold_elapsed.as_millis(),
+            if r.warm_empty { "empty" } else { "found" },
+            r.warm_elapsed.as_millis(),
+        );
+    }
+    println!(
+        "  {cold_empty}/{} cold probes came back empty, {warm_empty}/{} warm (immediate-repeat) probes did",
+        results.len(),
+        results.len(),
+    );
     Ok(ExitCode::SUCCESS)
 }
 

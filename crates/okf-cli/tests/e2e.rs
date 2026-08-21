@@ -983,6 +983,59 @@ fn standalone_binary_generate_lsp_disambiguates_a_call_via_rust_analyzer() {
     assert!(!callees_lsp_out.contains("functions/src/b/run"));
 }
 
+/// `okf-rs cold-crate-probe` finds one ambiguous call in a `crates/foo/`
+/// member of a two-crate workspace (`foo::get`/`bar::get` share a name),
+/// probes `foo` -- the only crate an ambiguous call landed in -- and
+/// reports a cold-vs-warm pair for it. Doesn't assert on `empty`/timing
+/// (a real server's answer to a real, resolvable query should find
+/// something both times, but this test only needs to confirm the crate
+/// got probed and reported, not what a live rust-analyzer's timing looks
+/// like on a given run). Skipped, not failed, when `rust-analyzer` isn't
+/// installed, matching this file's other real-LSP tests.
+#[test]
+fn standalone_binary_cold_crate_probe_reports_one_pair_per_crate_with_an_ambiguous_call() {
+    if !rust_analyzer_available() {
+        eprintln!("skipping: rust-analyzer not installed");
+        return;
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("crates/foo/src")).unwrap();
+    fs::create_dir_all(project.join("crates/bar/src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/foo\", \"crates/bar\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("crates/foo/Cargo.toml"),
+        "[package]\nname = \"foo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("crates/foo/src/lib.rs"),
+        "pub fn get() {}\npub fn caller() { get(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("crates/bar/Cargo.toml"),
+        "[package]\nname = \"bar\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("crates/bar/src/lib.rs"), "pub fn get() {}\n").unwrap();
+
+    let probe = run(&project, &["cold-crate-probe", "."]);
+    assert_success(&probe, &["cold-crate-probe"]);
+    let out = stdout_of(&probe);
+    assert!(out.contains("1 crate(s) probed"), "unexpected output: {out}");
+    assert!(out.contains("foo"), "unexpected output: {out}");
+    assert!(
+        !out.contains("bar"),
+        "bar has no ambiguous call site of its own, so it shouldn't be probed: {out}"
+    );
+}
+
 /// `--check-determinism` runs analysis twice, independently, and diffs
 /// the two renders — on the default tree-sitter-only path (no `--lsp`,
 /// no external process involved) that should always agree, since the

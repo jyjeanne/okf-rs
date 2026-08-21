@@ -212,6 +212,66 @@ move from "consistent with" to "established."
 significance (p ≈ 0.24 at n=13 per arm; a 25-30-per-arm batch is the next step) is still open — see
 above.
 
+### The real number: `okf-rs cold-crate-probe` and cache priming
+
+A follow-up review named the concrete lever behind why a cold crate was so hard to catch by chance
+in the first place: `rust-analyzer.cachePriming.enable` defaults to `true`, and on workspace load
+the server walks the whole crate graph and lowers every crate's def-map up front — the same
+`$/progress` sequence `wait_until_ready` already waits through (its own doc comment names
+"proc-macro/build-script cache priming" as one of the phases, written for an unrelated reason before
+this exchange). By the time a real query lands, priming has usually already made everything warm.
+
+`okf-rs cold-crate-probe [path]` tests this directly: `rust-analyzer.cachePriming.enable` set to
+`false` via `initializationOptions` (`okf_lsp::LspClient::start_with_init_options`,
+`disable_rust_analyzer_cache_priming`), then one cold-vs-warm `textDocument/definition` pair per
+distinct crate an ambiguous call was found in — the *first* query into that crate (genuinely cold,
+demand-driven lowering, not warm by luck of indexing order), immediately followed by a repeat of the
+exact same query (warm, memoized) — comparing cold against warm *within* the same crate, not across
+crates of different sizes, per the review's own stated control.
+
+Run for real against this repository (18 crates), reproduced twice:
+
+```
+Cold-crate probe: 18 crate(s) probed on . (cache priming disabled):
+  okf-analyzer         cold: found ( 7745-8305ms)   warm: found (    0ms)
+  okf-cli              cold: found ( 7259-7937ms)   warm: found (    1ms)
+  okf-docs             cold: found ( 2047-2057ms)   warm: found (    0ms)
+  ...every other crate...     cold: found (   3-238ms)   warm: found (0-5ms)
+  0/18 cold probes came back empty, 0/18 warm (immediate-repeat) probes did
+```
+
+Two real, quantified findings:
+
+- **Cold lowering cost is real, and wildly uneven.** Most crates lower in under 250ms even stone
+  cold; `okf-cli` and `okf-analyzer` (this project's two largest, most heavily-typed crates) take
+  **7-8 seconds**, reproducibly. `DEFINITION_RETRIES: 2` / `DEFINITION_RETRY_DELAY: 300ms`
+  (`crates/okf-analyzer/src/lsp.rs`) budgets at most ~300ms of retry beyond the first attempt — an
+  8-second cold cost was never going to fit inside that; it depends entirely on cache priming having
+  already paid it before the real resolution pass starts.
+- **Every flip this project has observed had its *caller* inside `okf-cli` or `okf-analyzer`** — the
+  original `okf-cli::cmd_scan` flip, and every file in the 10-vs-10 batch's one cold flip.
+  `textDocument/definition` is answered from the *caller's* position, so the crate whose analysis a
+  query actually needs first is the caller's crate — and that's exactly the two crates this probe
+  found to be the expensive ones.
+
+This also reconciles what looked like two competing readings of the same stress-test flip. If
+`okf-cli` really costs ~8 seconds to lower cold, why did the failing queries come back *empty*
+across all 4 retries in only ~1.2 seconds total, rather than the client waiting ~8 seconds and
+getting a correct answer (exactly what this probe shows happening without contention)? Read
+together, they're not in tension: without contention, `okf-cli`'s cold lowering runs to completion
+and answers correctly, just slowly. The stress-test's four fast, empty responses in 1.2 seconds
+aren't the client waiting a long time for nothing — they're the server returning quickly with *no*
+answer, four times, instead of doing the slow work at all. A query that never got scheduled to do
+the real (evidently ~8-second) work, not one that started the work and ran out of time — which is
+exactly what "empty through every retry" would look like if it were starvation rather than a slow
+success in progress. Under ordinary, uncontended conditions, `wait_until_ready` already pays that
+~8-second cost once, up front, via cache priming — consistent with plain `--check-determinism` runs
+(no artificial contention) staying clean throughout this whole investigation.
+
+**Open**: a *contended* `cold-crate-probe` run — deliberately run alongside a second concurrent
+process, the way the original stress test was — would directly test whether that ~8-second job is
+what gets starved, rather than inferring it from the retry pattern. Not yet run.
+
 **Open**: this measurement hasn't been run on a corpus other than okf-rs's own source, or across a
 wider resolver-version gap. A different codebase's ambiguous-call density could plausibly show a
 different rate — that's exactly the kind of project-specific number this benchmark exists to let a
