@@ -823,9 +823,9 @@ fn cmd_scan(path: &std::path::Path) -> Result<ExitCode> {
 /// empty isn't necessarily wrong, it's the measurement itself.
 fn cmd_cold_crate_probe(path: &std::path::Path) -> Result<ExitCode> {
     let project = Project::load(path)?;
-    let (results, skipped) = okf_analyzer::probe_cold_crates(&project)?;
+    let (results, skips) = okf_analyzer::probe_cold_crates(&project)?;
 
-    if results.is_empty() && skipped == 0 {
+    if results.is_empty() && skips.total() == 0 {
         println!(
             "Cold-crate probe: no ambiguous, cross-file calls under a `crates/` directory found on {} -- nothing to probe.",
             path.display()
@@ -835,9 +835,10 @@ fn cmd_cold_crate_probe(path: &std::path::Path) -> Result<ExitCode> {
 
     if results.is_empty() {
         println!(
-            "Cold-crate probe: {skipped} crate(s) on {} had an ambiguous, cross-file call but couldn't be probed -- \
-             no language server available for that language (see warnings above).",
-            path.display()
+            "Cold-crate probe: {} crate(s) on {} had an ambiguous, cross-file call but couldn't be probed -- {}.",
+            skips.total(),
+            path.display(),
+            skip_reason_summary(&skips),
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -846,8 +847,12 @@ fn cmd_cold_crate_probe(path: &std::path::Path) -> Result<ExitCode> {
         "Cold-crate probe: {} crate(s) probed on {} (cache priming disabled){}:",
         results.len(),
         path.display(),
-        if skipped > 0 {
-            format!(", {skipped} more skipped -- no language server available")
+        if skips.total() > 0 {
+            format!(
+                ", {} more skipped ({})",
+                skips.total(),
+                skip_reason_summary(&skips)
+            )
         } else {
             String::new()
         }
@@ -876,6 +881,23 @@ fn cmd_cold_crate_probe(path: &std::path::Path) -> Result<ExitCode> {
         results.len(),
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// A short, accurate clause describing why `skips.total()` crates were
+/// skipped, for [`cmd_cold_crate_probe`]'s report -- distinguishes a
+/// missing/unavailable language server (`skips.no_server`) from every
+/// other reason a probe might not run (`skips.other`, e.g. unreadable
+/// source text) instead of blaming every skip on the server, a real
+/// `/code-review` finding this fixes.
+fn skip_reason_summary(skips: &okf_analyzer::ProbeSkips) -> String {
+    match (skips.no_server, skips.other) {
+        (0, 0) => String::new(),
+        (n, 0) => format!("no language server available for that language ({n})"),
+        (0, n) => format!("source unavailable or rejected by the server ({n})"),
+        (n, m) => format!(
+            "no language server available for that language ({n}), source unavailable or rejected by the server ({m})"
+        ),
+    }
 }
 
 /// Where `generate` persists its incremental-indexing cache: a hidden

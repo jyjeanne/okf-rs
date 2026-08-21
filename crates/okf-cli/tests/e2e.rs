@@ -1028,7 +1028,10 @@ fn standalone_binary_cold_crate_probe_reports_one_pair_per_crate_with_an_ambiguo
     let probe = run(&project, &["cold-crate-probe", "."]);
     assert_success(&probe, &["cold-crate-probe"]);
     let out = stdout_of(&probe);
-    assert!(out.contains("1 crate(s) probed"), "unexpected output: {out}");
+    assert!(
+        out.contains("1 crate(s) probed"),
+        "unexpected output: {out}"
+    );
     assert!(out.contains("foo"), "unexpected output: {out}");
     assert!(
         !out.contains("bar"),

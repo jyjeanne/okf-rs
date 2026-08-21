@@ -67,18 +67,30 @@ pub struct CrateWarmup {
 }
 
 /// Selects up to `warmup.queries` entries from `ambiguous` whose file lies
-/// under `warmup.crate_name`, in the same order `ambiguous` already has —
-/// the set [`resolve_ambiguous_calls`] fires throwaway queries at to warm
-/// that crate up. Pulled out as a pure function so the selection logic is
-/// unit-testable without spawning a real language server.
+/// under `warmup.crate_name` *and* whose language is `language` (the
+/// client about to fire the warmup queries), in the same order
+/// `ambiguous` already has — the set [`resolve_ambiguous_calls`] fires
+/// throwaway queries at to warm that crate up. Pulled out as a pure
+/// function so the selection logic is unit-testable without spawning a
+/// real language server.
+///
+/// The `language` filter matters in a multi-language project: without it,
+/// warmup fires through whichever language's `LspClient` happens to start
+/// first, sending another language's files (matched by path alone) to a
+/// server that can't make sense of them — e.g. a Python client asked to
+/// open and query a Rust file from `crates/okf-graph/`, tagged
+/// `languageId: "python"` by `ensure_open`. Filtering by `language` here
+/// keeps warmup scoped to the client it's actually running through.
 fn warmup_targets<'a>(
     ambiguous: &[&'a (CallCandidate, Language, String)],
+    language: Language,
     warmup: &CrateWarmup,
 ) -> Vec<&'a (CallCandidate, Language, String)> {
     ambiguous
         .iter()
-        .filter(|(_, _, relative_path)| {
-            crate_name_from_path(relative_path).is_some_and(|name| name == warmup.crate_name)
+        .filter(|(_, entry_language, relative_path)| {
+            *entry_language == language
+                && crate_name_from_path(relative_path).is_some_and(|name| name == warmup.crate_name)
         })
         .take(warmup.queries)
         .copied()
@@ -138,7 +150,7 @@ pub(crate) fn resolve_ambiguous_calls(
 
         if is_first_use {
             if let Some(warmup) = warmup {
-                for (warm_call, _, warm_path) in warmup_targets(ambiguous, warmup) {
+                for (warm_call, _, warm_path) in warmup_targets(ambiguous, *language, warmup) {
                     let Some(source) = file_sources.get(warm_path.as_str()) else {
                         continue;
                     };
@@ -255,29 +267,48 @@ pub struct CrateProbeResult {
 /// [`resolve_ambiguous_calls`]; probes run in `ambiguous`'s own order, one
 /// per crate, at that crate's first appearance.
 ///
-/// Returns the probe results alongside the number of crates that had an
-/// ambiguous call (and so were eligible to probe) but were never actually
-/// probed — no language server available or installed for that crate's
-/// language, chief among the reasons (see the `eprintln!` warning below for
-/// specifics). Distinguishing that count from "no ambiguous calls existed
-/// at all" matters to the caller: without it, a project with plenty of
-/// ambiguous calls but no `rust-analyzer` on `PATH` would otherwise be
-/// reported identically to one with nothing ambiguous in it at all.
+/// Why one crate's cold-vs-warm probe never happened, tallied by
+/// [`probe_cold_crates`] instead of collapsed into one generic "skipped"
+/// count. Distinguishing these matters to the caller (`okf-rs
+/// cold-crate-probe`): reporting every skip as "no language server
+/// available" would misattribute a skip actually caused by unreadable
+/// source text or a rejected `textDocument/didOpen` to a cause the user
+/// never actually hit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeSkips {
+    /// The language server for that crate's language never started at all
+    /// (not installed, failed to spawn, ...) — see the `eprintln!`
+    /// warning [`probe_cold_crates`] prints when this happens.
+    pub no_server: usize,
+    /// The server started, but the probe itself couldn't run for an
+    /// unrelated reason: the source text wasn't available, or the server
+    /// rejected opening that file.
+    pub other: usize,
+}
+
+impl ProbeSkips {
+    /// Total crates skipped, regardless of reason.
+    pub fn total(&self) -> usize {
+        self.no_server + self.other
+    }
+}
+
+/// Returns the probe results alongside [`ProbeSkips`], so a caller can
+/// tell "no ambiguous calls existed at all" apart from "some existed but
+/// couldn't be probed" — and, within the latter, a genuinely missing
+/// language server apart from every other reason a probe might not run.
 pub(crate) fn probe_cold_crates(
     project: &Project,
     ambiguous: &[&(CallCandidate, Language, String)],
     file_sources: &HashMap<String, String>,
-) -> (Vec<CrateProbeResult>, usize) {
+) -> (Vec<CrateProbeResult>, ProbeSkips) {
     let targets = probe_targets(ambiguous);
-    let target_count = targets.len();
 
     let mut results = Vec::new();
+    let mut skips = ProbeSkips::default();
     let mut clients: HashMap<Language, Option<okf_lsp::LspClient>> = HashMap::new();
 
-    for (call, language, relative_path) in targets {
-        let Some(crate_name) = crate_name_from_path(relative_path) else {
-            continue;
-        };
+    for (crate_name, (call, language, relative_path)) in targets {
         let client_slot = clients.entry(*language).or_insert_with(|| {
             match okf_lsp::LspClient::start_with_init_options(
                 *language,
@@ -295,12 +326,15 @@ pub(crate) fn probe_cold_crates(
             }
         });
         let Some(client) = client_slot.as_mut() else {
+            skips.no_server += 1;
             continue;
         };
         let Some(source) = file_sources.get(relative_path.as_str()) else {
+            skips.other += 1;
             continue;
         };
         let Ok(uri) = client.ensure_open(relative_path, source) else {
+            skips.other += 1;
             continue;
         };
 
@@ -325,26 +359,28 @@ pub(crate) fn probe_cold_crates(
         client.shutdown();
     }
 
-    let skipped = target_count - results.len();
-    (results, skipped)
+    (results, skips)
 }
 
 /// Selects one entry from `ambiguous` per distinct crate — its first
-/// appearance in `ambiguous`'s own order — the set [`probe_cold_crates`]
-/// fires its cold-then-warm query pair at. Pulled out as a pure function
-/// for the same reason [`warmup_targets`] is: unit-testable without
-/// spawning a real language server. Entries outside `crates/` (see
-/// [`crate_name_from_path`]) are skipped, not grouped into one bucket.
+/// appearance in `ambiguous`'s own order, paired with that crate's own
+/// name (computed once here rather than re-parsed later) — the set
+/// [`probe_cold_crates`] fires its cold-then-warm query pair at. Pulled
+/// out as a pure function for the same reason [`warmup_targets`] is:
+/// unit-testable without spawning a real language server. Entries outside
+/// `crates/` (see [`crate_name_from_path`]) are skipped, not grouped into
+/// one bucket.
 fn probe_targets<'a>(
     ambiguous: &[&'a (CallCandidate, Language, String)],
-) -> Vec<&'a (CallCandidate, Language, String)> {
+) -> Vec<(String, &'a (CallCandidate, Language, String))> {
     let mut seen_crates: HashSet<String> = HashSet::new();
     ambiguous
         .iter()
-        .filter(|(_, _, relative_path)| {
-            crate_name_from_path(relative_path).is_some_and(|name| seen_crates.insert(name))
+        .filter_map(|entry| {
+            let (_, _, relative_path) = entry;
+            let name = crate_name_from_path(relative_path)?;
+            seen_crates.insert(name.clone()).then_some((name, *entry))
         })
-        .copied()
         .collect()
 }
 
@@ -366,6 +402,14 @@ mod tests {
     use super::*;
 
     fn candidate(caller_id: &str, path: &str) -> (CallCandidate, Language, String) {
+        candidate_lang(caller_id, path, Language::Rust)
+    }
+
+    fn candidate_lang(
+        caller_id: &str,
+        path: &str,
+        language: Language,
+    ) -> (CallCandidate, Language, String) {
         (
             CallCandidate {
                 caller_id: caller_id.to_string(),
@@ -375,7 +419,7 @@ mod tests {
                     character: 0,
                 },
             },
-            Language::Rust,
+            language,
             path.to_string(),
         )
     }
@@ -391,7 +435,7 @@ mod tests {
             queries: 10,
         };
 
-        let targets = warmup_targets(&ambiguous, &warmup);
+        let targets = warmup_targets(&ambiguous, Language::Rust, &warmup);
 
         assert_eq!(targets.len(), 2);
         assert!(targets
@@ -409,7 +453,7 @@ mod tests {
             queries: 1,
         };
 
-        let targets = warmup_targets(&ambiguous, &warmup);
+        let targets = warmup_targets(&ambiguous, Language::Rust, &warmup);
 
         assert_eq!(targets.len(), 1);
     }
@@ -425,9 +469,41 @@ mod tests {
             queries: 10,
         };
 
-        let targets = warmup_targets(&ambiguous, &warmup);
+        let targets = warmup_targets(&ambiguous, Language::Rust, &warmup);
 
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn warmup_targets_does_not_fire_through_a_different_languages_client() {
+        // Regression test for a real bug /code-review found: without the
+        // language filter, a Python file matching the target crate's path
+        // would be selected and warmed up through whichever client
+        // started first, even a Rust one -- see this function's own docs
+        // for the failure this guards against.
+        let rust_file =
+            candidate_lang("functions/a", "crates/okf-graph/src/lib.rs", Language::Rust);
+        let python_file = candidate_lang(
+            "functions/b",
+            "crates/okf-graph/src/other.py",
+            Language::Python,
+        );
+        let ambiguous: Vec<&(CallCandidate, Language, String)> = vec![&python_file, &rust_file];
+        let warmup = CrateWarmup {
+            crate_name: "okf-graph".to_string(),
+            queries: 10,
+        };
+
+        // A Python client starting first (it's the first entry in
+        // `ambiguous`) must not pick up the Rust file just because the
+        // path matches -- only the Rust file matches `Language::Rust`.
+        let rust_targets = warmup_targets(&ambiguous, Language::Rust, &warmup);
+        assert_eq!(rust_targets.len(), 1);
+        assert_eq!(rust_targets[0].0.caller_id, "functions/a");
+
+        let python_targets = warmup_targets(&ambiguous, Language::Python, &warmup);
+        assert_eq!(python_targets.len(), 1);
+        assert_eq!(python_targets[0].0.caller_id, "functions/b");
     }
 
     #[test]
@@ -459,8 +535,10 @@ mod tests {
         let targets = probe_targets(&ambiguous);
 
         assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].0.caller_id, "functions/a1");
-        assert_eq!(targets[1].0.caller_id, "functions/b1");
+        assert_eq!(targets[0].0, "okf-graph");
+        assert_eq!(targets[0].1 .0.caller_id, "functions/a1");
+        assert_eq!(targets[1].0, "okf-core");
+        assert_eq!(targets[1].1 .0.caller_id, "functions/b1");
     }
 
     #[test]

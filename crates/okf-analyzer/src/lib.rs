@@ -23,7 +23,7 @@ mod cache;
 mod lsp;
 
 pub use cache::AnalysisCache;
-pub use lsp::CrateWarmup;
+pub use lsp::{CrateWarmup, ProbeSkips};
 
 use anyhow::{Context, Result};
 use okf_core::{ManifestKind, Project};
@@ -229,40 +229,11 @@ pub fn analyze_with_cache_lsp_warmed(
 
     link_modules_to_packages(&mut concepts);
 
-    let mut symbol_table: HashMap<&str, Vec<&str>> = HashMap::new();
-    for concept in &concepts {
-        if matches!(concept.kind, ConceptKind::Function | ConceptKind::Method) {
-            symbol_table
-                .entry(concept.name.as_str())
-                .or_default()
-                .push(concept.id.as_str());
-        }
-    }
-
-    let mut resolved_edges: Vec<ResolvedEdge> = Vec::new();
-    let mut ambiguous: Vec<&(CallCandidate, Language, String)> = Vec::new();
-    for entry in &calls {
-        let (call, _, _) = entry;
-        let Some(candidates) = symbol_table.get(call.callee_name.as_str()) else {
-            continue;
-        };
-        if candidates.len() != 1 {
-            if use_lsp {
-                ambiguous.push(entry);
-            }
-            continue;
-        }
-        let callee_id = candidates[0].to_string();
-        if callee_id != call.caller_id {
-            resolved_edges.push(ResolvedEdge {
-                caller: call.caller_id.clone(),
-                callee: callee_id,
-                resolved_by: "tree-sitter".to_string(),
-                confidence: Confidence::Exact,
-                resolver_version: None,
-            });
-        }
-    }
+    let symbol_table = build_symbol_table(&concepts);
+    let (mut resolved_edges, ambiguous_indices) =
+        split_ambiguous_calls(&calls, &symbol_table, use_lsp);
+    let ambiguous: Vec<&(CallCandidate, Language, String)> =
+        ambiguous_indices.iter().map(|&i| &calls[i]).collect();
 
     if use_lsp && !ambiguous.is_empty() {
         let id_to_location: HashMap<&str, &Location> = concepts
@@ -332,10 +303,10 @@ pub fn analyze_with_cache_lsp_warmed(
 /// `generate` runs share) and never writes a bundle or resolves an edge
 /// for real.
 ///
-/// Returns the probe results alongside the number of crates that had an
-/// ambiguous call but were never actually probed (e.g. no language server
-/// available) — see [`lsp::probe_cold_crates`].
-pub fn probe_cold_crates(project: &Project) -> Result<(Vec<lsp::CrateProbeResult>, usize)> {
+/// Returns the probe results alongside [`ProbeSkips`], tallying crates
+/// that had an ambiguous call but were never actually probed, broken down
+/// by why — see [`lsp::probe_cold_crates`].
+pub fn probe_cold_crates(project: &Project) -> Result<(Vec<lsp::CrateProbeResult>, ProbeSkips)> {
     let mut concepts = detect_packages(project)?;
     let mut calls: Vec<(CallCandidate, Language, String)> = Vec::new();
     let mut file_sources: HashMap<String, String> = HashMap::new();
@@ -376,8 +347,27 @@ pub fn probe_cold_crates(project: &Project) -> Result<(Vec<lsp::CrateProbeResult
     Concept::disambiguate_ids(&mut concepts);
     link_modules_to_packages(&mut concepts);
 
+    let symbol_table = build_symbol_table(&concepts);
+    // The probe only ever cares about the ambiguous half of this split --
+    // `resolved_edges` here is Tree-sitter's own unambiguous resolution,
+    // irrelevant to a probe that never writes a bundle or resolves
+    // anything for real.
+    let (_resolved_edges, ambiguous_indices) = split_ambiguous_calls(&calls, &symbol_table, true);
+    let ambiguous: Vec<&(CallCandidate, Language, String)> =
+        ambiguous_indices.iter().map(|&i| &calls[i]).collect();
+
+    Ok(lsp::probe_cold_crates(project, &ambiguous, &file_sources))
+}
+
+/// Maps each function/method concept's bare name to every concept id
+/// sharing it, project-wide — the "how many candidates does this callee
+/// name match" lookup [`split_ambiguous_calls`] uses to tell an
+/// unambiguous call from an ambiguous one. A concept's own field, not a
+/// [`Project`] one, since it depends on which concepts were actually
+/// extracted this run.
+fn build_symbol_table(concepts: &[Concept]) -> HashMap<&str, Vec<&str>> {
     let mut symbol_table: HashMap<&str, Vec<&str>> = HashMap::new();
-    for concept in &concepts {
+    for concept in concepts {
         if matches!(concept.kind, ConceptKind::Function | ConceptKind::Method) {
             symbol_table
                 .entry(concept.name.as_str())
@@ -385,19 +375,54 @@ pub fn probe_cold_crates(project: &Project) -> Result<(Vec<lsp::CrateProbeResult
                 .push(concept.id.as_str());
         }
     }
+    symbol_table
+}
 
-    let mut ambiguous: Vec<&(CallCandidate, Language, String)> = Vec::new();
-    for entry in &calls {
-        let (call, _, _) = entry;
-        if symbol_table
-            .get(call.callee_name.as_str())
-            .is_some_and(|candidates| candidates.len() != 1)
-        {
-            ambiguous.push(entry);
+/// Splits `calls` into the edges Tree-sitter's own unambiguous
+/// name-matching already resolves, and the indices (into `calls`) of
+/// calls whose callee name matches more than one candidate project-wide —
+/// populated only when `include_ambiguous` is set, since
+/// [`analyze_with_cache_lsp_warmed`]'s plain (non-`--lsp`) path has no use
+/// for them. Indices rather than references so this stays a free
+/// function operating on borrowed input instead of returning a
+/// self-referential struct: both callers already hold their own `calls`
+/// and can index back into it.
+///
+/// The one piece of "how is ambiguity determined" logic shared by
+/// [`analyze_with_cache_lsp_warmed`] (the real resolution path) and
+/// [`probe_cold_crates`] (diagnostic-only) — previously duplicated
+/// between them, so a future change to the rule (e.g. also considering
+/// arity) could update one and silently miss the other. A `/code-review`
+/// finding.
+fn split_ambiguous_calls(
+    calls: &[(CallCandidate, Language, String)],
+    symbol_table: &HashMap<&str, Vec<&str>>,
+    include_ambiguous: bool,
+) -> (Vec<ResolvedEdge>, Vec<usize>) {
+    let mut resolved_edges = Vec::new();
+    let mut ambiguous_indices = Vec::new();
+    for (i, (call, _, _)) in calls.iter().enumerate() {
+        let Some(candidates) = symbol_table.get(call.callee_name.as_str()) else {
+            continue;
+        };
+        if candidates.len() != 1 {
+            if include_ambiguous {
+                ambiguous_indices.push(i);
+            }
+            continue;
+        }
+        let callee_id = candidates[0].to_string();
+        if callee_id != call.caller_id {
+            resolved_edges.push(ResolvedEdge {
+                caller: call.caller_id.clone(),
+                callee: callee_id,
+                resolved_by: "tree-sitter".to_string(),
+                confidence: Confidence::Exact,
+                resolver_version: None,
+            });
         }
     }
-
-    Ok(lsp::probe_cold_crates(project, &ambiguous, &file_sources))
+    (resolved_edges, ambiguous_indices)
 }
 
 /// One file's read+extract outcome, produced in parallel by
@@ -1316,6 +1341,91 @@ mod tests {
             generated_at: None,
             relationships: Vec::new(),
         }
+    }
+
+    fn call(caller_id: &str, callee_name: &str) -> (CallCandidate, Language, String) {
+        (
+            CallCandidate {
+                caller_id: caller_id.to_string(),
+                callee_name: callee_name.to_string(),
+                call_site: okf_tree_sitter::CallSite {
+                    line: 0,
+                    character: 0,
+                },
+            },
+            Language::Rust,
+            "src/lib.rs".to_string(),
+        )
+    }
+
+    #[test]
+    fn build_symbol_table_groups_by_name_functions_and_methods_only() {
+        let mut get_fn = make_concept("functions/get", "fn get()");
+        get_fn.name = "get".to_string();
+        let mut get_method = make_concept("methods/Foo/get", "fn get(&self)");
+        get_method.kind = ConceptKind::Method;
+        get_method.name = "get".to_string();
+        let mut get_module = make_concept("modules/get", "mod get");
+        get_module.kind = ConceptKind::Module;
+        get_module.name = "get".to_string();
+        let concepts = vec![get_fn, get_method, get_module];
+
+        let table = build_symbol_table(&concepts);
+
+        // Two candidates for "get" -- the function and the method -- the
+        // module (not a Function/Method) doesn't count as a candidate.
+        assert_eq!(table.get("get").map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn split_ambiguous_calls_resolves_an_unambiguous_call_and_flags_an_ambiguous_one() {
+        let mut a = make_concept("functions/a", "fn a()");
+        a.name = "caller".to_string();
+        let mut unique = make_concept("functions/unique", "fn unique()");
+        unique.name = "unique".to_string();
+        let mut dup1 = make_concept("functions/dup1", "fn dup()");
+        dup1.name = "dup".to_string();
+        let mut dup2 = make_concept("functions/dup2", "fn dup()");
+        dup2.name = "dup".to_string();
+        let concepts = vec![a, unique, dup1, dup2];
+        let symbol_table = build_symbol_table(&concepts);
+
+        let calls = vec![call("functions/a", "unique"), call("functions/a", "dup")];
+        let (resolved, ambiguous) = split_ambiguous_calls(&calls, &symbol_table, true);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].callee, "functions/unique");
+        assert_eq!(ambiguous, vec![1]);
+    }
+
+    #[test]
+    fn split_ambiguous_calls_drops_ambiguous_indices_when_not_requested() {
+        let mut dup1 = make_concept("functions/dup1", "fn dup()");
+        dup1.name = "dup".to_string();
+        let mut dup2 = make_concept("functions/dup2", "fn dup()");
+        dup2.name = "dup".to_string();
+        let concepts = vec![dup1, dup2];
+        let symbol_table = build_symbol_table(&concepts);
+        let calls = vec![call("functions/other", "dup")];
+
+        let (resolved, ambiguous) = split_ambiguous_calls(&calls, &symbol_table, false);
+
+        assert!(resolved.is_empty());
+        assert!(ambiguous.is_empty());
+    }
+
+    #[test]
+    fn split_ambiguous_calls_does_not_resolve_a_call_to_itself() {
+        let mut recursive = make_concept("functions/recursive", "fn recursive()");
+        recursive.name = "recursive".to_string();
+        let concepts = vec![recursive];
+        let symbol_table = build_symbol_table(&concepts);
+        let calls = vec![call("functions/recursive", "recursive")];
+
+        let (resolved, ambiguous) = split_ambiguous_calls(&calls, &symbol_table, true);
+
+        assert!(resolved.is_empty());
+        assert!(ambiguous.is_empty());
     }
 
     #[test]
