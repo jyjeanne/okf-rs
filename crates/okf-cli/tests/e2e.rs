@@ -1925,3 +1925,149 @@ fn standalone_binary_reports_a_clear_error_when_no_bundle_exists_yet() {
     assert!(!callers.status.success());
     assert!(stderr_of(&callers).contains("okf-rs generate"));
 }
+
+/// Writes the small Rust project `graph plan-change`'s golden test runs
+/// against: `login` (public) calls `authenticate` (public), which calls
+/// `verify_password`; `test_login` (an inline test, matched by
+/// `symbol_pattern`) and `handle_callback` (another module) call `login`;
+/// `tests/login.rs`'s `login_flow` (matched by `path_segment`) calls it
+/// too. Written from the test rather than checked in, so this repo's own
+/// bundle never picks up the fixture's `Cargo.toml` as a package.
+fn write_plan_change_fixture(project: &Path) {
+    let files = [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"plan-change-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("src/lib.rs", "pub mod auth;\npub mod oauth;\n"),
+        (
+            "src/auth.rs",
+            "pub fn authenticate(user: &str) -> bool {\n    verify_password(user)\n}\n\nfn verify_password(user: &str) -> bool {\n    !user.is_empty()\n}\n\npub fn login(user: &str) -> bool {\n    authenticate(user)\n}\n\nfn test_login() {\n    login(\"alice\");\n}\n",
+        ),
+        (
+            "src/oauth.rs",
+            "pub fn handle_callback(user: &str) -> bool {\n    crate::auth::login(user)\n}\n",
+        ),
+        (
+            "tests/login.rs",
+            "fn login_flow() {\n    plan_change_fixture::auth::login(\"bob\");\n}\n",
+        ),
+    ];
+    for (relative, content) in files {
+        let path = project.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+}
+
+/// `graph plan-change` end to end: JSON output byte-identical to the
+/// reviewed golden file (spec §4.1.9), deterministic across runs, a text
+/// rendering, `okf.toml`'s `[plan_change]` table honored, and the two
+/// error cases (unknown id with candidates, structural id).
+#[test]
+fn graph_plan_change_matches_the_golden_file() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("fixture");
+    write_plan_change_fixture(&project);
+
+    let generate = run(&project, &["generate", "."]);
+    assert_success(&generate, &["generate"]);
+
+    let target = "functions/src/auth/authenticate";
+    let args = ["graph", "plan-change", target, "--project", "."];
+    let first = run(&project, &args);
+    assert_success(&first, &args);
+    // A checkout with `core.autocrlf` may hand the golden file back with
+    // CRLF line endings; the contract is the content, not the platform's
+    // line terminator.
+    let golden =
+        fs::read_to_string(repo_root().join("tests/fixtures/plan-change/authenticate.json"))
+            .unwrap()
+            .replace("\r\n", "\n");
+    assert_eq!(stdout_of(&first).replace("\r\n", "\n"), golden);
+
+    let second = run(&project, &args);
+    assert_eq!(stdout_of(&first), stdout_of(&second));
+
+    let text = run(
+        &project,
+        &[
+            "graph",
+            "plan-change",
+            target,
+            "--project",
+            ".",
+            "--format",
+            "text",
+        ],
+    );
+    assert_success(&text, &["graph plan-change --format text"]);
+    assert!(stdout_of(&text).starts_with(&format!("Change plan for {target} (Function)")));
+
+    fs::write(
+        project.join("okf.toml"),
+        "output = \"knowledge\"\n\n[plan_change]\nboundary_terms = [\"oauth\"]\nlarge_blast_radius = 2\n",
+    )
+    .unwrap();
+    let configured = run(&project, &args);
+    assert_success(&configured, &args);
+    let configured_out = stdout_of(&configured);
+    assert!(configured_out.contains("\"signal\": \"auth_boundary\""));
+    assert!(configured_out.contains("module(s) matching a boundary term: modules/src/oauth"));
+    assert!(configured_out.contains("(threshold 2)"));
+
+    // Right symbol, wrong path: rejected rather than guessed, with the
+    // real id offered as a candidate.
+    let unknown = run(
+        &project,
+        &[
+            "graph",
+            "plan-change",
+            "functions/auth/authenticate",
+            "--project",
+            ".",
+        ],
+    );
+    assert!(!unknown.status.success());
+    let unknown_err = stderr_of(&unknown);
+    assert!(unknown_err.contains("no concept with id `functions/auth/authenticate`"));
+    assert!(unknown_err.contains(target));
+
+    let structural = run(
+        &project,
+        &["graph", "plan-change", "modules/src/auth", "--project", "."],
+    );
+    assert!(!structural.status.success());
+    assert!(stderr_of(&structural).contains("is a Module concept"));
+}
+
+/// `[agents] protocol = true` adds the OKF development-protocol directive
+/// to the generated `AGENTS.md` section, and survives repeated `init` runs
+/// (`init` rewrites only `okf.toml`'s `output` line). Without the flag the
+/// directive is absent.
+#[test]
+fn init_writes_the_protocol_directive_only_when_opted_in() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("fixture");
+    write_plan_change_fixture(&project);
+
+    let plain = run(&project, &["init", "."]);
+    assert_success(&plain, &["init"]);
+    let agents = fs::read_to_string(project.join("AGENTS.md")).unwrap();
+    assert!(!agents.contains("OKF development protocol"));
+
+    fs::write(
+        project.join("okf.toml"),
+        "output = \"knowledge\"\n\n[agents]\nprotocol = true\n",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let opted_in = run(&project, &["init", "."]);
+        assert_success(&opted_in, &["init"]);
+    }
+    let agents = fs::read_to_string(project.join("AGENTS.md")).unwrap();
+    assert_eq!(agents.matches("OKF development protocol").count(), 1);
+    assert!(agents.contains("okf-rs graph plan-change <id>"));
+    let config = fs::read_to_string(project.join("okf.toml")).unwrap();
+    assert!(config.contains("[agents]\nprotocol = true"));
+}

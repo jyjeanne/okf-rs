@@ -28,7 +28,25 @@ const END_MARKER: &str = "<!-- okf-rs:end -->";
 
 const TARGETS: [&str; 3] = ["CLAUDE.md", "AGENTS.md", ".github/copilot-instructions.md"];
 
-fn render_section(bundle_output: &str) -> String {
+/// The OKF development-protocol directive (agent integration spec §7.1),
+/// appended to the section only when `okf.toml` sets
+/// `[agents] protocol = true`. Kept to a short directive on purpose: the
+/// full procedure lives in the agent skill pack, not in every agent's
+/// always-loaded instructions.
+const PROTOCOL_DIRECTIVE: &str = "
+## OKF development protocol
+
+Before changing an existing concept: run `okf-rs generate --check-fresh`
+(regenerate if stale), then query the bundle with `explore` and with
+`graph` relation `plan-change` (MCP), or `okf-rs explore <id>` and
+`okf-rs graph plan-change <id>` (CLI). Do not infer callers or blast radius
+from source. Before a refactor, query `graph` modules, cycles, and path.
+After any change: regenerate, then run `okf-rs validate`. Read source files
+only after the graph names them.
+";
+
+fn render_section(bundle_output: &str, protocol: bool) -> String {
+    let directive = if protocol { PROTOCOL_DIRECTIVE } else { "" };
     format!(
         "{BEGIN_MARKER}\n\
 ## Knowledge base
@@ -41,7 +59,7 @@ This project's structural knowledge — modules, types, functions, and their cal
 - `okf-rs graph cycles` — list call-graph cycles
 
 Regenerate the bundle after code changes with `okf-rs generate`.
-{END_MARKER}\n"
+{directive}{END_MARKER}\n"
     )
 }
 
@@ -85,9 +103,16 @@ fn merge(existing: Option<String>, section: &str) -> String {
 /// Writes/updates `CLAUDE.md`, `AGENTS.md`, and
 /// `.github/copilot-instructions.md` under `project_root`, pointing at
 /// `bundle_output` (typically the same relative path recorded in
-/// `okf.toml`, e.g. `knowledge`). Returns the paths written.
-pub fn write_agent_entrypoints(project_root: &Path, bundle_output: &str) -> Result<Vec<PathBuf>> {
-    let section = render_section(bundle_output);
+/// `okf.toml`, e.g. `knowledge`). `protocol` adds the OKF
+/// development-protocol directive to the `AGENTS.md`/Copilot section
+/// (`okf.toml`'s `[agents] protocol`; off by default). Returns the paths
+/// written.
+pub fn write_agent_entrypoints(
+    project_root: &Path,
+    bundle_output: &str,
+    protocol: bool,
+) -> Result<Vec<PathBuf>> {
+    let section = render_section(bundle_output, protocol);
     let import_section = render_import_section();
     let mut written = Vec::new();
     for relative in TARGETS {
@@ -117,7 +142,7 @@ mod tests {
     #[test]
     fn creates_new_files_with_the_section() {
         let dir = tempfile::tempdir().unwrap();
-        let written = write_agent_entrypoints(dir.path(), "knowledge").unwrap();
+        let written = write_agent_entrypoints(dir.path(), "knowledge", false).unwrap();
         assert_eq!(written.len(), 3);
 
         // CLAUDE.md imports AGENTS.md rather than duplicating its
@@ -146,7 +171,7 @@ mod tests {
         )
         .unwrap();
 
-        write_agent_entrypoints(dir.path(), "knowledge").unwrap();
+        write_agent_entrypoints(dir.path(), "knowledge", false).unwrap();
         let first = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
         assert!(first.contains("Some existing instructions the user wrote."));
         assert!(first.contains(BEGIN_MARKER));
@@ -156,7 +181,7 @@ mod tests {
         // marked section (CLAUDE.md's import line is stable either way),
         // preserves the user's own CLAUDE.md content, and doesn't
         // duplicate the section.
-        write_agent_entrypoints(dir.path(), "docs/kb").unwrap();
+        write_agent_entrypoints(dir.path(), "docs/kb", false).unwrap();
         let second = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
         assert!(second.contains("Some existing instructions the user wrote."));
         assert_eq!(second.matches(BEGIN_MARKER).count(), 1);
@@ -169,21 +194,63 @@ mod tests {
     #[test]
     fn repeat_runs_do_not_grow_a_trailing_blank_line() {
         let dir = tempfile::tempdir().unwrap();
-        write_agent_entrypoints(dir.path(), "knowledge").unwrap();
+        write_agent_entrypoints(dir.path(), "knowledge", false).unwrap();
         let once = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
 
         for _ in 0..3 {
-            write_agent_entrypoints(dir.path(), "knowledge").unwrap();
+            write_agent_entrypoints(dir.path(), "knowledge", false).unwrap();
         }
         let repeated = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
         assert_eq!(once, repeated);
     }
 
     #[test]
+    fn protocol_directive_is_absent_by_default() {
+        let section = render_section("knowledge", false);
+        assert!(!section.contains("OKF development protocol"));
+        assert!(section.ends_with("with `okf-rs generate`.\n<!-- okf-rs:end -->\n"));
+    }
+
+    #[test]
+    fn protocol_directive_is_inserted_before_the_end_marker_when_enabled() {
+        let off = render_section("knowledge", false);
+        let on = render_section("knowledge", true);
+        // Exactly the directive is added; nothing else changes.
+        let insert_at = off.find(END_MARKER).unwrap();
+        let expected = format!(
+            "{}{}{}",
+            &off[..insert_at],
+            PROTOCOL_DIRECTIVE,
+            &off[insert_at..]
+        );
+        assert_eq!(on, expected);
+        let directive_lines = PROTOCOL_DIRECTIVE.trim().lines().count();
+        assert!(
+            directive_lines <= 12,
+            "directive is {directive_lines} lines"
+        );
+        assert!(on.contains("okf-rs generate --check-fresh"));
+        assert!(on.contains("plan-change"));
+    }
+
+    #[test]
+    fn protocol_directive_goes_to_agents_md_not_claude_md() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent_entrypoints(dir.path(), "knowledge", true).unwrap();
+        let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(agents.contains("OKF development protocol"));
+        // CLAUDE.md still only imports AGENTS.md, so Claude Code sees the
+        // directive through the import without a duplicate copy.
+        let claude = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+        assert!(!claude.contains("OKF development protocol"));
+        assert!(claude.contains("@AGENTS.md"));
+    }
+
+    #[test]
     fn claude_md_import_does_not_duplicate_on_repeat_runs() {
         let dir = tempfile::tempdir().unwrap();
-        write_agent_entrypoints(dir.path(), "knowledge").unwrap();
-        write_agent_entrypoints(dir.path(), "knowledge").unwrap();
+        write_agent_entrypoints(dir.path(), "knowledge", false).unwrap();
+        write_agent_entrypoints(dir.path(), "knowledge", false).unwrap();
 
         let claude = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
         assert_eq!(claude.matches("@AGENTS.md").count(), 1);

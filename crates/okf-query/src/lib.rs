@@ -14,11 +14,14 @@
 //! `okf-cli`/`okf-mcp`. Most of these functions (`search`,
 //! `graph_callers`, ...) return pre-formatted text, which is the right
 //! shape for a CLI/MCP caller but not for a Rust tool that wants to work
-//! with the data directly. The two operations that compute real
-//! aggregated data rather than just relaying `okf-graph`/`okf-search`
-//! results — [`coverage`] and [`graph_stats`] — additionally expose that
-//! data as a plain struct (`Serialize`, so it's JSON-embeddable too) via
-//! [`coverage_report`] and [`graph_stats_report`]; everywhere else, embed
+//! with the data directly. The operations that compute real aggregated
+//! data rather than just relaying `okf-graph`/`okf-search` results —
+//! [`coverage`] and [`graph_stats`] — additionally expose that data as a
+//! plain struct (`Serialize`, so it's JSON-embeddable too) via
+//! [`coverage_report`] and [`graph_stats_report`]; [`plan_change`]
+//! returns its [`PlanChange`] struct directly, with
+//! [`PlanChange::to_json`]/[`PlanChange::to_text`] for the CLI and MCP
+//! renderings. Everywhere else, embed
 //! `okf_graph::Graph`/`okf_search::SearchIndex`/`FullTextIndex` directly,
 //! which already return structured, borrowed data rather than text.
 //!
@@ -66,6 +69,12 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
+
+mod plan_change;
+pub use plan_change::{
+    plan_change, plan_change_from_concepts, Inspection, PlanChange, PlanChangeOptions, PlanTarget,
+    RiskSignal, SCHEMA as PLAN_CHANGE_SCHEMA,
+};
 
 /// Errors if `bundle` doesn't exist yet, with a pointer to `okf-rs
 /// generate` rather than an opaque "no such file or directory" error.

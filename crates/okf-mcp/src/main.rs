@@ -85,7 +85,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let bundle = okf_core::config::resolve_bundle(&project_root, None);
+    // Loaded once: `okf.toml` names the bundle and holds `plan-change`'s
+    // `[plan_change]` thresholds, so both come from the same read (and a
+    // malformed file warns once, not once per use).
+    let config = okf_core::config::load(&project_root);
+    let bundle = project_root.join(&config.output);
+    let plan_change = okf_query::PlanChangeOptions {
+        large_blast_radius: config.plan_change.large_blast_radius,
+        boundary_terms: config.plan_change.boundary_terms,
+    };
     let cache = cache::BundleCache::new();
 
     let stdin = io::stdin();
@@ -110,7 +118,7 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-        if let Some(response) = handle_message(&request, &bundle, &cache) {
+        if let Some(response) = handle_message(&request, &bundle, &cache, &plan_change) {
             writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
             stdout.flush()?;
         }
@@ -121,11 +129,13 @@ fn main() -> Result<()> {
 /// Dispatches one JSON-RPC message, returning the response to write (or
 /// `None` for notifications, which never get one). `cache` amortizes
 /// bundle parsing across calls within this one server process — see the
-/// `cache` module for the freshness guarantee it makes.
+/// `cache` module for the freshness guarantee it makes. `plan_change` is
+/// the project's `[plan_change]` config, read once at startup.
 fn handle_message(
     request: &Value,
     bundle: &std::path::Path,
     cache: &cache::BundleCache,
+    plan_change: &okf_query::PlanChangeOptions,
 ) -> Option<Value> {
     let method = request.get("method")?.as_str()?;
     let id = request.get("id").cloned();
@@ -145,7 +155,7 @@ fn handle_message(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match tools::call(name, &arguments, bundle, cache) {
+            match tools::call_with(name, &arguments, bundle, cache, plan_change) {
                 Ok(text) => Ok(json!({
                     "content": [{ "type": "text", "text": text }],
                     "isError": false,
@@ -194,6 +204,7 @@ mod tests {
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
             std::path::Path::new("knowledge"),
             &cache::BundleCache::new(),
+            &okf_query::PlanChangeOptions::default(),
         )
         .unwrap();
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
@@ -206,6 +217,7 @@ mod tests {
             &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
             std::path::Path::new("knowledge"),
             &cache::BundleCache::new(),
+            &okf_query::PlanChangeOptions::default(),
         );
         assert!(response.is_none());
     }
@@ -216,6 +228,7 @@ mod tests {
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "bogus" }),
             std::path::Path::new("knowledge"),
             &cache::BundleCache::new(),
+            &okf_query::PlanChangeOptions::default(),
         )
         .unwrap();
         assert_eq!(response["error"]["code"], -32601);
@@ -224,6 +237,7 @@ mod tests {
             &json!({ "jsonrpc": "2.0", "method": "notifications/bogus" }),
             std::path::Path::new("knowledge"),
             &cache::BundleCache::new(),
+            &okf_query::PlanChangeOptions::default(),
         );
         assert!(response.is_none());
     }
@@ -234,6 +248,7 @@ mod tests {
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
             std::path::Path::new("knowledge"),
             &cache::BundleCache::new(),
+            &okf_query::PlanChangeOptions::default(),
         )
         .unwrap();
         let names: Vec<&str> = response["result"]["tools"]
@@ -261,6 +276,7 @@ mod tests {
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
             std::path::Path::new("knowledge"),
             &cache::BundleCache::new(),
+            &okf_query::PlanChangeOptions::default(),
         )
         .unwrap();
         let graph_tool = response["result"]["tools"]
@@ -290,6 +306,7 @@ mod tests {
             "communities",
             "patterns",
             "features",
+            "plan-change",
         ] {
             assert!(
                 relations.contains(&expected),
@@ -317,6 +334,7 @@ mod tests {
             }),
             dir.path(),
             &cache::BundleCache::new(),
+            &okf_query::PlanChangeOptions::default(),
         )
         .unwrap();
 
@@ -337,6 +355,7 @@ mod tests {
             }),
             std::path::Path::new("/nonexistent/knowledge-bundle"),
             &cache::BundleCache::new(),
+            &okf_query::PlanChangeOptions::default(),
         )
         .unwrap();
 

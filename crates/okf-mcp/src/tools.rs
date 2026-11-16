@@ -63,16 +63,16 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "graph",
-            "description": "Unified entry point for graph-topology and architecture queries — one tool covering what used to be a dozen-plus single-purpose graph_* tools, to keep the schema this server contributes to every session's system prompt small. Pick a `relation`:\n- callers (needs `id`): concepts that directly call `id`\n- callees (needs `id`): concepts `id` directly calls\n- path (needs `from`, `to`): shortest call path between two concept ids\n- explain (needs `from`, `to`): why a relationship exists between two concepts — the relation kind plus a human-readable reason derived from its provenance (e.g. \"resolved via Tree-sitter's unambiguous name match\", or which language server resolved it); falls back to explaining the shortest call path hop-by-hop when there's no single direct relationship\n- api: the project's public API surface (public functions, methods, and types)\n- cycles: groups of concepts that call each other in a cycle (direct or mutual recursion)\n- modules: cross-module call dependency edges\n- isolated: concepts with no Calls/CalledBy edge in either direction — candidates for dead code or unresolved calls\n- stats: concept-kind breakdown, relationship edge counts by kind, and connected components of the Calls/CalledBy graph\n- layers: each package's layer in the package dependency graph (layer 0 = depends on no other package in the bundle)\n- domains: clusters of packages that depend on each other, directly or transitively\n- communities: package communities from modularity-optimization detection — finer-grained than domains\n- patterns: design patterns (Builder, Singleton, Factory, Visitor) detected via structural/naming heuristics — a signal to review, not a guarantee\n- features: REST endpoints, database models, and event-flow participants detected via naming heuristics (e.g. a *Controller-named type, an emit_*-named function)",
+            "description": "Unified entry point for graph-topology and architecture queries — one tool covering what used to be a dozen-plus single-purpose graph_* tools, to keep the schema this server contributes to every session's system prompt small. Pick a `relation`:\n- callers (needs `id`): concepts that directly call `id`\n- callees (needs `id`): concepts `id` directly calls\n- path (needs `from`, `to`): shortest call path between two concept ids\n- explain (needs `from`, `to`): why a relationship exists between two concepts — the relation kind plus a human-readable reason derived from its provenance (e.g. \"resolved via Tree-sitter's unambiguous name match\", or which language server resolved it); falls back to explaining the shortest call path hop-by-hop when there's no single direct relationship\n- api: the project's public API surface (public functions, methods, and types)\n- cycles: groups of concepts that call each other in a cycle (direct or mutual recursion)\n- modules: cross-module call dependency edges\n- isolated: concepts with no Calls/CalledBy edge in either direction — candidates for dead code or unresolved calls\n- stats: concept-kind breakdown, relationship edge counts by kind, and connected components of the Calls/CalledBy graph\n- layers: each package's layer in the package dependency graph (layer 0 = depends on no other package in the bundle)\n- domains: clusters of packages that depend on each other, directly or transitively\n- communities: package communities from modularity-optimization detection — finer-grained than domains\n- patterns: design patterns (Builder, Singleton, Factory, Visitor) detected via structural/naming heuristics — a signal to review, not a guarantee\n- features: REST endpoints, database models, and event-flow participants detected via naming heuristics (e.g. a *Controller-named type, an emit_*-named function)\n- plan-change (needs an exact `id`): JSON change plan to read BEFORE editing `id` — direct and indirect callers, blast radius, public API in scope, cycle membership, modules, tests that reach it (heuristic), risk signals, and what to inspect first",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "relation": {
                         "type": "string",
-                        "enum": ["callers", "callees", "path", "explain", "api", "cycles", "modules", "isolated", "stats", "layers", "domains", "communities", "patterns", "features"],
+                        "enum": ["callers", "callees", "path", "explain", "api", "cycles", "modules", "isolated", "stats", "layers", "domains", "communities", "patterns", "features", "plan-change"],
                         "description": "Which graph query to run",
                     },
-                    "id": { "type": "string", "description": "Concept id — required for relation=callers|callees (find it with the search tool)" },
+                    "id": { "type": "string", "description": "Concept id — required for relation=callers|callees|plan-change (find it with the search tool)" },
                     "from": { "type": "string", "description": "Starting concept id — required for relation=path|explain" },
                     "to": { "type": "string", "description": "Target concept id — required for relation=path|explain" },
                 },
@@ -95,7 +95,30 @@ pub fn list() -> Vec<Value> {
 /// them, rather than each tool re-reading the bundle from scratch.
 /// `search`/`search_ranked` are the exception: they build their own
 /// index (exact/BM25) straight from `bundle` and aren't cached here.
+///
+/// Uses the default `plan-change` thresholds; the server itself calls
+/// [`call_with`] with the project's `[plan_change]` config instead. The
+/// benchmarks and tests that only exercise other tools keep this shorter
+/// form.
 pub fn call(name: &str, arguments: &Value, bundle: &Path, cache: &BundleCache) -> Result<String> {
+    call_with(
+        name,
+        arguments,
+        bundle,
+        cache,
+        &okf_query::PlanChangeOptions::default(),
+    )
+}
+
+/// [`call`], with the project's `[plan_change]` config for
+/// `graph`'s `plan-change` relation.
+pub fn call_with(
+    name: &str,
+    arguments: &Value,
+    bundle: &Path,
+    cache: &BundleCache,
+    plan_change: &okf_query::PlanChangeOptions,
+) -> Result<String> {
     match name {
         "search" => okf_query::search(bundle, &arg_str(arguments, "query")?),
         "search_ranked" => okf_query::search_ranked(bundle, &arg_str(arguments, "query")?),
@@ -121,7 +144,7 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path, cache: &BundleCache) -
         "coverage" => Ok(okf_query::coverage_from_concepts(
             &cache.get_or_load(bundle)?,
         )),
-        "graph" => graph_relation(bundle, arguments, cache),
+        "graph" => graph_relation(bundle, arguments, cache, plan_change),
         other => Err(anyhow!("unknown tool `{other}`")),
     }
 }
@@ -132,7 +155,12 @@ pub fn call(name: &str, arguments: &Value, bundle: &Path, cache: &BundleCache) -
 /// grows by one `enum` variant per new graph query instead of one whole
 /// tool (with its own name and JSON Schema, repeated in every session's
 /// system prompt) per query.
-fn graph_relation(bundle: &Path, arguments: &Value, cache: &BundleCache) -> Result<String> {
+fn graph_relation(
+    bundle: &Path,
+    arguments: &Value,
+    cache: &BundleCache,
+    plan_change: &okf_query::PlanChangeOptions,
+) -> Result<String> {
     let relation = arg_str(arguments, "relation")?;
     // Each arm validates the arguments *that relation* needs before
     // touching the bundle/cache, so a malformed request (missing `id`/
@@ -174,8 +202,13 @@ fn graph_relation(bundle: &Path, arguments: &Value, cache: &BundleCache) -> Resu
         "features" => Ok(okf_query::graph_features_from_concepts(
             &cache.get_or_load(bundle)?,
         )),
+        "plan-change" => {
+            let id = arg_str(arguments, "id")?;
+            okf_query::plan_change_from_concepts(&cache.get_or_load(bundle)?, &id, plan_change)
+                .map(|plan| plan.to_json())
+        }
         other => Err(anyhow!(
-            "unknown relation `{other}` for the graph tool — expected one of: callers, callees, path, explain, api, cycles, modules, isolated, stats, layers, domains, communities, patterns, features"
+            "unknown relation `{other}` for the graph tool — expected one of: callers, callees, path, explain, api, cycles, modules, isolated, stats, layers, domains, communities, patterns, features, plan-change"
         )),
     }
 }
@@ -401,6 +434,53 @@ mod tests {
     }
 
     #[test]
+    fn graph_plan_change_returns_the_versioned_json_plan() {
+        let dir = sample_bundle();
+        let text = call(
+            "graph",
+            &json!({ "relation": "plan-change", "id": "functions/auth/decode_jwt" }),
+            dir.path(),
+            &cache(),
+        )
+        .unwrap();
+        assert!(text.starts_with("{\n  \"schema\": \"okf-plan-change/1\""));
+        assert!(text.contains("\"direct_callers\": [\n    \"functions/auth/verify_token\"\n  ]"));
+    }
+
+    #[test]
+    fn graph_plan_change_uses_the_options_passed_to_call_with() {
+        let dir = sample_bundle();
+        let options = okf_query::PlanChangeOptions {
+            large_blast_radius: 1,
+            ..okf_query::PlanChangeOptions::default()
+        };
+        let text = call_with(
+            "graph",
+            &json!({ "relation": "plan-change", "id": "functions/auth/decode_jwt" }),
+            dir.path(),
+            &cache(),
+            &options,
+        )
+        .unwrap();
+        assert!(text.contains("(threshold 1)"));
+    }
+
+    #[test]
+    fn graph_plan_change_rejects_an_inexact_id() {
+        let dir = sample_bundle();
+        let err = call(
+            "graph",
+            &json!({ "relation": "plan-change", "id": "decode_jwt" }),
+            dir.path(),
+            &cache(),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("no concept with id `decode_jwt`"));
+        assert!(message.contains("functions/auth/decode_jwt"));
+    }
+
+    #[test]
     fn unknown_concept_id_is_a_clear_error() {
         let dir = sample_bundle();
         let err = call(
@@ -476,11 +556,20 @@ mod tests {
         let err = call(
             "graph",
             &json!({ "relation": "path", "from": "a" }),
+            Path::new("/nonexistent/knowledge-bundle"),
+            &cache(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("missing required argument `to`"));
+
+        let err = call(
+            "graph",
+            &json!({ "relation": "plan-change" }),
             Path::new("/nonexistent"),
             &cache(),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("missing required argument"));
+        assert!(err.to_string().contains("missing required argument `id`"));
     }
 
     #[test]

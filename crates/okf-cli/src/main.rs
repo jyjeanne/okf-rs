@@ -413,6 +413,16 @@ enum DocsFormat {
     Obsidian,
 }
 
+/// `okf-rs graph plan-change --format`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PlanChangeFormat {
+    /// Versioned JSON (`okf-plan-change/1`), the same document the MCP
+    /// `graph` tool returns for `relation: "plan-change"`.
+    Json,
+    /// Human-readable summary of the same data; not a stable format.
+    Text,
+}
+
 #[derive(Subcommand)]
 enum GraphQuery {
     /// List concepts that directly call the given concept id.
@@ -553,6 +563,23 @@ enum GraphQuery {
         /// Project directory to look up `okf.toml` in (not the bundle itself).
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
+    },
+    /// Build a change plan for one concept before editing it: direct and
+    /// indirect callers, blast radius, public API in scope, call-cycle
+    /// membership, modules, tests that reach it (heuristic), risk signals,
+    /// and what to inspect first. Needs an exact concept id (find one with
+    /// `okf-rs search`); free text is never resolved to a best guess.
+    /// Risk thresholds come from `okf.toml`'s `[plan_change]` table.
+    PlanChange {
+        id: String,
+        /// Defaults to the value in `okf.toml`, or `knowledge`.
+        bundle: Option<PathBuf>,
+        /// Project directory to look up `okf.toml` in (not the bundle itself).
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "json")]
+        format: PlanChangeFormat,
     },
 }
 
@@ -772,7 +799,11 @@ fn cmd_init(
 
     if !no_agent_files {
         let output_display = output.display().to_string();
-        let agent_files = okf_generator::write_agent_entrypoints(&project.root, &output_display)?;
+        // Read after `write_default`, which keeps every setting but `output`,
+        // so the flag reflects the config as `init` leaves it.
+        let protocol = okf_core::config::load(&project.root).agents.protocol;
+        let agent_files =
+            okf_generator::write_agent_entrypoints(&project.root, &output_display, protocol)?;
         for file in agent_files {
             println!("Wrote {}", file.display());
         }
@@ -1621,6 +1652,35 @@ fn cmd_graph(query: GraphQuery) -> Result<ExitCode> {
             let bundle = resolve_query_bundle(bundle, &project);
             print_query_result(okf_query::graph_features(&bundle))
         }
+        GraphQuery::PlanChange {
+            id,
+            bundle,
+            project,
+            format,
+        } => {
+            let options = plan_change_options(&project);
+            let bundle = resolve_query_bundle(bundle, &project);
+            print_query_result(okf_query::plan_change(&bundle, &id, &options).map(|plan| {
+                match format {
+                    PlanChangeFormat::Json => plan.to_json(),
+                    PlanChangeFormat::Text => plan.to_text(),
+                }
+            }))
+        }
+    }
+}
+
+/// `okf.toml`'s `[plan_change]` table, copied into the `okf-query` options
+/// type (`okf-query` doesn't depend on `okf-core`, so it can't read the
+/// config itself).
+fn plan_change_options(project: &std::path::Path) -> okf_query::PlanChangeOptions {
+    let project_root = project
+        .canonicalize()
+        .unwrap_or_else(|_| project.to_path_buf());
+    let config = okf_core::config::load(&project_root).plan_change;
+    okf_query::PlanChangeOptions {
+        large_blast_radius: config.large_blast_radius,
+        boundary_terms: config.boundary_terms,
     }
 }
 
