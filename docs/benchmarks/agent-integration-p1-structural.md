@@ -2,7 +2,7 @@
 
 P1 gate after the 2026-11-17 re-scope (spec §9, decision D-9): whether the `okf` graph gives a coding agent complete, correct answers to **structural** questions — who calls X, what reaches X, the call path between two functions, recursion — that grep can only reconstruct slowly, and at what cost. The earlier "how does X work" runs, which motivated the re-scope, are in [`agent-integration-p1.md`](agent-integration-p1.md) and [`agent-integration-p1-jj.md`](agent-integration-p1-jj.md).
 
-**Status:** pre-registered in `881b196`, run once on 2026-11-17. **Verdict: fail, narrowly**, under the pre-registered rule: accuracy 1.0 for both variants, treatment tokens 0.77× baseline (bar ≤ 0.67×). Cost was 0.64× and source read 0.34×, but neither is the pre-registered criterion. See [Results](#results).
+**Status:** pre-registered in `881b196`, run once on 2026-11-17: **fail, narrowly** (accuracy 1.0 for both, tokens 0.77×; bar ≤ 0.67×) — see [Results](#results). After receiver-type resolution (`b1b3d3a`), re-run three times under a rule pre-registered in `c021f98`: **pass** — accuracy 1.0 for both variants, token ratio 0.525 (per run 0.513–0.541), cost 0.37×. See [Re-run results](#re-run-results-3-runs-pre-registered-rule) and its limits.
 
 ## Target
 
@@ -115,3 +115,49 @@ Committed before any of these runs.
 5. **No exclusions.** A session that exits non-zero or produces no result is re-run once and the re-run noted; if it fails again, that task-run scores 0 and its recorded tokens count.
 6. **Reported alongside, not gated:** per-run token ratios and their spread, cost ratio, characters read, adherence.
 7. The first run above (`881b196`, before the fix) is not part of the average: it used a different build.
+
+## Re-run results (3 runs, pre-registered rule)
+
+Run 2026-11-17 after `c021f98` (rule) on build `c021f98` (crates identical to `b1b3d3a`). All 30 sessions exited cleanly; no re-runs were needed, nothing was excluded.
+
+### Accuracy
+
+All 30 answers were read and graded against the ground truth above: **every task-run scores 1.0 in both variants.** Every S1, S2, and S3 answer lists exactly the required items (plus the optional tests), with no extra claims; every S4 chain is `cmd_resolve` → `MergeEditor::edit_files` → (closure via `resolve_files_one_by_one`) → target; every S5 answer names the `visit_directory` ↔ `process_dir_entry` cycle and `TreeState::snapshot`. Not scored but noted: some summaries miscount their own tables (S2 baselines say "24" or "21" over a 23-row table), and the treatment's S2 answers swap the line numbers of `MergedTree::conflicts_matching` and `MergedTree::entries_matching`.
+
+### Tokens and cost, per task (sum of 3 runs)
+
+| Task | Baseline tokens | Treatment tokens | Ratio |
+|---|---|---|---|
+| S1 direct callers (control) | 167,592 | 138,043 | 0.82 |
+| S2 method callers | 569,732 | 165,995 | **0.29** |
+| S3 transitive reach | 911,074 | 282,647 | **0.31** |
+| S4 call path | 160,012 | 238,226 | 1.49 |
+| S5 recursion | 208,706 | 234,351 | 1.12 |
+| **Total** | **2,017,116** | **1,059,262** | **0.525** |
+
+| Run | Baseline tokens | Treatment tokens | Ratio | Baseline cost | Treatment cost |
+|---|---|---|---|---|---|
+| 1 | 723,618 | 377,002 | 0.521 | $1.26 | $0.61 |
+| 2 | 667,507 | 361,033 | 0.541 | $1.11 | $0.34 |
+| 3 | 625,991 | 321,227 | 0.513 | $1.11 | $0.35 |
+| **All** | **2,017,116** | **1,059,262** | **0.525** | **$3.49** | **$1.31** (0.37) |
+
+- Source characters read (Read + Grep): 543,621 baseline vs 41,655 treatment, plus 71,856 from MCP responses (0.21 in total). Files opened: 34 vs 6. Turns: 138 vs 111.
+- Adherence: the treatment queried the graph before reading any source on 15/15 task-runs; it loaded the `okf-explore` skill first on 8/15 (the others went straight to the `okf` tools).
+
+### Verdict against the pre-registered rule
+
+- Treatment accuracy ≥ 0.9: **yes** (1.000).
+- Accuracy ≥ baseline + 0.15: no (1.000 vs 1.000).
+- Token ratio ≤ 0.67 at accuracy ≥ baseline − 0.05: **yes** (0.525; per run 0.513–0.541).
+- **P1 gate: pass.**
+
+### What changed since the failed run
+
+The difference is concentrated in the two tasks the graph got wrong before the fix. S2 went from treatment tokens 182,115 (one run, graph had no callers, agent grepped) to 55,332 per run on average; S3 from 141,743 to 94,216. With the callers resolved, the treatment answers S2 from one `graph callers` call. S4 and S5 stay costlier with the graph than without (1.49 and 1.12): for a short path or a two-function cycle, grep plus one read is cheaper than the extra graph round trips.
+
+### Limits of this result
+
+- **Not a held-out test.** The receiver-type fix was built after the first run showed which two tasks the graph got wrong, and S2 and S3 are exactly those tasks. The fix is general — 27 random added and 27 random removed edges on Jujutsu all checked out by hand, and it changes resolution on okf-rs too — but these five questions can't show that on their own. A fresh pre-registered structural task set, on this or another repository, would.
+- One model (`claude-opus-5-5`), one repository, five tasks, three runs.
+- Accuracy ties at 1.0: the graph's value here is cost, not correctness. A strong agent with grep answered every structural question right.
