@@ -18,8 +18,13 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
-/// The okf-rs version stamped into a saved cache -- see the module docs.
-const CACHE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The okf-rs version stamped into a saved cache -- see the module docs --
+/// plus an extraction-format marker. Bump the marker whenever per-file
+/// extraction output changes (new fields, new tags, new facts): a cache
+/// written by an earlier build of the *same* okf-rs version would otherwise
+/// be reused, silently keeping the old extraction for every unchanged file.
+/// `extraction-2`: test tags and receiver-type facts.
+const CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+extraction-2");
 
 /// A saved (or in-progress) cache, keyed by each file's project-relative
 /// path. Serializes with keys in sorted order (`BTreeMap`), so the cache
@@ -129,6 +134,7 @@ mod tests {
             FileExtraction {
                 concepts: Vec::new(),
                 calls: Vec::new(),
+                types: Default::default(),
             },
         );
         cache.save(&path).unwrap();

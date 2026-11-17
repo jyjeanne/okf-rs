@@ -346,6 +346,9 @@ impl Relationship {
             ("tree-sitter", Confidence::Exact) => {
                 "Resolved via Tree-sitter's unambiguous, project-wide name match — exactly one candidate in the project shared this name, so no further resolution was needed.".to_string()
             }
+            ("tree-sitter-receiver", _) => {
+                "Resolved via the call's receiver type, traced from the syntax by Tree-sitter — more than one function or method shares this name, and exactly one of them belongs to the type the receiver (or `Type::` qualifier) was traced to.".to_string()
+            }
             (server, Confidence::Semantic) => {
                 format!(
                     "Resolved by asking {server} which definition this call site actually resolves to, since more than one candidate shared this name and Tree-sitter's own name-matching alone couldn't disambiguate it."

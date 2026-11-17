@@ -20,6 +20,7 @@ mod kotlin;
 mod php;
 mod python;
 mod rust;
+mod rust_types;
 mod swift;
 mod typescript;
 
@@ -52,6 +53,96 @@ pub struct CallCandidate {
     /// `okf_lsp`); Tree-sitter's own unambiguous-name resolution in
     /// `okf-analyzer` doesn't need it.
     pub call_site: CallSite,
+    /// What the extractor could tell about the call's receiver — the `x` in
+    /// `x.method()`, or the `Type` in `Type::method()` — for `okf-analyzer`
+    /// to resolve to a type project-wide and pick the method that type
+    /// actually has. `None` for a plain `function()` call, for a receiver
+    /// the extractor can't describe, and for every language but Rust so
+    /// far.
+    #[serde(default)]
+    pub receiver: Option<TypeHint>,
+}
+
+/// A description of an expression's type, as far as one file's syntax
+/// can tell. Resolving it to a type name needs facts from the whole
+/// project (a field's declared type, a method's return type), which is
+/// why it's recorded here and resolved in `okf-analyzer` (see
+/// [`TypeFacts`]). Type names are bare (last path segment, generics and
+/// references removed; `Arc`/`Box`/`Option`/`Result`-style wrappers
+/// unwrapped).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeHint {
+    /// A known type, e.g. from a parameter's or `let`'s annotation, `self`,
+    /// a struct literal, or a `Type::` qualifier.
+    Named(String),
+    /// The type of field `field` on whatever type `base` resolves to.
+    Field { base: Box<TypeHint>, field: String },
+    /// The return type of method `method` called on whatever `base`
+    /// resolves to.
+    MethodReturn { base: Box<TypeHint>, method: String },
+    /// The return type of `Type::function(...)` (`owner` set) or of a free
+    /// function `function(...)`.
+    FnReturn {
+        owner: Option<String>,
+        function: String,
+    },
+}
+
+/// Per-file type facts the analyzer combines project-wide to resolve
+/// [`TypeHint`]s. Only the Rust extractor fills these in so far.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeFacts {
+    /// Named struct fields and their (normalized) types.
+    #[serde(default)]
+    pub fields: Vec<FieldFact>,
+    /// Methods and associated functions, including trait method
+    /// signatures that have no body (and so no concept).
+    #[serde(default)]
+    pub methods: Vec<MethodFact>,
+    /// Free functions' return types.
+    #[serde(default)]
+    pub functions: Vec<FunctionFact>,
+    /// `type Name = Target;` aliases.
+    #[serde(default)]
+    pub aliases: Vec<AliasFact>,
+}
+
+/// `type name = target;`, with `target` normalized (`None` when it isn't a
+/// nameable type, e.g. a tuple).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AliasFact {
+    pub name: String,
+    pub target: Option<String>,
+}
+
+/// `owner.field: ty`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldFact {
+    pub owner: String,
+    pub field: String,
+    pub ty: String,
+}
+
+/// A method or associated function declared on `owner` (an `impl` block's
+/// type or a trait's name), optionally implementing `trait_name`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MethodFact {
+    /// The method's concept id; `None` for a trait method signature with
+    /// no body, which contributes only its return type.
+    pub concept_id: Option<String>,
+    pub owner: String,
+    pub trait_name: Option<String>,
+    pub name: String,
+    /// Normalized return type (`Self` already replaced by `owner`).
+    pub returns: Option<String>,
+}
+
+/// A free function's normalized return type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionFact {
+    pub name: String,
+    pub returns: Option<String>,
 }
 
 /// Everything extracted from a single source file.
@@ -65,6 +156,9 @@ pub struct FileExtraction {
     /// functions/methods, in source order.
     pub concepts: Vec<Concept>,
     pub calls: Vec<CallCandidate>,
+    /// Type facts for receiver-type resolution (Rust only so far).
+    #[serde(default)]
+    pub types: TypeFacts,
 }
 
 /// Parses `file` and extracts its concepts and call candidates, reading its

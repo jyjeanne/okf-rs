@@ -414,6 +414,7 @@ mod tests {
             CallCandidate {
                 caller_id: caller_id.to_string(),
                 callee_name: "get".to_string(),
+                receiver: None,
                 call_site: okf_tree_sitter::CallSite {
                     line: 0,
                     character: 0,

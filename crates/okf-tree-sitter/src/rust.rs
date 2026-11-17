@@ -2,7 +2,11 @@ use crate::common::{
     import_relationship, location, lsp_position, make_concept, module_concept, module_path,
     node_text, signature_before_body, slugify, smallest_containing,
 };
-use crate::{CallCandidate, CallSite, FileExtraction};
+use crate::rust_types::{normalize_type, resolve_type_text, self_type, HintContext};
+use crate::{
+    AliasFact, CallCandidate, CallSite, FieldFact, FileExtraction, FunctionFact, MethodFact,
+    TypeFacts, TypeHint,
+};
 use anyhow::{Context, Result};
 use okf_parser::{Concept, ConceptKind, Language};
 use std::ops::Range;
@@ -17,6 +21,9 @@ const QUERY_SRC: &str = r#"
 (call_expression function: (identifier) @call.name) @call.def
 (call_expression function: (field_expression field: (field_identifier) @call.name)) @call.def
 (call_expression function: (scoped_identifier name: (identifier) @call.name)) @call.def
+(function_signature_item name: (identifier) @sig.name) @sig.def
+(field_declaration name: (field_identifier) @field.name type: (_) @field.type) @field.def
+(type_item name: (type_identifier) @alias.name type: (_) @alias.type) @alias.def
 "#;
 
 /// The container a method belongs to: the `Self` type, plus the trait
@@ -163,7 +170,9 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
 
     let mut concepts: Vec<Concept> = Vec::new();
     let mut function_spans: Vec<(String, Range<usize>)> = Vec::new();
-    let mut raw_calls: Vec<(Range<usize>, String, CallSite)> = Vec::new();
+    let mut raw_calls: Vec<(Range<usize>, String, CallSite, Option<TypeHint>)> = Vec::new();
+    let mut types = TypeFacts::default();
+    let mut hints = HintContext::new(source);
 
     while let Some(m) = matches.next() {
         let mut import_node = None;
@@ -180,6 +189,14 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         let mut fn_name = None;
         let mut fn_vis = None;
         let mut call_name = None;
+        let mut sig_def = None;
+        let mut sig_name = None;
+        let mut field_def = None;
+        let mut field_name = None;
+        let mut field_type = None;
+        let mut alias_def = None;
+        let mut alias_name = None;
+        let mut alias_type = None;
 
         for cap in m.captures {
             let cap_name = query.capture_names()[cap.index as usize];
@@ -198,6 +215,14 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 "fn.name" => fn_name = Some(cap.node),
                 "fn.vis" => fn_vis = Some(cap.node),
                 "call.name" => call_name = Some(cap.node),
+                "sig.def" => sig_def = Some(cap.node),
+                "sig.name" => sig_name = Some(cap.node),
+                "field.def" => field_def = Some(cap.node),
+                "field.name" => field_name = Some(cap.node),
+                "field.type" => field_type = Some(cap.node),
+                "alias.def" => alias_def = Some(cap.node),
+                "alias.name" => alias_name = Some(cap.node),
+                "alias.type" => alias_type = Some(cap.node),
                 _ => {}
             }
         }
@@ -253,7 +278,8 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
 
         if let (Some(def), Some(name)) = (fn_def, fn_name) {
             let fn_name_text = node_text(source, name);
-            let (kind, qualified) = match container_name(source, def) {
+            let container = container_name(source, def);
+            let (kind, qualified) = match &container {
                 Some(Container {
                     type_name,
                     trait_name: Some(trait_name),
@@ -291,8 +317,73 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
             if is_test_code(source, def) {
                 concept.tags.push(TEST_TAG.to_string());
             }
+            let returns = def
+                .child_by_field_name("return_type")
+                .and_then(|r| resolve_type_text(source, def, node_text(source, r)));
+            match &container {
+                Some(c) => {
+                    if let Some(owner) = normalize_type(c.type_name) {
+                        types.methods.push(MethodFact {
+                            concept_id: Some(concept.id.clone()),
+                            owner,
+                            trait_name: c.trait_name.and_then(normalize_type),
+                            name: fn_name_text.to_string(),
+                            returns,
+                        });
+                    }
+                }
+                None => types.functions.push(FunctionFact {
+                    name: fn_name_text.to_string(),
+                    returns,
+                }),
+            }
             function_spans.push((concept.id.clone(), def.byte_range()));
             concepts.push(concept);
+        }
+
+        // A trait method declared without a body: no concept, but its
+        // return type is what a call on a `dyn Trait`/`impl Trait`
+        // receiver evaluates to.
+        if let (Some(def), Some(name)) = (sig_def, sig_name) {
+            if let Some(owner) = self_type(source, def) {
+                types.methods.push(MethodFact {
+                    concept_id: None,
+                    owner,
+                    trait_name: None,
+                    name: node_text(source, name).to_string(),
+                    returns: def
+                        .child_by_field_name("return_type")
+                        .and_then(|r| resolve_type_text(source, def, node_text(source, r))),
+                });
+            }
+        }
+
+        if let (Some(def), Some(name), Some(ty)) = (field_def, field_name, field_type) {
+            let owner = def
+                .parent()
+                .and_then(|list| list.parent())
+                .filter(|s| s.kind() == "struct_item")
+                .and_then(|s| s.child_by_field_name("name"));
+            if let (Some(owner), Some(ty)) =
+                (owner, resolve_type_text(source, def, node_text(source, ty)))
+            {
+                types.fields.push(FieldFact {
+                    owner: node_text(source, owner).to_string(),
+                    field: node_text(source, name).to_string(),
+                    ty,
+                });
+            }
+        }
+
+        // An associated type (`type Item = ...;` inside an impl or trait)
+        // is not a project-wide alias.
+        if let (Some(def), Some(name), Some(ty)) = (alias_def, alias_name, alias_type) {
+            if def.parent().is_none_or(|p| p.kind() != "declaration_list") {
+                types.aliases.push(AliasFact {
+                    name: node_text(source, name).to_string(),
+                    target: resolve_type_text(source, def, node_text(source, ty)),
+                });
+            }
         }
 
         if let Some(node) = call_name {
@@ -300,17 +391,19 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 node.byte_range(),
                 node_text(source, node).to_string(),
                 lsp_position(source, node),
+                hints.receiver_hint(node),
             ));
         }
     }
 
     let mut calls = Vec::new();
-    for (range, callee_name, call_site) in raw_calls {
+    for (range, callee_name, call_site, receiver) in raw_calls {
         if let Some(caller_id) = smallest_containing(&function_spans, range.start) {
             calls.push(CallCandidate {
                 caller_id: caller_id.to_string(),
                 callee_name,
                 call_site,
+                receiver,
             });
         }
     }
@@ -320,6 +413,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
     Ok(FileExtraction {
         concepts: all,
         calls,
+        types,
     })
 }
 
@@ -555,5 +649,155 @@ mod real {
         ] {
             assert!(!is_test_attribute(no), "{no}");
         }
+    }
+
+    /// The receiver hint recorded for the call to `callee` inside the
+    /// function or method named `caller`.
+    fn hint_for(extraction: &FileExtraction, caller: &str, callee: &str) -> Option<TypeHint> {
+        extraction
+            .calls
+            .iter()
+            .find(|c| c.caller_id.ends_with(&format!("/{caller}")) && c.callee_name == callee)
+            .unwrap_or_else(|| panic!("no call {caller} -> {callee}"))
+            .receiver
+            .clone()
+    }
+
+    fn named(name: &str) -> TypeHint {
+        TypeHint::Named(name.to_string())
+    }
+
+    #[test]
+    fn receiver_hints_follow_parameters_lets_fields_and_chains() {
+        let src = r#"
+struct Holder { store: Arc<Store> }
+impl Holder {
+    fn store(&self) -> &Arc<Store> { &self.store }
+    fn via_field(&self) { self.store.concurrency(); }
+    fn via_method(&self) { self.store().concurrency(); }
+    fn via_self_path() -> Self { Self::new() }
+}
+fn param(store: &Arc<Store>) { store.concurrency(); }
+fn typed_let() { let s: Store = make(); s.concurrency(); }
+fn ctor() -> Result<()> { let mut f = GitFetch::new(1)?; f.fetch(); Ok(()) }
+fn chained(repo: &dyn Repo) { repo.store().concurrency(); }
+fn literal() { Store { x: 1 }.concurrency(); }
+fn shadowed(x: Old) { let x = New::default(); x.go(); }
+fn closure_param() { let f = |store| store.concurrency(); }
+fn generic<R: Repo>(repo: &R) { repo.store(); }
+fn unbounded<T>(t: T) { t.store(); }
+fn module_path() { git::push_updates(); }
+fn assoc(item: Self::Item) { item.go(); }
+"#;
+        let x = extract(src, "src/lib.rs").unwrap();
+        assert_eq!(
+            hint_for(&x, "via_field", "concurrency"),
+            Some(TypeHint::Field {
+                base: Box::new(named("Holder")),
+                field: "store".into()
+            })
+        );
+        assert_eq!(
+            hint_for(&x, "via_method", "concurrency"),
+            Some(TypeHint::MethodReturn {
+                base: Box::new(named("Holder")),
+                method: "store".into()
+            })
+        );
+        assert_eq!(hint_for(&x, "via_self_path", "new"), Some(named("Holder")));
+        assert_eq!(hint_for(&x, "param", "concurrency"), Some(named("Store")));
+        assert_eq!(
+            hint_for(&x, "typed_let", "concurrency"),
+            Some(named("Store"))
+        );
+        assert_eq!(
+            hint_for(&x, "ctor", "fetch"),
+            Some(TypeHint::FnReturn {
+                owner: Some("GitFetch".into()),
+                function: "new".into()
+            })
+        );
+        assert_eq!(
+            hint_for(&x, "chained", "concurrency"),
+            Some(TypeHint::MethodReturn {
+                base: Box::new(named("Repo")),
+                method: "store".into()
+            })
+        );
+        assert_eq!(hint_for(&x, "literal", "concurrency"), Some(named("Store")));
+        // The nearest preceding `let` wins over the parameter it shadows.
+        assert_eq!(
+            hint_for(&x, "shadowed", "go"),
+            Some(TypeHint::FnReturn {
+                owner: Some("New".into()),
+                function: "default".into()
+            })
+        );
+        // Unknowable receivers get no hint rather than a guess.
+        assert_eq!(hint_for(&x, "closure_param", "concurrency"), None);
+        assert_eq!(hint_for(&x, "generic", "store"), Some(named("Repo")));
+        assert_eq!(hint_for(&x, "unbounded", "store"), None);
+        assert_eq!(hint_for(&x, "module_path", "push_updates"), None);
+        assert_eq!(hint_for(&x, "assoc", "go"), None);
+        // A plain function call has no receiver at all.
+        assert_eq!(hint_for(&x, "typed_let", "make"), None);
+    }
+
+    #[test]
+    fn records_fields_methods_trait_signatures_and_aliases_as_type_facts() {
+        let src = r#"
+type Shared = Arc<Store>;
+struct Tree { store: Arc<Store>, name: String }
+trait Repo {
+    type Item;
+    fn store(&self) -> &Arc<Store>;
+    fn base(&self) -> Self { todo!() }
+}
+impl Tree {
+    fn new() -> Result<Self, Error> { todo!() }
+}
+impl Repo for Tree {
+    type Item = u8;
+    fn store(&self) -> &Arc<Store> { &self.store }
+}
+fn make() -> Option<Box<Store>> { None }
+"#;
+        let x = extract(src, "src/lib.rs").unwrap();
+        let t = &x.types;
+        assert!(t.fields.contains(&FieldFact {
+            owner: "Tree".into(),
+            field: "store".into(),
+            ty: "Store".into()
+        }));
+        let method = |owner: &str, name: &str| {
+            t.methods
+                .iter()
+                .find(|m| m.owner == owner && m.name == name)
+                .unwrap_or_else(|| panic!("no fact for {owner}::{name}"))
+        };
+        assert_eq!(method("Tree", "new").returns.as_deref(), Some("Tree"));
+        assert_eq!(method("Tree", "store").trait_name.as_deref(), Some("Repo"));
+        assert!(method("Tree", "store").concept_id.is_some());
+        // A bodiless trait signature: return type only, no concept.
+        let signature = method("Repo", "store");
+        assert_eq!(signature.returns.as_deref(), Some("Store"));
+        assert!(signature.concept_id.is_none());
+        // `Self` in a trait default method is the trait.
+        assert_eq!(method("Repo", "base").returns.as_deref(), Some("Repo"));
+        assert_eq!(
+            t.functions,
+            vec![FunctionFact {
+                name: "make".into(),
+                returns: Some("Store".into())
+            }]
+        );
+        // Associated types are not project-wide aliases.
+        assert_eq!(
+            t.aliases,
+            vec![AliasFact {
+                name: "Shared".into(),
+                target: Some("Store".into())
+            }]
+        );
     }
 }
