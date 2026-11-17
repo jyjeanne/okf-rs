@@ -1342,6 +1342,69 @@ fn standalone_binary_check_fresh_reports_stale_after_a_source_change() {
     assert_eq!(bundle_before, bundle_after);
 }
 
+/// Renaming a function and regenerating must not leave the old concept
+/// file behind: a leftover would still be linked from nowhere (`validate`
+/// would flag it), still show up in `search`, and keep `--check-fresh`
+/// reporting the bundle stale forever, since a fresh generation never has
+/// it.
+#[test]
+fn standalone_binary_generate_removes_the_files_of_a_renamed_function() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn old_name() {}\npub fn caller() { old_name(); }\n",
+    )
+    .unwrap();
+    assert_success(&run(&project, &["generate", "."]), &["generate"]);
+    let functions = project.join("knowledge/functions");
+    let old_file = fs::read_dir(&functions)
+        .unwrap()
+        .flatten()
+        .flat_map(|module| fs::read_dir(module.path()).into_iter().flatten().flatten())
+        .map(|e| e.path())
+        .find(|p| p.file_name().is_some_and(|n| n == "old_name.md"))
+        .expect("first generate should write old_name.md");
+    let notes = project.join("knowledge/NOTES.md");
+    fs::write(&notes, "Hand-written, not okf-rs's.\n").unwrap();
+
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn new_name() {}\npub fn caller() { new_name(); }\n",
+    )
+    .unwrap();
+    let regenerate = run(&project, &["generate", "."]);
+    assert_success(&regenerate, &["generate"]);
+
+    assert!(!old_file.exists(), "{} was left behind", old_file.display());
+    assert!(old_file.with_file_name("new_name.md").exists());
+    assert!(notes.exists(), "a file okf-rs didn't write was removed");
+    // `validate` would (rightly) flag the plain note itself.
+    fs::remove_file(&notes).unwrap();
+    assert!(
+        stdout_of(&regenerate).contains("Removed 1 stale file"),
+        "unexpected output: {}",
+        stdout_of(&regenerate)
+    );
+
+    let validate = run(&project, &["validate", "knowledge"]);
+    assert_success(&validate, &["validate"]);
+    assert!(
+        stdout_of(&validate).contains("no issues found"),
+        "unexpected output: {}",
+        stdout_of(&validate)
+    );
+    let check = run(&project, &["generate", ".", "--check-fresh"]);
+    assert_success(&check, &["generate --check-fresh"]);
+    assert!(stdout_of(&check).contains("Up to date"));
+}
+
 /// `--check-fresh` needs an existing bundle to compare against -- on a
 /// project that's never been generated, it should fail with a clear
 /// message pointing at `generate`, not report every file as "stale".

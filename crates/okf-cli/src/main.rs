@@ -1026,7 +1026,8 @@ fn cmd_generate(
     };
 
     let source_revision = okf_core::git::head_revision(&project.root);
-    okf_generator::write_bundle(&result.concepts, &output, source_revision.as_deref())?;
+    let written =
+        okf_generator::write_bundle(&result.concepts, &output, source_revision.as_deref())?;
     if !no_cache {
         cache.save(&cache_path)?;
     }
@@ -1042,6 +1043,12 @@ fn cmd_generate(
         stats.reparsed,
         stats.reused
     );
+    if written.removed > 0 {
+        println!(
+            "Removed {} stale file(s) left by concepts that no longer exist",
+            written.removed
+        );
+    }
     if let Some(enrich_stats) = enrich_stats {
         println!(
             "Enriched {} concepts ({} generated, {} reused from the previous bundle)",

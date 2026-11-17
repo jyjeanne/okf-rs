@@ -143,6 +143,24 @@ impl ConceptKind {
         }
     }
 
+    /// Every kind, in declaration order — for code that needs the full set
+    /// of [`ConceptKind::bundle_dir`]s (e.g. `okf-generator`'s stale-file
+    /// pruning, which only ever looks inside directories okf-rs writes).
+    pub const ALL: [ConceptKind; 12] = [
+        ConceptKind::Package,
+        ConceptKind::Module,
+        ConceptKind::Class,
+        ConceptKind::Trait,
+        ConceptKind::Interface,
+        ConceptKind::Struct,
+        ConceptKind::Enum,
+        ConceptKind::Function,
+        ConceptKind::Method,
+        ConceptKind::Variable,
+        ConceptKind::Constant,
+        ConceptKind::Document,
+    ];
+
     /// The directory a concept of this kind is grouped under in a bundle.
     pub fn bundle_dir(&self) -> &'static str {
         match self {

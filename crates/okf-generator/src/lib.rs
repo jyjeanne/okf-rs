@@ -10,9 +10,9 @@
 
 mod agents;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use okf_parser::{Concept, RelationKind};
+use okf_parser::{Concept, ConceptKind, RelationKind};
 use okf_render::{capitalize, contains_members, group_by_kind_dir, relative_link};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -35,6 +35,11 @@ const GENERATOR_NAME: &str = "okf-rs";
 /// (spec §7's `<producer>/<version>` convention), since the producer of a
 /// generated bundle is always `okf-rs` itself.
 const PRODUCER: &str = concat!("okf-rs/", env!("CARGO_PKG_VERSION"));
+
+/// [`PRODUCER`] without the version: what marks a concept file as written
+/// by okf-rs (any version) when pruning stale output — see
+/// [`prune_stale_files`].
+const PRODUCER_PREFIX: &str = "okf-rs/";
 
 #[derive(Serialize)]
 struct Frontmatter {
@@ -187,11 +192,17 @@ fn unique_by_kind_and_target<'a>(
 /// real provenance (`okf-rs generate --check-determinism`/`--check-fresh`'s
 /// own scratch writes — see `okf-cli`'s `cmd_check_determinism`/
 /// `cmd_check_fresh`).
+///
+/// Regenerating into an existing bundle also removes what the previous
+/// run wrote for concepts that no longer exist (a renamed or deleted
+/// function, say) — see [`prune_stale_files`] for exactly which files
+/// count as okf-rs's own. The returned [`WriteSummary`] says how many
+/// were removed.
 pub fn write_bundle(
     concepts: &[Concept],
     output_dir: &Path,
     source_revision: Option<&str>,
-) -> Result<()> {
+) -> Result<WriteSummary> {
     let mut concepts = concepts.to_vec();
     Concept::disambiguate_ids(&mut concepts);
     let concepts = concepts.as_slice();
@@ -212,22 +223,164 @@ pub fn write_bundle(
 
     fs::create_dir_all(output_dir)?;
 
+    // Relative paths of everything this run writes, lowercased: the
+    // filesystem may not distinguish case (see the collision check above),
+    // and on one that doesn't, rewriting `run.md` over an existing `Run.md`
+    // keeps the old spelling — comparing case-sensitively would then
+    // delete the file just written.
+    let mut written: HashSet<String> = HashSet::new();
+
     for concept in concepts {
-        let file_path = output_dir.join(format!("{}.md", concept.id));
+        let relative = format!("{}.md", concept.id);
+        let file_path = output_dir.join(&relative);
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent)?;
         }
         let content = render_concept(concept, concepts, &bundle_ids)?;
         fs::write(file_path, content)?;
+        written.insert(relative.to_lowercase());
     }
 
     for (dir, entries) in &by_dir {
         write_dir_index(output_dir, dir, entries)?;
+        written.insert(format!("{dir}/index.md").to_lowercase());
     }
 
     write_root_index(output_dir, &by_dir, source_revision)?;
 
+    let removed = prune_stale_files(output_dir, &written)?;
+    Ok(WriteSummary { removed })
+}
+
+/// What [`write_bundle`] did beyond writing the bundle itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteSummary {
+    /// Stale files removed: okf-rs's own output from an earlier run for
+    /// concepts (or whole kind directories) that no longer exist.
+    pub removed: usize,
+}
+
+/// Removes files an earlier run of okf-rs wrote that this run didn't,
+/// then any directory left empty. Only two kinds of file ever qualify,
+/// and only inside the per-kind directories okf-rs writes to
+/// (`functions/`, `modules/`, ... — never the bundle root, so the root
+/// `index.md` and anything a user keeps beside the bundle are untouched):
+///
+/// - a concept file whose frontmatter carries `generated.by: okf-rs/<any
+///   version>` — the stamp every generated concept has, and one a
+///   hand-written concept wouldn't (it would name its own author);
+/// - a kind directory's `index.md` whose content is exactly the shape
+///   [`write_dir_index`] produces (a `# <Kind>` heading followed only by
+///   list items), left behind when the last concept of that kind is gone.
+///
+/// Anything else — other files, unstamped markdown, symlinks — is kept,
+/// and a directory still holding any of it isn't removed.
+fn prune_stale_files(output_dir: &Path, written: &HashSet<String>) -> Result<usize> {
+    let mut kind_dirs: Vec<&str> = ConceptKind::ALL.iter().map(|k| k.bundle_dir()).collect();
+    kind_dirs.sort_unstable();
+    kind_dirs.dedup();
+
+    let mut removed = 0;
+    for kind_dir in kind_dirs {
+        let dir = output_dir.join(kind_dir);
+        if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        removed += prune_dir(&dir, kind_dir, kind_dir, written)?;
+        remove_if_empty(&dir)?;
+    }
+    Ok(removed)
+}
+
+/// Recursive step of [`prune_stale_files`]: `dir` is `relative` under the
+/// bundle root, inside the kind directory `kind_dir`.
+fn prune_dir(
+    dir: &Path,
+    relative: &str,
+    kind_dir: &str,
+    written: &HashSet<String>,
+) -> Result<usize> {
+    let mut entries = fs::read_dir(dir)
+        .with_context(|| format!("failed to list {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut removed = 0;
+    for entry in entries {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let path = entry.path();
+        let child = format!("{relative}/{name}");
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            removed += prune_dir(&path, &child, kind_dir, written)?;
+            remove_if_empty(&path)?;
+            continue;
+        }
+        if !file_type.is_file() || !name.ends_with(".md") || written.contains(&child.to_lowercase())
+        {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let stale = if child == format!("{kind_dir}/index.md") {
+            is_generated_dir_index(&content, kind_dir)
+        } else {
+            is_generated_concept(&content)
+        };
+        if stale {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove stale {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn remove_if_empty(dir: &Path) -> Result<()> {
+    if fs::read_dir(dir)?.next().is_none() {
+        fs::remove_dir(dir).with_context(|| format!("failed to remove {}", dir.display()))?;
+    }
     Ok(())
+}
+
+/// Whether `content`'s frontmatter has `generated:` with a `by:` value
+/// starting `okf-rs/` — i.e. okf-rs wrote it, whichever version.
+fn is_generated_concept(content: &str) -> bool {
+    let mut lines = content.lines();
+    if lines.next().map(str::trim_end) != Some("---") {
+        return false;
+    }
+    let mut in_generated = false;
+    for line in lines {
+        let line = line.trim_end();
+        if line == "---" {
+            return false;
+        }
+        if !line.starts_with([' ', '\t']) {
+            in_generated = line == "generated:";
+            continue;
+        }
+        if in_generated {
+            if let Some(value) = line.trim_start().strip_prefix("by:") {
+                let value = value.trim().trim_matches(['"', '\'']);
+                return value.starts_with(PRODUCER_PREFIX);
+            }
+        }
+    }
+    false
+}
+
+/// Whether `content` is exactly what [`write_dir_index`] writes for
+/// `kind_dir`: its heading, then nothing but list items.
+fn is_generated_dir_index(content: &str, kind_dir: &str) -> bool {
+    let mut lines = content.lines().map(str::trim_end);
+    if lines.next() != Some(format!("# {}", capitalize(kind_dir)).as_str()) {
+        return false;
+    }
+    lines.all(|line| line.is_empty() || line.starts_with("- ["))
 }
 
 fn render_concept(
@@ -772,5 +925,112 @@ mod tests {
             module_content.contains("# Member of"),
             "the generic relationship rendering should show the module's own Member of section: {module_content}"
         );
+    }
+
+    #[test]
+    fn regenerating_removes_files_of_concepts_that_no_longer_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = concept(ConceptKind::Module, "auth", "auth", "src/auth.rs");
+        let old = concept(
+            ConceptKind::Function,
+            "old_name",
+            "auth.old_name",
+            "src/auth.rs",
+        );
+        let kept = concept(ConceptKind::Function, "kept", "auth.kept", "src/auth.rs");
+        let gone = concept(ConceptKind::Class, "Gone", "auth.Gone", "src/auth.rs");
+        let first =
+            write_bundle(&[module.clone(), old, kept.clone(), gone], dir.path(), None).unwrap();
+        assert_eq!(first.removed, 0);
+        assert!(dir.path().join("functions/auth/old_name.md").exists());
+        assert!(dir.path().join("classes/auth/Gone.md").exists());
+
+        let renamed = concept(
+            ConceptKind::Function,
+            "new_name",
+            "auth.new_name",
+            "src/auth.rs",
+        );
+        let second = write_bundle(&[module, kept, renamed], dir.path(), None).unwrap();
+
+        assert!(!dir.path().join("functions/auth/old_name.md").exists());
+        assert!(dir.path().join("functions/auth/new_name.md").exists());
+        assert!(dir.path().join("functions/auth/kept.md").exists());
+        // The last class is gone: its file, the kind's index, and the
+        // now-empty directories all go.
+        assert!(!dir.path().join("classes").exists());
+        assert_eq!(second.removed, 3, "old_name.md, Gone.md, classes/index.md");
+        let root = fs::read_to_string(dir.path().join("index.md")).unwrap();
+        assert!(!root.contains("classes"), "{root}");
+    }
+
+    #[test]
+    fn pruning_keeps_files_okf_rs_did_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = concept(ConceptKind::Function, "f", "auth.f", "src/auth.rs");
+        write_bundle(std::slice::from_ref(&f), dir.path(), None).unwrap();
+
+        let hand_written =
+            "---\ntype: Note\ntitle: design\ngenerated:\n  by: alice\n---\n\nKept.\n";
+        let user_files = [
+            ("functions/auth/design.md", hand_written),
+            ("functions/auth/notes.txt", "not markdown"),
+            ("functions/plain.md", "# No frontmatter\n"),
+            (
+                "classes/index.md",
+                "# Classes\n\nSome prose a user wrote.\n",
+            ),
+            (
+                "extra/stale.md",
+                "---\ngenerated:\n  by: okf-rs/0.1.0\n---\n",
+            ),
+            ("README.md", "---\ngenerated:\n  by: okf-rs/0.1.0\n---\n"),
+        ];
+        for (path, content) in user_files {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+
+        let summary = write_bundle(&[f], dir.path(), None).unwrap();
+
+        assert_eq!(summary.removed, 0);
+        for (path, _) in user_files {
+            assert!(dir.path().join(path).exists(), "{path} was removed");
+        }
+    }
+
+    #[test]
+    fn recognizes_the_okf_rs_stamp_in_any_version_and_line_ending() {
+        assert!(is_generated_concept(
+            "---\ntype: Rust Function\ngenerated:\n  by: okf-rs/0.6.0\n---\n"
+        ));
+        assert!(is_generated_concept(
+            "---\r\ntitle: f\r\ngenerated:\r\n  by: \"okf-rs/0.7.0\"\r\n---\r\n"
+        ));
+        assert!(!is_generated_concept("---\ngenerated:\n  by: alice\n---\n"));
+        // `by:` under a different key, or after the frontmatter, isn't the stamp.
+        assert!(!is_generated_concept(
+            "---\nauthor:\n  by: okf-rs/0.7.0\n---\n"
+        ));
+        assert!(!is_generated_concept(
+            "---\ntitle: f\n---\ngenerated:\n  by: okf-rs/0.7.0\n"
+        ));
+        assert!(!is_generated_concept("generated:\n  by: okf-rs/0.7.0\n"));
+    }
+
+    #[test]
+    fn a_case_only_rename_keeps_the_rewritten_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lower = concept(ConceptKind::Function, "run", "auth.run", "src/auth.rs");
+        write_bundle(&[lower], dir.path(), None).unwrap();
+
+        let upper = concept(ConceptKind::Function, "Run", "auth.Run", "src/auth.rs");
+        write_bundle(std::slice::from_ref(&upper), dir.path(), None).unwrap();
+
+        // On a case-insensitive filesystem the file keeps its old spelling;
+        // on a case-sensitive one `run.md` is stale but kept (the
+        // conservative side). Either way the concept's file must exist.
+        assert!(dir.path().join(format!("{}.md", upper.id)).exists());
     }
 }
