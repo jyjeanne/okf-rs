@@ -68,4 +68,16 @@ For each run, record from the session transcript (definitions in spec §9.2):
 - total tokens;
 - whether the answer is correct against the ground-truth commit.
 
-Results go in [`docs/benchmarks/agent-integration-p1.md`](../../docs/benchmarks/agent-integration-p1.md). If the exit criterion fails, record the result and stop: P2 starts only after P1 passes.
+Results go in [`docs/benchmarks/agent-integration-p1.md`](../../docs/benchmarks/agent-integration-p1.md) (first run: 2026-11-17). If the exit criterion fails, record the result and stop: P2 starts only after P1 passes.
+
+### Automated harness
+
+[`bench/`](bench/) runs this procedure with headless Claude Code (`claude -p`):
+
+```sh
+examples/agent-workflow/bench/setup.sh . <commit> <empty work dir>   # copies, binaries, bundle, MCP config
+<work dir>/run-all.sh                                                # the 10 sessions, in parallel
+node <work dir>/analyze.js <work dir>                                # metrics per §9.2; answers saved for grading
+```
+
+`setup.sh` exports `<commit>` with `git archive` (no history for the agent to read), removes this README and the pack's `.claude/` folder from both copies, generates the bundle only in the treatment copy, and installs the skill there. Both variants get the same built-in tools (`Read`, `Grep`, `Glob`, `Skill`) and no user settings; only the treatment gets the `okf` MCP server. Grading answers against the ground-truth commits is manual.
