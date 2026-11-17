@@ -385,18 +385,22 @@ description: >
 mode: subagent
 steps: 20
 permissions:
-  - { action: edit, resource: "**", effect: deny }
+  - { action: edit, resource: "*", effect: deny }
   - { action: shell, resource: "*", effect: deny }
-  - { action: shell, resource: "okf-rs search*", effect: allow }
-  - { action: shell, resource: "okf-rs explore*", effect: allow }
-  - { action: shell, resource: "okf-rs graph*", effect: allow }
-  - { action: shell, resource: "okf-rs coverage*", effect: allow }
-  - { action: shell, resource: "okf-rs validate*", effect: allow }
-  - { action: shell, resource: "okf-rs impact*", effect: allow }
-  - { action: shell, resource: "okf-rs review*", effect: allow }
-  - { action: shell, resource: "git diff*", effect: allow }
-  - { action: shell, resource: "git log*", effect: allow }
-  - { action: webfetch, resource: "**", effect: deny }
+  - { action: shell, resource: "okf-rs search *", effect: allow }
+  - { action: shell, resource: "okf-rs explore *", effect: allow }
+  - { action: shell, resource: "okf-rs graph *", effect: allow }
+  - { action: shell, resource: "okf-rs coverage *", effect: allow }
+  - { action: shell, resource: "okf-rs validate *", effect: allow }
+  - { action: shell, resource: "okf-rs diff *", effect: allow }
+  - { action: shell, resource: "okf-rs impact *", effect: allow }
+  - { action: shell, resource: "okf-rs review *", effect: allow }
+  - { action: shell, resource: "okf-rs generate --check-fresh", effect: allow }
+  - { action: shell, resource: "git diff *", effect: allow }
+  - { action: shell, resource: "git log *", effect: allow }
+  - { action: shell, resource: "git status *", effect: allow }
+  - { action: shell, resource: "git rev-parse *", effect: allow }
+  - { action: webfetch, resource: "*", effect: deny }
 ---
 
 You are the OKF Architect. Your only source of architectural truth is
@@ -411,7 +415,9 @@ Workflow:
 4. Hand off to the developer agent. You do not implement.
 ```
 
-The allowlist omits `okf-rs generate` (writes the bundle and `.okf-cache.json`), `okf-rs init` (writes `AGENTS.md`/`CLAUDE.md`), `okf-rs watch`, `okf-rs docs`, and `okf-rs diff`. `diff` is left out until its temporary-worktree behavior is checked against a read-only requirement; `impact` and `review` cover the same question for PRs. The architect therefore cannot run `generate --check-fresh` itself: the developer runs it before the first edit (OKF-DP-001). Shell pattern syntax is *Unverified* beyond the documented `src/**` example for `read`; confirm in P2.
+The shipped file is `examples/agent-workflow/.opencode/agents/okf-architect.md`; the block above is its frontmatter, and the body below is the v1.1 draft (the shipped body names the skills and the shell limits). The allowlist omits `okf-rs generate` (writes the bundle and `.okf-cache.json`), `okf-rs init` (writes `AGENTS.md`/`CLAUDE.md`), `okf-rs watch`, and `okf-rs docs`. `okf-rs generate --check-fresh` is allowed **only exactly as written**: it analyzes in memory and writes only a scratch directory under the OS temp dir (`cmd_check_fresh`), but `--lsp` would start a language server, which for Rust runs build scripts. `diff`, `impact`, and `review` are allowed (O-6 closed, P2): all three use the same temporary `git worktree` under the OS temp dir (`WorktreeCheckout`, `crates/okf-cli/src/main.rs`), registered in `.git/worktrees/` and removed on exit; they never touch the working tree, the bundle, or `.okf-cache.json`. If the process is killed, `git worktree prune` removes the leftover registration.
+
+Pattern syntax (O-5, from https://opencode.ai/docs/permissions/, 2026-11-17; not run in an OpenCode session): resources are whole-value wildcards, `*` is zero or more characters including `/`, `?` is one character; "a shell pattern ending in ` *` also matches the command without arguments" (`git status *` matches `git status` and `git status --short`); the last matching rule wins; compound commands are checked one subcommand at a time; matching is case-insensitive on Windows. `okf-rs graph*` without the space would also match an unrelated `okf-rs graphx`, so the patterns use ` *`.
 
 Changes from v1 (schema checked 2026-11-17): `steps` instead of `maxSteps`; `permissions` as an ordered list of `{action, resource, effect}` where the last matching rule wins; `shell` instead of `bash`; `temperature` removed because sampling is set on the model. The binary name is `okf-rs`. v1's allowlist `okf-rs *` allowed `generate` and `init`, which write files; it is replaced.
 
@@ -429,19 +435,26 @@ Field names below were checked against the documentation pages cited. Items not 
 **Claude Code subagent** — `.claude/agents/<name>.md`, project scope (https://code.claude.com/docs/en/sub-agents)
 - Required frontmatter: `name` (no `:`, max 256 chars) and `description`.
 - Optional: `tools` (allowlist; all subagent-available tools if omitted), `disallowedTools` (denylist, applied first), `model` (`sonnet`, `opus`, `haiku`, `fable`, a full model ID, or `inherit`), `maxTurns`, `mcpServers`, `skills`, `permissionMode`, `isolation` (`worktree`).
-- Read-only architect: `tools: Read, Grep, Glob, mcp__okf__explore, mcp__okf__search, mcp__okf__search_ranked, mcp__okf__search_semantic, mcp__okf__coverage, mcp__okf__graph`. The MCP names are listed explicitly rather than with a wildcard, because a wildcard in `tools` is *Unverified*. Bash is absent, so the subagent cannot change files through the shell. A denylist such as `disallowedTools: Write, Edit` leaves Bash available and is **not** read-only.
+- Read-only architect: `tools: Read, Grep, Glob, mcp__okf__explore, mcp__okf__search, mcp__okf__search_ranked, mcp__okf__search_semantic, mcp__okf__coverage, mcp__okf__graph`, plus `skills: [okf-explore, okf-impact, okf-refactor]`. Bash is absent, so the subagent cannot change files through the shell; it names the shell commands the developer must run instead. A denylist such as `disallowedTools: Write, Edit` leaves Bash available and is **not** read-only.
 - MCP: subagents inherit the main conversation's MCP tools when `tools` is omitted; an explicit `tools` list must name them.
 
 **OpenCode agent** — `.opencode/agents/<name>.md`, `~/.config/opencode/agents/<name>.md`, or the `agents` key in `opencode.json` (https://opencode.ai/docs/agents/)
 - Fields: `description`, `mode` (`primary|subagent|all`, default `primary`), `model`, `system`, `permissions`, `steps`, `hidden`, `color`, `disabled`.
 - `permissions` is an ordered array of `{action, resource, effect}`; `effect` is `allow|ask|deny`; the last matching rule wins. Actions include `shell`, `edit`, `webfetch`, `read`, `glob`, `grep`, `skill`.
 
+**Verified in real sessions (P2.2, 2026-11-17, Claude Code 2.1.326, headless `claude -p` on a scratch Rust project with the `okf` server; transcripts checked tool call by tool call)**
+- An explicit `tools` list naming `mcp__okf__explore`, … gives the subagent exactly those tools; it called `mcp__okf__search`, `explore`, and `graph` (`plan-change`) and reported no Bash, Edit, or Write.
+- A wildcard works too: `tools: Read, mcp__okf__*` gave the subagent all six okf tools. The shipped files keep the explicit list, which also leaves `search_semantic` out of the reviewer.
+- `skills:` as a YAML list preloads the named skills into the subagent's context: the architect listed the `# OKF Exploration`, `# OKF Impact`, and `# OKF Refactor` headings without loading anything, and not the okf-graph-validation one it wasn't given.
+- MCP names in a SKILL.md body: agents that loaded `okf-explore` (which says the tools are named `mcp__okf__<tool>` in Claude Code) called them correctly in every P1 benchmark session.
+- **`Bash(<pattern>)` in a subagent's `tools` neither restricts nor pre-approves.** With `tools: … Bash(git diff *), Bash(okf-rs review *) …` the subagent reported plain `Bash`; with all Bash allowed by the session it also ran `git status` and a compound `ls` command; under `--permission-mode dontAsk` with no Bash rule, `git status`/`git diff` ran (Claude Code allows read-only git commands by default) and `okf-rs review` was denied. A read-only subagent therefore cannot be given a shell through its own file: the shipped reviewer lists `Bash` and states the commands it may run, and the pack's `.claude/settings.json` allows exactly the read-only commands (`Bash(okf-rs review *)` etc., verified to allow `okf-rs review` and `okf-rs impact` while `okf-rs generate --check-fresh`, not listed, was denied). Anything else asks the user, or is denied in `dontAsk` mode.
+- A subagent's Bash runs with the user's own `PATH`, not the `PATH` of the process that launched `claude`; for a binary that isn't installed, `CLAUDE_ENV_FILE` (a script sourced before each Bash command) works.
+
+**Checked against documentation only (OpenCode not installed here)**
+- OpenCode V2 schema as above (https://opencode.ai/docs/agents/, /permissions/, /skills/, read 2026-11-17): `permissions` list, `shell` action, `steps`; V1's `permission`, `bash`, `tools`, `maxSteps`, `temperature`, `prompt` are legacy. MCP tools are the action `<server>_<tool>` (so `okf_explore`, `okf_*`). OpenCode reads `.claude/skills/`, and a skill's id is its folder name. There is no `allowed-tools` equivalent; skills are gated per agent with the `skill` action. The default `mode` is `primary`, and the base policy allows everything not matched by a rule.
+
 **Unverified**
-- MCP tool names inside a SKILL.md body. `mcp__<server>__<tool>` is documented for permission rules, not confirmed for prose in a skill body.
-- Wildcards in Claude Code `tools` lists.
-- Glob syntax of `shell` resources beyond the documented `src/**` example for `read`.
-- Whether OpenCode has an `allowed-tools` equivalent for skills: not documented on the page checked.
-- The Claude Code skills and subagents pages were read only to about 100K characters.
+- The OpenCode agent files have not been run in an OpenCode session.
 
 ---
 
@@ -631,7 +644,7 @@ Defaults chosen in v1.1. Each can be changed; the reason to revisit is listed.
 | D-5 | Skill MCP naming | MCP form, CLI never in skill bodies (§4.3) | — |
 | D-6 | Protocol directive | opt-in (O-3, §15) | Adherence rate (§7.2) shows agents ignore it even when present |
 | D-7 | Cycle membership | SCC with more than one member, or a self-loop (§4.1.4) | — (matches `explore` today) |
-| D-8 | Architect shell access | read-only `okf-rs` subcommands and `git diff`/`git log` only (§6.3) | Read-only requirement for `diff` is confirmed, then add it |
+| D-8 | Architect shell access | read-only `okf-rs` subcommands (now including `diff`, O-6) and exactly `okf-rs generate --check-fresh`, plus `git diff`/`git log`/`git status`/`git rev-parse` (§6.3). In Claude Code the architect has no shell at all, since a subagent's `tools` cannot limit Bash (§6.5) | A Claude Code mechanism to limit a subagent's Bash is found |
 | D-11 | P1 outcome (decided 2026-11-17 by the project owner) | Accept the narrower claim: the graph lowers agent cost on structural questions that are expensive to answer by search (cross-crate transitive reach, widely shared method names) and raises it on local lookups; accuracy was equal with and without it on both pre-registered sets. P1 is closed on that basis; P2 is decided on its own merits. The skill is not re-tuned to route by question type (that would need a new held-out test) | A future held-out set shows routing would change the result |
 | D-10 | Repeated measurement (decided 2026-11-17 by the project owner) | P1.8 re-measured as 3 runs after receiver-type resolution; mean accuracy and ratio-of-totals tokens, rule pre-registered in `docs/benchmarks/agent-integration-p1-structural.md` | — |
 | D-9 | P1 gate (decided 2026-11-17 by the project owner) | Structural questions (UC-1S): accuracy against independent ground truth, then accuracy gain or token savings (§9.1). Replaces "≤ 1/3 files read" on "how does X work" questions | Evidence for the change: okf-rs run (files 0.46; floor 0.38 on that repo), Jujutsu run 1 (0.87, adherence 4/5), Jujutsu run 2 after the `explore` fix (1.23, tokens 2.3×). Revisit if structural answers turn out no better than grep's |
@@ -665,6 +678,7 @@ Defaults chosen in v1.1. Each can be changed; the reason to revisit is listed.
 - Receiver-type call resolution (2026-11-17, after the first structural run): the Rust extractor records what each method call's receiver is (`self`, a typed parameter or `let`, a field, a chained call, a `Type::f()` constructor) plus project-wide type facts (field types, method owners and return types, trait signatures, aliases); the analyzer resolves an ambiguous method name to the one candidate the receiver's type owns (`resolved_by: tree-sitter-receiver`), and drops name-only edges from calls on standard-library or third-party values. On Jujutsu: +10,144 edges, −443 false edges; a manual check of 27 random added and 27 random removed edges found every one correct. The structural run's two graph misses (`Store::concurrency`, `GitFetch::fetch`) now resolve, so `plan-change` reaches all four commands in S3.
 - Self-call fix and D-11 (2026-11-17): the analyzer now records a function calling itself when the syntax vouches for it — `f(..)` not shadowed by a function-local `use`, `self.f(..)`, `Self::f(..)` (Rust; plus any recursion a language server confirms with `--lsp`) — so §4.1.4's self-recursion case occurs in real bundles. Delegation such as `self.inner.f(..)` is not recorded as recursion. Checked by hand: all 15 self-edges on Helix and a random 15 of 28 on Jujutsu are genuine recursion. Known limits documented: macro-bound receivers get no type; type names are compared without their crate. D-11 accepts the narrower P1 claim.
 - Stale-file pruning (2026-11-17): `okf-rs generate` (and `watch`) now removes the files an earlier run wrote for concepts that no longer exist, so a renamed function no longer leaves an orphan that `validate` reports and `generate --check-fresh` flags forever. Only concept files stamped `generated.by: okf-rs/…` and okf-rs's own per-kind `index.md` are removed, and only inside the per-kind directories. This matters for P2's impact measurement, which regenerates the bundle after each change (OKF-DP-003).
+- P2.1–P2.2 (2026-11-17): skills `okf-impact`, `okf-refactor`, `okf-graph-validation` and agents `okf-architect`, `okf-developer`, `okf-reviewer` in both formats shipped in `examples/agent-workflow/` (pack 1.4). §6.3 patterns use ` *` (O-5, from the docs) and allow `diff` (O-6 closed, D-8 updated); §6.5 records what real Claude Code sessions verified, including that `Bash(<pattern>)` in a subagent's `tools` does not limit the shell. Two graph limits found while verifying, both stated in the skills: (1) `diff`, `impact`, `review`, and `generate --check-fresh` see signatures, call edges, and line ranges, not bodies, so an edit inside a function body that changes no call is reported as no concept-level change; the skills take edited concepts from `git diff` hunks; (2) the Rust extractor reads no calls inside macro arguments (`format!(.., run(x))`, `assert_eq!(run(x), ..)`), so callers and tests that reach a function only through a macro are missing from the graph.
 - Held-out structural benchmark (2026-11-17): pre-registered on Helix, failed (tokens 1.59×, accuracy tied); §10 cost claim narrowed. Findings recorded in `docs/benchmarks/agent-integration-p1-heldout.md`, including a spec/implementation mismatch: the analyzer never records self-calls, so §4.1.4's self-recursion case never occurs in a real bundle.
 - P1 re-scope (2026-11-17, D-9): §8 adds UC-1S (structural questions) and records the UC-1 result; §9.1 P1 exit criterion replaced; §9.2 adds characters read per tool and structural accuracy; §9.3 adds structural task rules (independent ground truth, pre-registration); §10 cost claim corrected; the shipped skill is pack 1.3 (structural questions), while §5.3 keeps the 1.2 example.
 
@@ -674,12 +688,12 @@ Defaults chosen in v1.1. Each can be changed; the reason to revisit is listed.
 
 | ID | Item | Status |
 |---|---|---|
-| O-1 | Agent and Skill formats (§6.5) | Partly resolved 2026-11-17. *Unverified* items in §6.5 must be tested before agent files are committed |
+| O-1 | Agent and Skill formats (§6.5) | Claude Code: closed, verified in real sessions (P2.2). OpenCode: checked against the documentation only; the agent files have not run in an OpenCode session |
 | O-2 | `okf-mcp` invocation | Closed. Verified in code: `okf-mcp <project-root>`, no `serve`. The `claude mcp add` syntax is still *Unverified* (§6.4) |
 | O-3 | Directive opt-in vs always-on (§7.1) | Default: opt-in. Confirm |
 | O-4 | `okf.toml` keys `plan_change.large_blast_radius` and `plan_change.boundary_terms` | Closed — implemented in P1 (`crates/okf-core/src/config.rs`). Invalid values warn and keep the default; `large_blast_radius` must be ≥ 1 |
-| O-5 | Shell pattern syntax in OpenCode `permissions` (§6.3) | Open — confirm in a P2 session |
-| O-6 | Whether `okf-rs diff` writes outside the project (temporary worktree) | Open — decides whether the architect may run `diff` (D-8) |
+| O-5 | Shell pattern syntax in OpenCode `permissions` (§6.3) | Answered from the documentation (§6.3): whole-value wildcards, ` *` suffix also matches no arguments, last match wins. Not yet run in an OpenCode session |
+| O-6 | Whether `okf-rs diff` writes outside the project (temporary worktree) | Closed: `diff`, `impact`, and `review` share one mechanism, a temporary worktree under the OS temp dir registered in `.git/worktrees/` and removed on exit; none writes the working tree, bundle, or cache. The architect may run all three (D-8) |
 
 ---
 
@@ -689,21 +703,23 @@ Defaults chosen in v1.1. Each can be changed; the reason to revisit is listed.
 okf-rs/
 ├── examples/
 │   └── agent-workflow/
-│       ├── .claude/skills/
-│       │   ├── okf-explore/SKILL.md
-│       │   ├── okf-impact/SKILL.md
-│       │   ├── okf-refactor/SKILL.md
-│       │   └── okf-graph-validation/SKILL.md
+│       ├── .claude/
+│       │   ├── skills/
+│       │   │   ├── okf-explore/SKILL.md
+│       │   │   ├── okf-impact/SKILL.md
+│       │   │   ├── okf-refactor/SKILL.md
+│       │   │   └── okf-graph-validation/SKILL.md
+│       │   ├── agents/        (okf-architect.md, okf-developer.md, okf-reviewer.md)
+│       │   └── settings.json  (allow rules for the read-only okf-rs and git commands)
 │       ├── .opencode/agents/
 │       │   ├── okf-architect.md
 │       │   ├── okf-developer.md
 │       │   └── okf-reviewer.md
-│       ├── CLAUDE.md          (OKF-DP directive, generated by okf-rs init)
-│       ├── AGENTS.md
-│       └── README.md          (A/B test scenarios, task list from §9.3)
+│       ├── bench/             (headless benchmark harness)
+│       └── README.md          (setup, A/B test scenarios, task list from §9.3)
 ```
 
-Claude Code subagent files (`.claude/agents/`) are added in P2, using the format in §6.5.
+`CLAUDE.md`/`AGENTS.md` are not shipped in the pack: `okf-rs init` writes them in the user's project (§7.1).
 
 # Appendix B — A/B validation metrics
 
