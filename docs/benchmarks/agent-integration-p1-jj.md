@@ -2,7 +2,7 @@
 
 Second run of the P1 exploration benchmark, on a repository where grep-based navigation should be expensive enough for the spec's 3× target (§9.1) to be reachable. The first run, on okf-rs itself, is in [`agent-integration-p1.md`](agent-integration-p1.md).
 
-**Status:** run on 2026-11-17. **Verdict: fail.** Files opened: 0.87 of baseline (criterion ≤ 0.33); adherence 4/5.
+**Status:** run twice on 2026-11-17. **Verdict: fail on both runs.** Run 1: files opened 0.87 of baseline (criterion ≤ 0.33), adherence 4/5. Run 2, after `explore` gained locations and capped lists: files 1.23, adherence 5/5, tokens 2.3× baseline. See [Run 2](#run-2-after-the-explore-fix).
 
 ## Target and run conditions
 
@@ -64,8 +64,42 @@ Grading notes: J3's question allows two readings. The baseline answered with jj'
 
 Across both repositories the pattern is the opposite of the spec's hypothesis: the graph helped on the small repository (source + MCP characters −33%, [first run](agent-integration-p1.md)) and not on the larger one.
 
+## Run 2 (after the explore fix)
+
+Same target, tasks, model, tools, and isolation; both variants re-run. Changes on the treatment side only: okf-rs `4e85e4c`, where `explore` returns the concept's location (`file#Lstart-Lend`) and each direct caller's and callee's, caps its lists (20/20/10, production code before tests), and the `okf-explore` skill (pack 1.2) says to read the returned line ranges instead of searching. Bundle: 9,522 concepts, as before.
+
+| Task | Variant | Files | Source chars | MCP chars | Skill first | Source-first | Turns | Tokens | Cost | Correct |
+|---|---|---|---|---|---|---|---|---|---|---|
+| J1 | baseline | 1 | 13,914 | — | n/a | n/a | 5 | 47,711 | $0.132 | yes |
+| J1 | treatment | 2 | 6,078 | 7,015 | yes | no | 9 | 69,823 | $0.193 | yes |
+| J2 | baseline | 3 | 15,336 | — | n/a | n/a | 9 | 64,696 | $0.162 | yes |
+| J2 | treatment | 3 | 9,119 | 5,500 | yes | no | 14 | 125,281 | $0.172 | yes |
+| J3 | baseline | 1 | 13,189 | — | n/a | n/a | 5 | 62,967 | $0.133 | partial |
+| J3 | treatment | 2 | 14,852 | 10,631 | yes | no | 13 | 114,220 | $0.206 | yes |
+| J4 | baseline | 6 | 23,748 | — | n/a | n/a | 11 | 73,796 | $0.194 | yes |
+| J4 | treatment | 7 | 28,989 | 6,433 | yes | no | 24 | 217,605 | $0.366 | yes |
+| J5 | baseline | 2 | 45,275 | — | n/a | n/a | 8 | 103,162 | $0.256 | yes |
+| J5 | treatment | 2 | 44,721 | 21,441 | yes | no | 14 | 269,733 | $0.376 | yes |
+| **Total** | baseline | **13** | **111,462** | — | | | 38 | **352,332** | **$0.88** | 4.5/5 |
+| **Total** | treatment | **16** | **103,759** | **51,020** | 5/5 | 0/5 | 74 | **796,662** | **$1.31** | 5/5 |
+
+- Files, treatment ÷ baseline: **1.23**. Source chars: 0.93; with MCP output: **1.39**. Tokens **2.26×**, cost +49%, turns +95%.
+- **Run-to-run noise.** The baseline moved between runs from 15 to 13 files, 145k to 111k source characters, and 435k to 352k tokens: roughly ±20% for a single run. The treatment's token gap is well outside that.
+
+**What the fix changed.** It did what it was built to do. The treatment's Grep output fell from 48,361 to 19,782 characters (−59%): after `explore`, agents read the returned range directly (J1: search, two `explore` calls, then `file_util.rs` lines 285–365 and the test at 934, with no grep at all). Adherence reached 5/5.
+
+**Why the totals didn't improve.** The savings went into more graph round trips:
+
+1. **More turns.** The treatment made more `search`/`explore` calls (J4: 4 searches and 6 explores; J5: 2 searches, 4 explores, 1 `graph`), 74 turns against 38. Every turn re-sends the conversation, so tokens grow with turns, not with characters read.
+2. **Unresolved method calls.** `explore` again reported no callers for a method with a common name (`Store::concurrency`, implemented by every backend; earlier `SourceSymbolScanner::find`). The agent said so and fell back to a 12.5k-character grep (J4). The bundle was generated without `--lsp`, which is meant for exactly this.
+3. **`search` output is uncapped.** `search "symbol"` returned 14.9k characters (J5), more than any `explore` response.
+4. **Reading volume is set by the question.** For "how does X work", the agent reads the mechanism's code either way (J5: both variants read `source_symbol.rs` whole, ~35–40k characters). The graph changes how the code is found, not how much of it has to be read.
+
+**Conclusion across the three runs.** For UC-1 mechanism questions with a strong model, graph-first exploration does not reduce what the agent reads, and it costs more tokens on a large repository because each graph call is an extra turn. Locating code is not the expensive part for these questions; grep already does it in one or two calls. The adherence result stands: agents use the skill and query the graph first when it is installed.
+
 ## Options (decision needed; not taken here)
 
+0. **Done:** option 1's `explore` fix (location, caps), measured in Run 2 above. The cheap follow-ups it points to — cap `search` output, generate with `--lsp` — are still open, but Run 2 suggests the turn overhead, not output size, is the main cost for these questions.
 1. **Fix what the transcripts point to, then re-run this exact task set:** add the concept's location (file and line range) to `explore`; cap blast-radius lists in `explore` (count plus the first N); optionally run the treatment bundle with `--lsp`. The tasks file is fixed, so the re-run is directly comparable.
 2. **Re-scope P1.** UC-1 mechanism questions are grep's best case. The graph's distinctive answers are structural — transitive callers, blast radius, cycles — which grep can only reconstruct slowly. Gate on UC-2 (impact, P2's recall metric) instead of files read for UC-1, and record the change in the spec's decisions log.
 3. **Stop at adherence.** Keep the skill and protocol for consistency, without a cost claim.

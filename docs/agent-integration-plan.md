@@ -1,7 +1,7 @@
 # Implementation plan — Coding agent integration
 
 **Source:** `docs/OKF_Agent_Integration_Spec_EN_v1.md` (v1.1, 2026-11-17)
-**Status:** P0 complete. P1.1–P1.6 implemented on branch `feat/agent-integration-p1` (2026-11-17). P1.7 run twice on 2026-11-17. On okf-rs: adherence 5/5, file ratio 0.46 (fail; floor 0.38 on that repo). Re-run on Jujutsu (456 Rust files): adherence 4/5, file ratio **0.87**, source + MCP characters +9% (fail). See `docs/benchmarks/agent-integration-p1.md` and `docs/benchmarks/agent-integration-p1-jj.md`, which list the options. P2 is gated on that decision.
+**Status:** P0 complete. P1.1–P1.6 implemented on branch `feat/agent-integration-p1` (2026-11-17). P1.7 run twice on 2026-11-17. On okf-rs: adherence 5/5, file ratio 0.46 (fail; floor 0.38 on that repo). Re-run on Jujutsu (456 Rust files): adherence 4/5, file ratio **0.87**, source + MCP characters +9% (fail). After the `explore` fix (locations, capped lists; `4e85e4c`), Jujutsu run 2: adherence 5/5, Grep output −59%, but file ratio 1.23 and tokens 2.3× baseline (fail): graph round trips add turns. See `docs/benchmarks/agent-integration-p1.md` and `docs/benchmarks/agent-integration-p1-jj.md`, which list the options. P2 is gated on that decision.
 
 ### P1 progress
 
@@ -13,7 +13,7 @@
 | P1.4 MCP | Done — `graph` relation `plan-change`, config read once at server start | `crates/okf-mcp/src/{main,tools}.rs` |
 | P1.5 directive | Done — opt-in; output unchanged when off; e2e test through `init` | `crates/okf-generator/src/agents.rs` |
 | P1.6 pack | Done — `okf-explore` Skill, README with setup and the 5 fixed tasks | `examples/agent-workflow/` |
-| P1.7 measurement | **Run twice — fail.** okf-rs: 13 → 6 files (0.46), adherence 5/5. Jujutsu: 15 → 13 files (0.87), adherence 4/5, more text consumed than baseline | `docs/benchmarks/agent-integration-p1.md`, `docs/benchmarks/agent-integration-p1-jj.md`, harness in `examples/agent-workflow/bench/` |
+| P1.7 measurement | **Run three times — fail.** okf-rs: 13 → 6 files (0.46), adherence 5/5. Jujutsu run 1: 15 → 13 files (0.87), adherence 4/5. Jujutsu run 2 (after the `explore` fix): 13 → 16 files (1.23), adherence 5/5, tokens 2.3× | `docs/benchmarks/agent-integration-p1.md`, `docs/benchmarks/agent-integration-p1-jj.md`, harness in `examples/agent-workflow/bench/` |
 
 **Unplanned fix in P1.5.** `okf-rs init` overwrote `okf.toml` with only its `output` line, dropping `[diff]` and (now) `[agents]` on every re-run, which would have made the opt-in directive disappear. `config::write_default` now replaces only the top-level `output` line of an existing file.
 
