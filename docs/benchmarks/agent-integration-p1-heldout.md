@@ -92,6 +92,8 @@ All 30 answers were read and graded: **every task-run scores 1.0 in both variant
 4. **Self-calls are never recorded.** `split_ambiguous_calls` skips any edge from a function to itself, so self-recursion never appears as a `Calls` edge or as a cycle in a real bundle, contradicting spec §4.1.4's cycle definition (which counts self-recursion) and `plan-change`'s self-recursion handling (exercised only by in-memory tests).
 5. **One model, two repositories, ten structural questions.** Taken together, the two pre-registered structural sets point to a narrower claim than P1 made: the graph lowers agent cost where answering by grep is expensive (cross-crate transitive reach, widely shared method names), and raises it where the answer is local.
 
+**Follow-up (2026-11-17, decision D-11):** option 1 plus the self-call fix from option 3. Self-calls are now recorded when the syntax vouches for them (`f(..)`, `self.f(..)`, `Self::f(..)`); a first, looser version also counted `self.inner.f(..)` and was wrong on 5 of 10 sampled Helix edges (wrappers around same-named third-party types, a function-local `use` shadowing the function's name), so it was tightened before committing. After the fix, all 15 Helix self-edges and a random 15 of Jujutsu's 28 are genuine recursion. Macro-bound receivers are documented as a limit, not fixed.
+
 ### Options (decision needed; not taken here)
 
 1. **Accept the fail.** P1's structural-cost claim does not hold in general; record the narrower finding and decide P2 on its own merits.
