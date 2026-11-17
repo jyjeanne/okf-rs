@@ -2,7 +2,7 @@
 
 A fresh, held-out check of the P1 structural result ([`agent-integration-p1-structural.md`](agent-integration-p1-structural.md)). That result passed after receiver-type resolution, but the fix was built after seeing which two Jujutsu tasks the graph got wrong, so those tasks couldn't show whether the fix generalizes. This set uses a different repository and new questions, chosen without looking at the graph.
 
-**Status:** pre-registered. Tasks, ground truth, scoring, and the gate were committed before any okf-rs command ran on Helix.
+**Status:** pre-registered in `500d975` (tasks, ground truth, scoring, and gate committed before any okf-rs command ran on Helix); run 2026-11-17. **Verdict: fail.** Accuracy 1.0 for both variants; treatment tokens **1.59×** baseline (per run 1.48–1.71), cost 1.02×. The Jujutsu pass does not generalize to this repository. See [Results](#results).
 
 ## Held-out discipline
 
@@ -40,4 +40,60 @@ A fresh, held-out check of the P1 structural result ([`agent-integration-p1-stru
 
 ## Results
 
-Not run yet.
+Run 2026-11-17 on okf-rs `500d975` (crates identical to `b1b3d3a`), skill pack 1.3, `claude-opus-5-5`, 3 runs × 10 sessions. All 30 sessions exited cleanly; nothing was re-run or excluded. Bundle: 5,511 concepts from 299 files.
+
+### Accuracy
+
+All 30 answers were read and graded: **every task-run scores 1.0 in both variants.** H1: the 3 callers. H2: exactly the 18 required functions; answers that mention `Editor::focus` and `EditorView::handle_mouse_event` list them separately as indirect callers through the `Editor` wrapper (accurate, not claimed as direct callers), and `ensure_cursor_in_view_center` only as excluded. H3: the 8 commands. H4: the five-function chain; `ls.goto_definition` appears only as the request the closure sends. H5: the `elaborate` ↔ `elaborate_placeholder` cycle, `Snippet::new` as the entry point, `elaborate_choice` and `elaborate_transform` explicitly excluded. Chains (H3) were recorded, not scored; a few list `buffer_gather_*_impl` as if it were a hop.
+
+### Tokens and cost
+
+| Task | Baseline tokens | Treatment tokens | Ratio |
+|---|---|---|---|
+| H1 direct callers (control) | 91,766 | 177,546 | 1.93 |
+| H2 method callers | 242,835 | 263,548 | 1.09 |
+| H3 commands reaching a function | 201,478 | 302,437 | 1.50 |
+| H4 call path | 110,087 | 246,503 | 2.24 |
+| H5 recursion | 105,692 | 208,044 | 1.97 |
+| **Total (3 runs)** | **751,858** | **1,198,078** | **1.593** |
+
+| Run | Baseline tokens | Treatment tokens | Ratio | Baseline cost | Treatment cost |
+|---|---|---|---|---|---|
+| 1 | 231,894 | 395,365 | 1.705 | $0.75 | $0.84 |
+| 2 | 229,697 | 372,187 | 1.620 | $0.60 | $0.54 |
+| 3 | 290,267 | 430,526 | 1.483 | $0.62 | $0.63 |
+| **All** | **751,858** | **1,198,078** | **1.593** | **$1.97** | **$2.01** (1.02) |
+
+- Source characters (Read + Grep): 273,923 baseline vs 211,885 treatment, plus 42,666 from MCP responses. Turns: 87 baseline vs 127 treatment.
+- Adherence: skill loaded first on 8/15 treatment task-runs; a source file was read before the first `explore` call on 4/15 (all on H2 and H3).
+
+### Verdict against the pre-registered rule
+
+- Treatment accuracy ≥ 0.9: yes (1.000).
+- Accuracy ≥ baseline + 0.15: **no** (1.000 vs 1.000).
+- Token ratio ≤ 0.67 at accuracy ≥ baseline − 0.05: **no** (1.593).
+- **Held-out gate: fail.**
+
+### What the graph alone answers (checked after the run, as pre-registered)
+
+| Task | Graph alone | Notes |
+|---|---|---|
+| H1 | correct (3 callers) | |
+| H2 | **2 of 18 callers** | Most `view` receivers come from `current!` / `view_mut!` macros (`let (view, doc) = current!(cx.editor);`), which syntax-only receiver typing can't see through. Every treatment answer noticed and fell back to grep. |
+| H3 | correct (all 8 commands via `plan-change`) | |
+| H4 | correct (`graph path` gives the exact chain) | |
+| H5 | correct pair | The self-call `Snippet::elaborate` → itself is missing: the analyzer never records a function calling itself (see findings). |
+
+### Findings
+
+1. **The cost advantage depends on how expensive grep is.** On Jujutsu the baseline needed 300k tokens for the transitive question, and the graph cut that to a third. On Helix the answers are local (mostly in one file, `commands/typed.rs`), the baseline answers in 4–8 turns at ~30–70k tokens, and the graph route's fixed overhead — loading the skill, `search`, `explore`/`graph`, then a confirming grep — costs more than the whole baseline. The graph was right on 4 of 5 tasks and still lost on cost on all five.
+2. **Agents verify graph answers with grep.** Most treatment answers say the graph and a text search "agree". That double-checking is reasonable given the graph's known gaps, but it means the graph adds cost rather than replacing search on easy questions.
+3. **Receiver typing doesn't see through macros.** It generalized to Helix's plain parameters, fields, and chains (H1, H3, H4, H5 are graph-correct), but not to macro-bound values, which Helix uses for most `view`/`doc` access. The H2 graph answer was 2 of 18.
+4. **Self-calls are never recorded.** `split_ambiguous_calls` skips any edge from a function to itself, so self-recursion never appears as a `Calls` edge or as a cycle in a real bundle, contradicting spec §4.1.4's cycle definition (which counts self-recursion) and `plan-change`'s self-recursion handling (exercised only by in-memory tests).
+5. **One model, two repositories, ten structural questions.** Taken together, the two pre-registered structural sets point to a narrower claim than P1 made: the graph lowers agent cost where answering by grep is expensive (cross-crate transitive reach, widely shared method names), and raises it where the answer is local.
+
+### Options (decision needed; not taken here)
+
+1. **Accept the fail.** P1's structural-cost claim does not hold in general; record the narrower finding and decide P2 on its own merits.
+2. **Route by question type.** Change the skill so the graph is used for transitive and cross-module questions and grep for local lookups, then test that routing on a *new* pre-registered held-out set (a third repository) mixing both kinds. Re-running this Helix set after tuning would no longer be held-out.
+3. **Fix the two concrete defects regardless of P1:** record self-call edges (a correctness bug against the spec), and decide whether to attempt common macro patterns for receiver typing (`current!`-style tuples) or document the limit.
