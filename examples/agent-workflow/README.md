@@ -2,7 +2,7 @@
 
 Skills and conventions that make a coding agent (Claude Code, OpenCode) query the OKF knowledge graph before it reads source. The design and its rationale are in [`docs/OKF_Agent_Integration_Spec_EN_v1.md`](../../docs/OKF_Agent_Integration_Spec_EN_v1.md); the delivery plan is [`docs/agent-integration-plan.md`](../../docs/agent-integration-plan.md).
 
-**Pack version:** 1.2 (matches `metadata.okf_pack` in each `SKILL.md`). 1.2: `okf-explore` reads the line ranges `explore` now returns instead of searching for the concept. The two benchmark runs to date used 1.1.
+**Pack version:** 1.3 (matches `metadata.okf_pack` in each `SKILL.md`). 1.2: `okf-explore` reads the line ranges `explore` returns instead of searching for the concept. 1.3: `okf-explore` covers structural questions (callers, transitive reach, paths, cycles) relation by relation, and says when to check the graph with grep. Benchmark runs record the pack version they used.
 
 ## What's in it
 
@@ -91,4 +91,5 @@ node <work dir>/analyze.js <work dir>         # metrics per §9.2; answers saved
 | Tasks file | Target | Results |
 |---|---|---|
 | `bench/tasks/okf-rs.tsv` | this repository (55 Rust files) | [`docs/benchmarks/agent-integration-p1.md`](../../docs/benchmarks/agent-integration-p1.md) |
-| `bench/tasks/jj.tsv` | [Jujutsu](https://github.com/jj-vcs/jj) at `4351061bb` (456 Rust files) | [`docs/benchmarks/agent-integration-p1-jj.md`](../../docs/benchmarks/agent-integration-p1-jj.md) |
+| `bench/tasks/jj.tsv` | [Jujutsu](https://github.com/jj-vcs/jj) at `4351061bb` (456 Rust files), "how does X work" | [`docs/benchmarks/agent-integration-p1-jj.md`](../../docs/benchmarks/agent-integration-p1-jj.md) |
+| `bench/tasks/jj-structural.tsv` | Jujutsu at `4351061bb`, structural questions (P1 gate after the re-scope) | [`docs/benchmarks/agent-integration-p1-structural.md`](../../docs/benchmarks/agent-integration-p1-structural.md) |

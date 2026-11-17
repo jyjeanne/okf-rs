@@ -1,12 +1,13 @@
 ---
 name: okf-explore
 description: >
-  Explore an unfamiliar or existing part of the codebase through the OKF
-  knowledge graph before reading any source file. Use when the user asks
-  to explain, understand, locate, or navigate code, symbols, modules,
-  call paths, or architecture.
+  Answer questions about the codebase's structure through the OKF knowledge
+  graph before reading source: who calls a function, what code or which
+  commands a change would reach, the call path between two functions,
+  recursion and call cycles, module dependencies. Also use it to explain,
+  locate, or navigate code, symbols, and modules.
 metadata:
-  okf_pack: "1.2"
+  okf_pack: "1.3"
 ---
 
 # OKF Exploration — graph first, source second
@@ -19,25 +20,36 @@ using this skill.
 ## Method
 
 1. Identify candidate concepts from the user request (names, domain terms).
-2. MCP `search` with those terms to locate concepts and get their ids. If
-   results are ambiguous or empty, MCP `search_ranked` with a descriptive
-   phrase.
+2. MCP `search` with those terms to get exact concept ids. If results are
+   ambiguous or empty, MCP `search_ranked` with a descriptive phrase.
 3. MCP `explore` on the chosen concept id: location, signature,
    description, callers and callees (each with its location), blast
    radius, public API membership, cycle membership. ONE call.
-4. If the question is architecture-level, MCP `graph` with relation
-   `modules`, `communities`, or `path` (with `from` and `to` ids).
-5. NOW read source: read the line ranges the `Location` values point to
-   (`file#Lstart-Lend` → read that file from `start` for `end - start + 1`
-   lines), and only those. Do not search for a function the graph has
-   already located.
-6. Synthesize the answer. For every claim about who calls what, name the
-   MCP call that showed it. Never grep the whole repository to find
-   something the graph already knows.
+4. Structural questions — answer from the graph:
+   - Who calls X: `graph` relation `callers` (the full list; `explore`
+     caps it).
+   - What X reaches, or which entry points reach X: `graph` relation
+     `plan-change` on X (`affected_concepts` is every transitive caller),
+     then `path` from an entry point to X for the chain.
+   - Call path between two functions: `graph` relation `path`.
+   - Recursion: `graph` relation `cycles`, or `explore`'s cycle flag.
+   - Module or package dependencies: `graph` relation `modules` or
+     `communities`.
+5. Check the graph where it can be wrong: callers are matched by name, so
+   a method whose name many types share (e.g. `concurrency`, `find`) may
+   show no callers. If the graph reports **no** callers for something that
+   is clearly used, grep for its call sites and say in the answer which
+   facts came from grep.
+6. Read source only to confirm or explain: the line ranges the `Location`
+   values point to (`file#Lstart-Lend`), and only those. Do not search for
+   a function the graph has already located.
+7. Synthesize. For every structural claim, name the MCP call (or grep)
+   that showed it.
 
 ## Anti-patterns (forbidden)
 
 - Reading files before the first `explore` call.
 - Grepping for a concept `explore` already gave a location for.
-- Guessing callers or callees from reading source.
+- Reconstructing callers or call chains by reading source when the graph
+  lists them.
 - Calling `explore` on more than 2–3 concepts before synthesizing.

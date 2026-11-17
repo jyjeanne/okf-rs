@@ -296,6 +296,8 @@ Skills describe the operation by its name and parameters, and show the MCP form 
 
 ## 5.3 Complete example — `okf-explore` (foundational Skill, build first)
 
+The shipped version is `examples/agent-workflow/.claude/skills/okf-explore/SKILL.md` (pack 1.3, which adds a step for structural questions, D-9); the example below is the 1.2 form.
+
 ```markdown
 ---
 name: okf-explore
@@ -504,8 +506,11 @@ These three checks are the adherence metric in §9.2.
 
 # 8. Use cases
 
-## UC-1 — Exploration (priority 1, expected high value)
-*"Explain the authentication architecture"* → search → explore(Authentication) → graph modules/callers → structured explanation. Success metric (to be measured): files read divided by ≥ 3 vs grep baseline, at equal explanation quality.
+## UC-1 — Exploration (priority 1)
+*"Explain the authentication architecture"* → search → explore(Authentication) → graph modules/callers → structured explanation. The original success metric — files read divided by ≥ 3 vs a grep baseline — was measured three times on 2026-11-17 and not met: for "how does X work" questions a strong agent with grep already finds the code in one or two calls, and graph round trips added turns (`docs/benchmarks/agent-integration-p1*.md`). UC-1 stays a supported use; it is no longer the P1 gate (D-9).
+
+## UC-1S — Structural questions (priority 1, P1 gate since D-9)
+*"Who calls `persist_temp_file`?"*, *"Which commands can reach `parse_object_format_mismatch`?"*, *"What's the call path from `cmd_resolve` to X?"*, *"Which functions recurse when walking the tree?"* → `graph` relations `callers`, `plan-change`, `path`, `cycles` → answer. These are the questions the graph answers directly and grep reconstructs slowly or incompletely (transitive reach, method calls across crates). Success metric: answer accuracy against independent ground truth, and cost (§9.2).
 
 ## UC-2 — Change impact analysis (priority 1, expected high value)
 *"I want to modify UserService.authenticate()"* → `plan-change` → plan (direct/indirect/API/tests/risks) → approval → implementation → after change, `okf-rs impact` between the pre-change and post-change refs. Metric: §9.2, blast-radius recall.
@@ -531,7 +536,7 @@ modules → communities → cycles → living map (regenerated, therefore never 
 | Phase | Deliverable | Exit criterion |
 |---|---|---|
 | **P0 — Spec** | This document v1.1, reviewed | Review findings applied; open items in §15 resolved or explicitly deferred |
-| **P1 — Foundations** | `plan-change` (graph relation + CLI, §4.1); `okf-explore` Skill; OKF-DP directive in the generator template (§7.1) | On 5 real exploration tasks (§9.3), the agent loads and follows `okf-explore` without prompting (§9.2 definition); treatment reads ≤ 1/3 the distinct source files of the baseline |
+| **P1 — Foundations** | `plan-change` (graph relation + CLI, §4.1); `okf-explore` Skill; OKF-DP directive in the generator template (§7.1) | **Since D-9:** on 5 structural tasks (UC-1S, §9.3), treatment accuracy ≥ 0.9, **and** either accuracy ≥ baseline + 0.15, or tokens ≤ 0.67 × baseline at accuracy ≥ baseline − 0.05 (§9.2). Adherence is recorded, not gated. *(Superseded: treatment reads ≤ 1/3 the distinct source files of the baseline on 5 exploration tasks — not met in three runs.)* |
 | **P2 — Impact + Refactor** | Skills `okf-impact`, `okf-refactor`, `okf-graph-validation`; agents (3) in both tool formats | On 3 real modifications (§9.3), blast-radius recall ≥ 0.9 and 0 unpredicted broken tests (§9.2 definitions); before/after graph produced for every refactoring task |
 | **P3 — Review + Debug** | Skills `okf-review`, `okf-debug` | Review of a real PR: all concepts affected per graph diff are mentioned in the report |
 | **P4 — Feature + Docs** | Skills `okf-feature`, `okf-architecture`, `okf-documentation` | Only if P1–P3 demonstrate value; otherwise deferred |
@@ -546,6 +551,8 @@ modules → communities → cycles → living map (regenerated, therefore never 
 - **Unpredicted broken tests:** tests that fail after the change and whose id is not in the `tests` field of `plan-change`. Counted per task; the P2 target is 0.
 - **Protocol adherence rate:** fraction of tasks where all applicable checks in §7.2 passed.
 - **Tokens consumed:** total input + output tokens per task, from the session log.
+- **Characters read per tool:** characters returned to the agent by `Read`, `Grep`, and the `okf` MCP tools, from the transcript. Added after the first run showed that Grep's content output and MCP responses are reading too, which "files read" misses.
+- **Structural accuracy (UC-1S, since D-9):** per task, against ground truth fixed before the run. Set answers (callers, commands, cycle members): recall = required items named ÷ required items, precision = correct items ÷ items claimed, score = F1; test functions are optional (count neither way). Path answers: 1 if every required hop appears in order with no wrong hop, else 0. Accuracy = mean task score per variant. The exact scoring of each task set is pre-registered in its results document.
 
 ## 9.3 Task selection `[DECIDED]`
 
@@ -556,6 +563,8 @@ Benchmark tasks are taken from **this repository's own history**, so ground trut
 - If fewer than 3 modification tasks have |A| > 0, the task pool is extended with further merged commits before the P2 gate is evaluated. The gate is never passed on fewer than 3 valid tasks.
 
 Tasks are fixed before the first run and recorded in `examples/agent-workflow/README.md` (A/B scenarios, Appendix A).
+
+**Structural tasks (UC-1S, since D-9).** Run on a repository large enough that grep navigation is costly (Jujutsu, 456 Rust files, for the first set). Ground truth must not come from okf-rs output, or the treatment wins by construction: call sites are found by grep, mapped to enclosing functions by a text-only helper, and every result is reviewed by reading the code; transitive answers are built level by level the same way. Building or running the target (e.g. a compiler-based oracle) is avoided for third-party repositories, since it executes their build scripts. Tasks, ground truth, and scoring are committed before the first run (`docs/benchmarks/agent-integration-p1-structural.md`). The set mixes a grep-easy control, a case the graph is known to get wrong (method calls on a widely shared name), transitive reach, a call path, and a cycle.
 
 ---
 
@@ -570,7 +579,7 @@ The benefits below are hypotheses. Each is tied to a metric in §9 and is claime
 - **Architecture drift is visible.** The graph is regenerated and versioned like code: dependency cycles and new coupling appear in `okf-rs diff` and can be reviewed in a PR.
 - **Reviews grounded in computed facts.** PR review diffs the graph: public API changes, call-graph changes, and cycle introductions are listed by the tool.
 - **Documentation generated from the graph.** Architecture docs are regenerated from the bundle rather than written by hand.
-- **Lower agent cost.** Fewer files read per task, if §9.2 confirms it.
+- **Lower agent cost.** *Not supported for "how does X work" questions:* three runs (2026-11-17) found no reduction on a 456-file repository and higher token use from graph round trips. Whether structural questions are answered more accurately or cheaply is what the D-9 gate measures.
 
 ## On a codebase in active build (greenfield)
 
@@ -622,6 +631,7 @@ Defaults chosen in v1.1. Each can be changed; the reason to revisit is listed.
 | D-6 | Protocol directive | opt-in (O-3, §15) | Adherence rate (§7.2) shows agents ignore it even when present |
 | D-7 | Cycle membership | SCC with more than one member, or a self-loop (§4.1.4) | — (matches `explore` today) |
 | D-8 | Architect shell access | read-only `okf-rs` subcommands and `git diff`/`git log` only (§6.3) | Read-only requirement for `diff` is confirmed, then add it |
+| D-9 | P1 gate (decided 2026-11-17 by the project owner) | Structural questions (UC-1S): accuracy against independent ground truth, then accuracy gain or token savings (§9.1). Replaces "≤ 1/3 files read" on "how does X work" questions | Evidence for the change: okf-rs run (files 0.46; floor 0.38 on that repo), Jujutsu run 1 (0.87, adherence 4/5), Jujutsu run 2 after the `explore` fix (1.23, tokens 2.3×). Revisit if structural answers turn out no better than grep's |
 
 ---
 
@@ -649,6 +659,7 @@ Defaults chosen in v1.1. Each can be changed; the reason to revisit is listed.
 - Corrections from the P1 implementation (2026-11-17): §4.1.2 CLI parameters match the other `graph` subcommands (positional `bundle`, `--project`); §4.1.3 example replaced by the real golden output; §4.1.4 `kind` is the concept kind, and self-calls are excluded from `direct_callers`/`callees`; §4.1.5 `symbol_pattern` kinds listed exactly, `limits` strings fixed, and the measured Rust inline-test limitation recorded; §4.1.6 boundary terms skip the `modules/` kind segment; §4.1.7 missing-bundle message matches `okf_query::require_bundle`; §7.1 `init` keeps the rest of `okf.toml`; O-4 closed.
 - Rust test tagging (2026-11-17, before P2): §4.1.5 adds the `tag` rule backed by the Rust extractor's `test` tag, updates the third `limits` string, and replaces the "measured limitation" note with the measured result; §4.1.6 rules 3 and 4 skip tests; §4.1.3 example regenerated; D-3 updated.
 - `explore` location and caps (2026-11-17, after the Jujutsu benchmark): §4.1.8 documents the new `explore` output (concept and neighbour locations; capped, production-first lists with exact counts); §5.3 example skill reads the returned line ranges (pack 1.2).
+- P1 re-scope (2026-11-17, D-9): §8 adds UC-1S (structural questions) and records the UC-1 result; §9.1 P1 exit criterion replaced; §9.2 adds characters read per tool and structural accuracy; §9.3 adds structural task rules (independent ground truth, pre-registration); §10 cost claim corrected; the shipped skill is pack 1.3 (structural questions), while §5.3 keeps the 1.2 example.
 
 ---
 
