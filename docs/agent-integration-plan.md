@@ -1,7 +1,7 @@
 # Implementation plan — Coding agent integration
 
 **Source:** `docs/OKF_Agent_Integration_Spec_EN_v1.md` (v1.1, 2026-11-17)
-**Status:** P0 complete. P1.1–P1.6 implemented on branch `feat/agent-integration-p1` (2026-11-17). P1.7 run twice on 2026-11-17. On okf-rs: adherence 5/5, file ratio 0.46 (fail; floor 0.38 on that repo). Re-run on Jujutsu (456 Rust files): adherence 4/5, file ratio **0.87**, source + MCP characters +9% (fail). After the `explore` fix (locations, capped lists; `4e85e4c`), Jujutsu run 2: adherence 5/5, Grep output −59%, but file ratio 1.23 and tokens 2.3× baseline (fail): graph round trips add turns. See `docs/benchmarks/agent-integration-p1.md` and `docs/benchmarks/agent-integration-p1-jj.md`. **Decision (2026-11-17, project owner): P1 re-scoped to structural questions (spec D-9)**; the new gate is P1.8. P2 starts after P1.8 passes.
+**Status:** P0 complete. P1.1–P1.6 implemented on branch `feat/agent-integration-p1` (2026-11-17). P1.7 run twice on 2026-11-17. On okf-rs: adherence 5/5, file ratio 0.46 (fail; floor 0.38 on that repo). Re-run on Jujutsu (456 Rust files): adherence 4/5, file ratio **0.87**, source + MCP characters +9% (fail). After the `explore` fix (locations, capped lists; `4e85e4c`), Jujutsu run 2: adherence 5/5, Grep output −59%, but file ratio 1.23 and tokens 2.3× baseline (fail): graph round trips add turns. See `docs/benchmarks/agent-integration-p1.md` and `docs/benchmarks/agent-integration-p1-jj.md`. **Decision (2026-11-17, project owner): P1 re-scoped to structural questions (spec D-9)**; the new gate is P1.8. P1.8 ran once and failed narrowly on its token criterion (0.77× vs ≤ 0.67×, accuracy tied at 1.0); `docs/benchmarks/agent-integration-p1-structural.md` lists the options. P2 starts after P1.8 passes.
 
 ### P1 progress
 
@@ -13,7 +13,7 @@
 | P1.4 MCP | Done — `graph` relation `plan-change`, config read once at server start | `crates/okf-mcp/src/{main,tools}.rs` |
 | P1.5 directive | Done — opt-in; output unchanged when off; e2e test through `init` | `crates/okf-generator/src/agents.rs` |
 | P1.6 pack | Done — `okf-explore` Skill, README with setup and the 5 fixed tasks | `examples/agent-workflow/` |
-| P1.8 structural gate (D-9) | **Pre-registered**: 5 structural questions on Jujutsu with independent ground truth and fixed scoring; skill pack 1.3 covers structural questions | `bench/tasks/jj-structural.tsv`, `docs/benchmarks/agent-integration-p1-structural.md` |
+| P1.8 structural gate (D-9) | **Run once — fail, narrowly.** Accuracy 1.0 for both variants; treatment tokens 0.77× (bar ≤ 0.67×), cost 0.64×, source read 0.34×. Savings concentrated on the transitive question (tokens 0.45×). Name-matched resolution missed method callers in 2 tasks; the agent recovered with grep both times | `bench/tasks/jj-structural.tsv`, `docs/benchmarks/agent-integration-p1-structural.md` |
 | P1.7 measurement | **Run three times — fail.** okf-rs: 13 → 6 files (0.46), adherence 5/5. Jujutsu run 1: 15 → 13 files (0.87), adherence 4/5. Jujutsu run 2 (after the `explore` fix): 13 → 16 files (1.23), adherence 5/5, tokens 2.3× | `docs/benchmarks/agent-integration-p1.md`, `docs/benchmarks/agent-integration-p1-jj.md`, harness in `examples/agent-workflow/bench/` |
 
 **Unplanned fix in P1.5.** `okf-rs init` overwrote `okf.toml` with only its `output` line, dropping `[diff]` and (now) `[agents]` on every re-run, which would have made the opt-in directive disappear. `config::write_default` now replaces only the top-level `output` line of an existing file.
