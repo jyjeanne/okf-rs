@@ -553,6 +553,7 @@ modules → communities → cycles → living map (regenerated, therefore never 
 - **Tokens consumed:** total input + output tokens per task, from the session log.
 - **Characters read per tool:** characters returned to the agent by `Read`, `Grep`, and the `okf` MCP tools, from the transcript. Added after the first run showed that Grep's content output and MCP responses are reading too, which "files read" misses.
 - **Structural accuracy (UC-1S, since D-9):** per task, against ground truth fixed before the run. Set answers (callers, commands, cycle members): recall = required items named ÷ required items, precision = correct items ÷ items claimed, score = F1; test functions are optional (count neither way). Path answers: 1 if every required hop appears in order with no wrong hop, else 0. Accuracy = mean task score per variant. The exact scoring of each task set is pre-registered in its results document.
+- **Repeated runs (D-10):** when a gate is measured over several runs, accuracy is the mean over every task-run and the token ratio is the ratio of totals over the same task-runs; the number of runs and the rule are written down before the first of them, and no run is excluded.
 
 ## 9.3 Task selection `[DECIDED]`
 
@@ -631,6 +632,7 @@ Defaults chosen in v1.1. Each can be changed; the reason to revisit is listed.
 | D-6 | Protocol directive | opt-in (O-3, §15) | Adherence rate (§7.2) shows agents ignore it even when present |
 | D-7 | Cycle membership | SCC with more than one member, or a self-loop (§4.1.4) | — (matches `explore` today) |
 | D-8 | Architect shell access | read-only `okf-rs` subcommands and `git diff`/`git log` only (§6.3) | Read-only requirement for `diff` is confirmed, then add it |
+| D-10 | Repeated measurement (decided 2026-11-17 by the project owner) | P1.8 re-measured as 3 runs after receiver-type resolution; mean accuracy and ratio-of-totals tokens, rule pre-registered in `docs/benchmarks/agent-integration-p1-structural.md` | — |
 | D-9 | P1 gate (decided 2026-11-17 by the project owner) | Structural questions (UC-1S): accuracy against independent ground truth, then accuracy gain or token savings (§9.1). Replaces "≤ 1/3 files read" on "how does X work" questions | Evidence for the change: okf-rs run (files 0.46; floor 0.38 on that repo), Jujutsu run 1 (0.87, adherence 4/5), Jujutsu run 2 after the `explore` fix (1.23, tokens 2.3×). Revisit if structural answers turn out no better than grep's |
 
 ---

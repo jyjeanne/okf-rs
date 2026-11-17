@@ -95,3 +95,23 @@ Run 2026-11-17: okf-rs `881b196` (crates identical to `4e85e4c`), skill pack 1.3
 3. **Close the name-resolution gap, then re-run:** better receiver-aware resolution in the Rust extractor, or `--lsp` on repositories it is safe to build. S2 and half of S3 would then come from the graph instead of grep.
 
 Changing the criterion or the task weighting after seeing these results is not an option this document can take: a new criterion needs a new pre-registered task set.
+
+**Decision (2026-11-17, project owner):** option 3 — fix name resolution in the Rust extractor using the receiver's type, then repeat the run three times with the averaging rule written down before running.
+
+## Re-run after receiver-type resolution — pre-registration
+
+Committed before any of these runs.
+
+**What changes:** only okf-rs — build `b1b3d3a`, which resolves Rust method calls by their receiver's type (spec §14). On the target, the graph now lists all 23 callers of `Store::concurrency()` (S2) and the callers of `GitFetch::fetch`, so `plan-change` reaches all four commands of S3. Checked before pre-registering, by running the graph queries directly, not by running any agent session.
+
+**What stays the same:** target (`4351061bb`), the five questions, ground truth, scoring rules, and gate thresholds above; skill pack 1.3; model `claude-opus-5-5`; harness and isolation; one fresh setup (bundle regenerated with `b1b3d3a`) shared by the three runs.
+
+**Repetition and averaging rule:**
+
+1. **n = 3 runs.** Each run is the full set of 10 sessions (5 tasks × baseline/treatment), launched in parallel; the three runs are launched one after another.
+2. **Accuracy** per variant = mean task score over all 15 task-runs (5 tasks × 3 runs), each scored as above.
+3. **Token ratio** = total treatment tokens over the 15 task-runs ÷ total baseline tokens over the same 15 (ratio of totals, not mean of per-run ratios).
+4. **Gate** (thresholds unchanged): treatment accuracy ≥ 0.9, **and** either treatment accuracy ≥ baseline accuracy + 0.15, or token ratio ≤ 0.67 with treatment accuracy ≥ baseline accuracy − 0.05.
+5. **No exclusions.** A session that exits non-zero or produces no result is re-run once and the re-run noted; if it fails again, that task-run scores 0 and its recorded tokens count.
+6. **Reported alongside, not gated:** per-run token ratios and their spread, cost ratio, characters read, adherence.
+7. The first run above (`881b196`, before the fix) is not part of the average: it used a different build.
