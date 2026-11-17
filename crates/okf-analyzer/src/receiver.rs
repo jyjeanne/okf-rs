@@ -20,9 +20,16 @@
 //! Everything else keeps today's behavior. Type names are bare (no module
 //! path), so two project types sharing a name pool their facts; a lookup
 //! that becomes ambiguous that way simply doesn't resolve.
+//!
+//! Known limits (measured on Helix, `docs/benchmarks/agent-integration-p1-heldout.md`):
+//! a receiver bound through a macro (`let (view, doc) = current!(editor);`)
+//! gets no hint, so its calls keep name-only resolution; and because names
+//! are compared without their crate, a project type named like a
+//! third-party type it wraps (`Syntax` around `tree_house::Syntax`) is taken
+//! for it. [`is_self_recursion`] is deliberately stricter for that reason.
 
 use okf_parser::{Concept, ConceptKind};
-use okf_tree_sitter::{TypeFacts, TypeHint};
+use okf_tree_sitter::{CallCandidate, CallForm, TypeFacts, TypeHint};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Provenance recorded on an edge resolved by receiver type.
@@ -221,6 +228,27 @@ impl TypeIndex {
     }
 }
 
+/// Whether a call from a function to itself is recursion the syntax can
+/// vouch for: a plain `f(..)` call (not shadowed by a `use` inside the
+/// function), `self.f(..)`, or `Self::f(..)`.
+///
+/// A method call on any other value is recorded only between different
+/// functions. Inside `f`, `self.inner.f()` or `field.f()` is usually
+/// delegation to a wrapped value whose type merely shares a name with the
+/// caller's own (`Syntax` wrapping `tree_house::Syntax`), and type names are
+/// compared without their crate, so even a "same type" receiver can't be
+/// trusted. A module path (`fs::read(..)` inside `read`) names a different
+/// function. A call whose form the extractor didn't record
+/// ([`CallForm::Unknown`], every language but Rust so far) keeps those
+/// languages' earlier behavior of never drawing a self-edge from a name
+/// match.
+pub(crate) fn is_self_recursion(call: &CallCandidate) -> bool {
+    matches!(
+        call.form,
+        CallForm::Plain | CallForm::SelfMethod | CallForm::SelfPath
+    )
+}
+
 fn unique(set: Option<&BTreeSet<String>>) -> Option<String> {
     let set = set?;
     if set.len() == 1 {
@@ -406,6 +434,102 @@ pub fn caller(p: &Plain) {{ p.concurrency(); }}
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].target, "functions/src/Tuned/concurrency");
         assert_eq!(calls[0].resolved_by, RESOLVER);
+    }
+
+    fn is_self_call(calls: &[Relationship], own_id: &str) -> bool {
+        calls.iter().any(|r| r.target == own_id)
+    }
+
+    #[test]
+    fn self_recursion_is_recorded_when_the_syntax_vouches_for_it() {
+        // The Helix shape: `elaborate` is ambiguous by name (another type
+        // has an `elaborate` too), and `self.elaborate(..)` recurses.
+        let source = r#"
+pub struct Snippet;
+impl Snippet {
+    fn elaborate(&mut self, depth: u8) { if depth > 0 { self.elaborate(depth - 1); } }
+}
+pub struct TabstopIdx;
+impl TabstopIdx { fn elaborate(i: usize) -> Self { TabstopIdx } }
+pub fn fact(n: u64) -> u64 { if n == 0 { 1 } else { n * fact(n - 1) } }
+"#;
+        let elaborate = calls_of(source, "elaborate");
+        // `calls_of` finds the first concept named `elaborate`: Snippet's.
+        assert!(is_self_call(&elaborate, "functions/src/Snippet/elaborate"));
+        assert!(is_self_call(
+            &calls_of(source, "fact"),
+            "functions/src/fact"
+        ));
+    }
+
+    #[test]
+    fn delegation_and_module_paths_are_not_mistaken_for_recursion() {
+        let source = r#"
+pub struct Buffered<W> { writer: W }
+impl<W> Buffered<W> {
+    pub fn flush(&mut self) { self.writer.flush(); }
+}
+pub fn read(path: &str) -> Vec<u8> { std::fs::read(path).unwrap() }
+"#;
+        assert!(!is_self_call(
+            &calls_of(source, "flush"),
+            "functions/src/Buffered/flush"
+        ));
+        assert!(!is_self_call(
+            &calls_of(source, "read"),
+            "functions/src/read"
+        ));
+    }
+
+    #[test]
+    fn a_wrapper_delegating_to_a_same_named_wrapped_type_is_not_recursion() {
+        // Helix: `Syntax::layers_for_byte_range` calls
+        // `self.inner.layers_for_byte_range(..)` on a `tree_house::Syntax`.
+        let source = r#"
+pub struct Syntax { inner: tree_house::Syntax }
+impl Syntax {
+    pub fn layers_for_byte_range(&self) { self.inner.layers_for_byte_range(); }
+}
+"#;
+        assert!(!is_self_call(
+            &calls_of(source, "layers_for_byte_range"),
+            "functions/src/Syntax/layers_for_byte_range"
+        ));
+    }
+
+    #[test]
+    fn a_function_local_import_shadows_the_function_s_own_name() {
+        // Helix: a test named `symlink` that imports and calls
+        // `std::os::unix::fs::symlink`.
+        let source = r#"
+fn symlink() {
+    use std::os::unix::fs::symlink;
+    symlink("a", "b").unwrap();
+}
+"#;
+        assert!(!is_self_call(
+            &calls_of(source, "symlink"),
+            "functions/src/symlink"
+        ));
+    }
+
+    #[test]
+    fn a_self_path_call_is_recursion() {
+        let source = r#"
+pub struct Tree;
+impl Tree {
+    pub fn build(depth: u8) -> Self { if depth > 0 { Self::build(depth - 1) } else { Tree } }
+    pub fn rebuild(depth: u8) -> Self { if depth > 0 { Tree::rebuild(depth - 1) } else { Tree } }
+}
+"#;
+        assert!(is_self_call(
+            &calls_of(source, "build"),
+            "functions/src/Tree/build"
+        ));
+        assert!(is_self_call(
+            &calls_of(source, "rebuild"),
+            "functions/src/Tree/rebuild"
+        ));
     }
 
     #[test]

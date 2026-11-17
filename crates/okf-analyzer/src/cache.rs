@@ -23,8 +23,9 @@ use std::path::Path;
 /// extraction output changes (new fields, new tags, new facts): a cache
 /// written by an earlier build of the *same* okf-rs version would otherwise
 /// be reused, silently keeping the old extraction for every unchanged file.
-/// `extraction-2`: test tags and receiver-type facts.
-const CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+extraction-2");
+/// `extraction-2`: test tags and receiver-type facts. `extraction-3`: call
+/// forms (plain/method/path).
+const CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+extraction-3");
 
 /// A saved (or in-progress) cache, keyed by each file's project-relative
 /// path. Serializes with keys in sorted order (`BTreeMap`), so the cache

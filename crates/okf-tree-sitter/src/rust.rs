@@ -4,8 +4,8 @@ use crate::common::{
 };
 use crate::rust_types::{normalize_type, resolve_type_text, self_type, HintContext};
 use crate::{
-    AliasFact, CallCandidate, CallSite, FieldFact, FileExtraction, FunctionFact, MethodFact,
-    TypeFacts, TypeHint,
+    AliasFact, CallCandidate, CallForm, CallSite, FieldFact, FileExtraction, FunctionFact,
+    MethodFact, TypeFacts, TypeHint,
 };
 use anyhow::{Context, Result};
 use okf_parser::{Concept, ConceptKind, Language};
@@ -141,6 +141,77 @@ fn is_test_code(src: &str, function_node: Node) -> bool {
     false
 }
 
+/// The [`CallForm`] of the call whose callee name is `call_name`. Only the
+/// `Self*` forms and an unshadowed plain call let `okf-analyzer` record a
+/// function calling itself as recursion: `self.inner.f()` inside `f` is
+/// usually delegation to a wrapped value of another type, however its type
+/// is named.
+fn call_form(src: &str, call_name: Node) -> CallForm {
+    let Some(parent) = call_name.parent() else {
+        return CallForm::Plain;
+    };
+    match parent.kind() {
+        "field_expression" => match parent.child_by_field_name("value") {
+            Some(value) if value.kind() == "self" => CallForm::SelfMethod,
+            _ => CallForm::Method,
+        },
+        "scoped_identifier" => {
+            let path = parent
+                .child_by_field_name("path")
+                .map(|p| node_text(src, p).trim())
+                .unwrap_or("");
+            let own_type = self_type(src, parent);
+            if path == "Self" || (!path.contains("::") && own_type.as_deref() == Some(path)) {
+                CallForm::SelfPath
+            } else {
+                CallForm::Path
+            }
+        }
+        _ => {
+            if imported_in_enclosing_function(src, call_name, node_text(src, call_name)) {
+                CallForm::Path
+            } else {
+                CallForm::Plain
+            }
+        }
+    }
+}
+
+/// Whether a `use` declaration inside the function enclosing `node`
+/// mentions `name` (e.g. `use std::os::unix::fs::symlink;` inside a test
+/// named `symlink`), making a plain `name(..)` call refer to the import.
+fn imported_in_enclosing_function(src: &str, node: Node, name: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "function_item" {
+            let Some(body) = n.child_by_field_name("body") else {
+                return false;
+            };
+            let mut stack = vec![body];
+            while let Some(item) = stack.pop() {
+                if item.kind() == "use_declaration" {
+                    let text = node_text(src, item);
+                    let mentions = text
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .any(|word| word == name);
+                    if mentions {
+                        return true;
+                    }
+                }
+                let mut cursor = item.walk();
+                for child in item.named_children(&mut cursor) {
+                    if child.kind() != "function_item" {
+                        stack.push(child);
+                    }
+                }
+            }
+            return false;
+        }
+        current = n.parent();
+    }
+    false
+}
+
 fn type_signature(src: &str, def_node: Node) -> String {
     let text = node_text(src, def_node);
     text.split(['{', ';'])
@@ -170,7 +241,9 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
 
     let mut concepts: Vec<Concept> = Vec::new();
     let mut function_spans: Vec<(String, Range<usize>)> = Vec::new();
-    let mut raw_calls: Vec<(Range<usize>, String, CallSite, Option<TypeHint>)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut raw_calls: Vec<(Range<usize>, String, CallSite, Option<TypeHint>, CallForm)> =
+        Vec::new();
     let mut types = TypeFacts::default();
     let mut hints = HintContext::new(source);
 
@@ -387,23 +460,26 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         }
 
         if let Some(node) = call_name {
+            let form = call_form(source, node);
             raw_calls.push((
                 node.byte_range(),
                 node_text(source, node).to_string(),
                 lsp_position(source, node),
                 hints.receiver_hint(node),
+                form,
             ));
         }
     }
 
     let mut calls = Vec::new();
-    for (range, callee_name, call_site, receiver) in raw_calls {
+    for (range, callee_name, call_site, receiver, form) in raw_calls {
         if let Some(caller_id) = smallest_containing(&function_spans, range.start) {
             calls.push(CallCandidate {
                 caller_id: caller_id.to_string(),
                 callee_name,
                 call_site,
                 receiver,
+                form,
             });
         }
     }

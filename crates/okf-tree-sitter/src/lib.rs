@@ -61,6 +61,34 @@ pub struct CallCandidate {
     /// far.
     #[serde(default)]
     pub receiver: Option<TypeHint>,
+    /// The call's syntactic form, which decides whether a call from a
+    /// function to a same-named function can be trusted as recursion (see
+    /// [`CallForm`]). [`CallForm::Unknown`] for languages whose extractor
+    /// doesn't record it.
+    #[serde(default)]
+    pub form: CallForm,
+}
+
+/// How a call is written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallForm {
+    /// Not recorded (every extractor but Rust's, so far).
+    #[default]
+    Unknown,
+    /// `f(..)`, where `f` isn't imported by a `use` inside the calling
+    /// function (such a call is recorded as [`CallForm::Path`]).
+    Plain,
+    /// `self.f(..)`.
+    SelfMethod,
+    /// `x.f(..)` on anything but `self`.
+    Method,
+    /// `Self::f(..)`, or `Type::f(..)` with the enclosing impl's own type
+    /// as a single-segment path.
+    SelfPath,
+    /// Any other path call (`a::b::f(..)`, `OtherType::f(..)`), or a plain
+    /// call to a name imported inside the calling function.
+    Path,
 }
 
 /// A description of an expression's type, as far as one file's syntax

@@ -444,7 +444,7 @@ fn split_ambiguous_calls(
                     .filter(|id| types.accepts(id, ty))
                     .collect();
                 if let [callee] = matching.as_slice() {
-                    if **callee != call.caller_id {
+                    if **callee != call.caller_id || receiver::is_self_recursion(call) {
                         resolved_edges.push(ResolvedEdge {
                             caller: call.caller_id.clone(),
                             callee: callee.to_string(),
@@ -462,7 +462,7 @@ fn split_ambiguous_calls(
             continue;
         }
         let callee_id = candidates[0].to_string();
-        if callee_id != call.caller_id {
+        if callee_id != call.caller_id || receiver::is_self_recursion(call) {
             resolved_edges.push(ResolvedEdge {
                 caller: call.caller_id.clone(),
                 callee: callee_id,
@@ -1426,6 +1426,7 @@ mod tests {
                 caller_id: caller_id.to_string(),
                 callee_name: callee_name.to_string(),
                 receiver: None,
+                form: Default::default(),
                 call_site: okf_tree_sitter::CallSite {
                     line: 0,
                     character: 0,
@@ -1499,7 +1500,9 @@ mod tests {
     }
 
     #[test]
-    fn split_ambiguous_calls_does_not_resolve_a_call_to_itself() {
+    fn split_ambiguous_calls_does_not_resolve_a_call_to_itself_of_unknown_form() {
+        // Languages whose extractor records no call form keep the earlier
+        // rule: never a self-edge from a name match.
         let mut recursive = make_concept("functions/recursive", "fn recursive()");
         recursive.name = "recursive".to_string();
         let concepts = vec![recursive];
@@ -1511,6 +1514,26 @@ mod tests {
 
         assert!(resolved.is_empty());
         assert!(ambiguous.is_empty());
+    }
+
+    #[test]
+    fn split_ambiguous_calls_records_a_plain_recursive_call() {
+        let mut recursive = make_concept("functions/recursive", "fn recursive()");
+        recursive.name = "recursive".to_string();
+        let concepts = vec![recursive];
+        let symbol_table = build_symbol_table(&concepts);
+        let mut plain = call("functions/recursive", "recursive");
+        plain.0.form = okf_tree_sitter::CallForm::Plain;
+
+        let (resolved, _) = split_ambiguous_calls(
+            &[plain],
+            &symbol_table,
+            &receiver::TypeIndex::default(),
+            true,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].caller, resolved[0].callee);
     }
 
     #[test]

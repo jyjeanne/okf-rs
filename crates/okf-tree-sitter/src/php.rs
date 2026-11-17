@@ -214,6 +214,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         if let Some(caller_id) = smallest_containing(&function_spans, range.start) {
             calls.push(CallCandidate {
                 receiver: None,
+                form: Default::default(),
                 caller_id: caller_id.to_string(),
                 callee_name,
                 call_site,
