@@ -23,7 +23,8 @@
 | Prerequisite: stale files | Done — `generate`/`watch` remove files an earlier run wrote for concepts that no longer exist (`d6a1bd7`) | `crates/okf-generator/src/lib.rs` |
 | P2.1 skills | Done — `okf-impact`, `okf-refactor`, `okf-graph-validation` (pack 1.4) | `examples/agent-workflow/.claude/skills/` |
 | P2.2 agents | Done for Claude Code, verified in real sessions (architect: question and refactor plan; reviewer; developer under `--agent`, both protocol steps). OpenCode files follow the V2 docs, not run (OpenCode not installed). Findings: `Bash(<pattern>)` in a subagent's `tools` doesn't limit the shell, so read-only Bash comes from `.claude/settings.json` allow rules; O-5 answered from docs; O-6 closed (`diff` = `impact` = `review` worktree mechanism) | `examples/agent-workflow/.claude/agents/`, `.opencode/agents/`, spec §6.3, §6.5 |
-| P2.3 measurement | Not started. Two graph limits found in P2.2 bear on it: `diff`/`impact` don't see body-only edits (so `A` can't come from `impact` alone), and Rust calls inside macro arguments are not extracted (callers and tests reached through `assert_eq!`/`format!` are missing from `P`) | — |
+| Prerequisite: macro calls, call forms | Done — Rust calls inside `name!(..)`/`name![..]` arguments are extracted; method calls no longer resolve to free functions (nor plain calls to methods). Spot checks: 10/10 removed edges false, 24/26 added edges correct (spec §14) | `crates/okf-tree-sitter/src/rust.rs`, `crates/okf-analyzer/src/{lib,receiver}.rs` |
+| P2.3 measurement | Not started. `diff`/`impact` don't see body-only edits, so `A` can't come from `impact` alone: needs a decision before pre-registration | — |
 
 **Unplanned fix in P1.5.** `okf-rs init` overwrote `okf.toml` with only its `output` line, dropping `[diff]` and (now) `[agents]` on every re-run, which would have made the opt-in directive disappear. `config::write_default` now replaces only the top-level `output` line of an existing file.
 

@@ -76,6 +76,8 @@ pub(crate) struct TypeIndex {
     aliases: HashMap<String, BTreeSet<String>>,
     /// Every type name the project defines or implements methods for.
     project_types: HashSet<String>,
+    /// Function and method concept id → its kind, for [`TypeIndex::form_allows`].
+    callable_kinds: HashMap<String, ConceptKind>,
 }
 
 impl TypeIndex {
@@ -87,6 +89,11 @@ impl TypeIndex {
     ) -> Self {
         let mut index = TypeIndex::default();
         for concept in concepts {
+            if matches!(concept.kind, ConceptKind::Function | ConceptKind::Method) {
+                index
+                    .callable_kinds
+                    .insert(concept.id.clone(), concept.kind);
+            }
             if matches!(
                 concept.kind,
                 ConceptKind::Struct
@@ -225,6 +232,22 @@ impl TypeIndex {
     /// methods are never project concepts.
     pub(crate) fn is_external(&self, ty: &str) -> bool {
         !self.project_types.contains(ty)
+    }
+
+    /// Whether a call written in `form` can name the concept `id` at all.
+    /// The syntax settles it in Rust: `x.f()` and `self.f()` only ever call
+    /// a method, and a bare `f()` never does — so a `.clone()` call is
+    /// never drawn to a free function named `clone`, and a free function
+    /// and a method sharing a name don't make each other's calls
+    /// ambiguous. Path calls (`Type::f()`, `module::f()`) may name either,
+    /// and a call of unknown form (every language but Rust) or a concept
+    /// the index doesn't know is never filtered out.
+    pub(crate) fn form_allows(&self, form: CallForm, id: &str) -> bool {
+        match (form, self.callable_kinds.get(id)) {
+            (CallForm::Method | CallForm::SelfMethod, Some(kind)) => *kind == ConceptKind::Method,
+            (CallForm::Plain, Some(kind)) => *kind == ConceptKind::Function,
+            _ => true,
+        }
     }
 }
 

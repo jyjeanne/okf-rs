@@ -26,6 +26,14 @@ const QUERY_SRC: &str = r#"
 (type_item name: (type_identifier) @alias.name type: (_) @alias.type) @alias.def
 "#;
 
+/// The call patterns of [`QUERY_SRC`] alone, for the re-parse of macro
+/// arguments in [`macro_calls`].
+const CALL_QUERY_SRC: &str = r#"
+(call_expression function: (identifier) @call.name) @call.def
+(call_expression function: (field_expression field: (field_identifier) @call.name)) @call.def
+(call_expression function: (scoped_identifier name: (identifier) @call.name)) @call.def
+"#;
+
 /// The container a method belongs to: the `Self` type, plus the trait
 /// being implemented if this is a trait impl (as opposed to an inherent
 /// impl or a default trait-method body).
@@ -210,6 +218,147 @@ fn imported_in_enclosing_function(src: &str, node: Node, name: &str) -> bool {
         current = n.parent();
     }
     false
+}
+
+/// A macro invocation whose arguments can be read as an expression list:
+/// `name!(..)` or `name![..]`, at any nesting depth. Tree-sitter keeps a
+/// macro's arguments as a flat token tree, so the calls in
+/// `format!("{}", run(x))` or `assert_eq!(f(), 2)` are invisible to the call
+/// patterns until the invocation is rewritten (see [`macro_calls`]).
+struct MacroArgs {
+    /// Byte range of the macro's name, which is not a call.
+    name: Range<usize>,
+    bang: usize,
+    open: usize,
+    close: usize,
+}
+
+/// Every `name!(..)`/`name![..]` invocation under `node`, including ones
+/// nested inside another invocation's arguments (which tree-sitter leaves
+/// as `identifier`, `!`, token-tree siblings rather than an invocation
+/// node). Brace-delimited invocations (`quote! { .. }`, `select! { .. }`)
+/// are skipped: their contents are usually items or a DSL, not expressions.
+fn collect_macro_args(node: Node, out: &mut Vec<MacroArgs>) {
+    if node.kind() == "macro_invocation" {
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        if let [.., name, bang, tree] = children.as_slice() {
+            push_macro_args(*name, *bang, *tree, out);
+        }
+        return;
+    }
+    if node.kind() == "token_tree" {
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        for (i, child) in children.iter().enumerate() {
+            if matches!(child.kind(), "token_tree" | "macro_invocation") {
+                collect_macro_args(*child, out);
+            }
+            if let [name, bang, tree] = &children[i..children.len().min(i + 3)] {
+                if name.kind() == "identifier" && bang.kind() == "!" {
+                    push_macro_args(*name, *bang, *tree, out);
+                }
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_macro_args(child, out);
+    }
+}
+
+fn push_macro_args(name: Node, bang: Node, tree: Node, out: &mut Vec<MacroArgs>) {
+    if bang.kind() != "!" || tree.kind() != "token_tree" {
+        return;
+    }
+    // `std::format!`: the call-like name is the last segment.
+    let name = if name.kind() == "scoped_identifier" {
+        name.child_by_field_name("name").unwrap_or(name)
+    } else {
+        name
+    };
+    let last = u32::try_from(tree.child_count().saturating_sub(1)).unwrap_or(0);
+    let (Some(open), Some(close)) = (tree.child(0), tree.child(last)) else {
+        return;
+    };
+    if !matches!((open.kind(), close.kind()), ("(", ")") | ("[", "]")) {
+        return;
+    }
+    out.push(MacroArgs {
+        name: name.byte_range(),
+        bang: bang.start_byte(),
+        open: open.start_byte(),
+        close: close.start_byte(),
+    });
+    // The arguments may themselves hold nested invocations.
+    collect_macro_args(tree, out);
+}
+
+/// The calls written inside macro arguments, as
+/// `(name range, callee name, call site, receiver, form)` like the calls
+/// from the main query. `source` is re-parsed once with every invocation
+/// from [`collect_macro_args`] rewritten in place — `name!(a, b)` becomes
+/// `name (a, b)` and `name![a, b]` becomes `name (a, b)` — which keeps every
+/// byte offset (so locations, call sites, and enclosing functions are
+/// exact) and turns the arguments into ordinary expressions. Only calls
+/// inside a rewritten argument list are returned, never the macro names.
+#[allow(clippy::type_complexity)]
+fn macro_calls(
+    source: &str,
+    root: Node,
+    ts_lang: &tree_sitter::Language,
+) -> Result<Vec<(Range<usize>, String, CallSite, Option<TypeHint>, CallForm)>> {
+    let mut invocations = Vec::new();
+    collect_macro_args(root, &mut invocations);
+    if invocations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut bytes = source.as_bytes().to_vec();
+    for m in &invocations {
+        bytes[m.bang] = b' ';
+        bytes[m.open] = b'(';
+        bytes[m.close] = b')';
+    }
+    // Only ASCII bytes were replaced by ASCII bytes.
+    let rewritten = String::from_utf8(bytes).context("macro rewrite broke UTF-8")?;
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(ts_lang)
+        .context("failed to load Rust grammar")?;
+    let tree = parser
+        .parse(&rewritten, None)
+        .context("failed to parse rewritten Rust source")?;
+    let query = Query::new(ts_lang, CALL_QUERY_SRC).context("invalid Rust call query")?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), rewritten.as_bytes());
+    let mut hints = HintContext::new(&rewritten);
+    let mut calls = Vec::new();
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if query.capture_names()[cap.index as usize] != "call.name" {
+                continue;
+            }
+            let node = cap.node;
+            let start = node.start_byte();
+            let inside = invocations
+                .iter()
+                .any(|m| m.open < start && start < m.close);
+            let is_macro_name = invocations.iter().any(|m| m.name == node.byte_range());
+            if !inside || is_macro_name {
+                continue;
+            }
+            calls.push((
+                node.byte_range(),
+                node_text(&rewritten, node).to_string(),
+                lsp_position(&rewritten, node),
+                hints.receiver_hint(node),
+                call_form(&rewritten, node),
+            ));
+        }
+    }
+    Ok(calls)
 }
 
 fn type_signature(src: &str, def_node: Node) -> String {
@@ -470,6 +619,8 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
             ));
         }
     }
+
+    raw_calls.extend(macro_calls(source, tree.root_node(), &ts_lang)?);
 
     let mut calls = Vec::new();
     for (range, callee_name, call_site, receiver, form) in raw_calls {
@@ -875,5 +1026,129 @@ fn make() -> Option<Box<Store>> { None }
                 target: Some("Store".into())
             }]
         );
+    }
+}
+
+#[cfg(test)]
+mod macro_call_tests {
+    use super::*;
+
+    fn calls_of(src: &str) -> Vec<(String, String, CallForm)> {
+        let extraction = extract(src, "src/lib.rs").unwrap();
+        let mut calls: Vec<_> = extraction
+            .calls
+            .iter()
+            .map(|c| {
+                let caller = c.caller_id.rsplit('/').next().unwrap().to_string();
+                (caller, c.callee_name.clone(), c.form)
+            })
+            .collect();
+        calls.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        calls
+    }
+
+    #[test]
+    fn reads_calls_inside_macro_arguments() {
+        let src = r#"
+pub fn report(path: &str) -> String {
+    format!("{} items", run(path))
+}
+fn values() -> Vec<usize> {
+    vec![one(), two()]
+}
+#[test]
+fn run_counts() {
+    assert_eq!(run("a"), 2);
+}
+"#;
+        let calls = calls_of(src);
+        let names: Vec<_> = calls
+            .iter()
+            .map(|(c, n, _)| (c.as_str(), n.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("report", "run"),
+                ("run_counts", "run"),
+                ("values", "one"),
+                ("values", "two"),
+            ],
+            "macro names (format, vec, assert_eq) must not be calls"
+        );
+        assert!(calls.iter().all(|(_, _, form)| *form == CallForm::Plain));
+    }
+
+    #[test]
+    fn reads_calls_in_nested_and_scoped_macros() {
+        let src = r#"
+fn check() {
+    assert_eq!(std::format!("{}", helper(1)), "2");
+    assert!(matches!(parse(), Some(_)));
+}
+"#;
+        let names: Vec<_> = calls_of(src).into_iter().map(|(_, n, _)| n).collect();
+        // `Some(_)` reads as a constructor call, exactly as `Some(x)` does in
+        // ordinary code; no concept has that name, so it never resolves.
+        assert_eq!(names, ["Some", "helper", "parse"]);
+    }
+
+    #[test]
+    fn macro_method_calls_keep_their_receiver_type() {
+        let src = r#"
+pub struct Store { items: Vec<String> }
+impl Store {
+    fn count(&self) -> usize { self.items.len() }
+    fn show(&self) { println!("{}", self.count()); }
+    fn other(store: &Store) { println!("{}", store.count()); }
+}
+"#;
+        let extraction = extract(src, "src/lib.rs").unwrap();
+        let in_macros: Vec<_> = extraction
+            .calls
+            .iter()
+            .filter(|c| c.callee_name == "count")
+            .map(|c| {
+                (
+                    c.caller_id.rsplit('/').next().unwrap(),
+                    c.form,
+                    c.receiver.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            in_macros,
+            [
+                (
+                    "show",
+                    CallForm::SelfMethod,
+                    Some(TypeHint::Named("Store".into()))
+                ),
+                (
+                    "other",
+                    CallForm::Method,
+                    Some(TypeHint::Named("Store".into()))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn macro_call_sites_point_into_the_original_source() {
+        let src = "fn report() -> String {\n    format!(\"{}\", run(1))\n}\n";
+        let extraction = extract(src, "src/lib.rs").unwrap();
+        let call = extraction
+            .calls
+            .iter()
+            .find(|c| c.callee_name == "run")
+            .unwrap();
+        // `run` starts at line 1 (0-based), column 18.
+        assert_eq!((call.call_site.line, call.call_site.character), (1, 18));
+    }
+
+    #[test]
+    fn brace_delimited_macros_are_not_read() {
+        let src = "fn f() { my_dsl! { g() } }\n";
+        assert!(calls_of(src).is_empty());
     }
 }

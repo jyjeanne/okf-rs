@@ -425,9 +425,18 @@ fn split_ambiguous_calls(
     let mut resolved_edges = Vec::new();
     let mut ambiguous_indices = Vec::new();
     for (i, (call, _, _)) in calls.iter().enumerate() {
-        let Some(candidates) = symbol_table.get(call.callee_name.as_str()) else {
+        let Some(named) = symbol_table.get(call.callee_name.as_str()) else {
             continue;
         };
+        // `x.f()` can't call a free function, nor `f()` a method.
+        let candidates: Vec<&str> = named
+            .iter()
+            .copied()
+            .filter(|id| types.form_allows(call.form, id))
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
         let receiver_type = call.receiver.as_ref().and_then(|hint| types.resolve(hint));
         if receiver_type
             .as_deref()
@@ -439,12 +448,13 @@ fn split_ambiguous_calls(
         }
         if candidates.len() != 1 {
             if let Some(ty) = receiver_type.as_deref() {
-                let matching: Vec<&&str> = candidates
+                let matching: Vec<&str> = candidates
                     .iter()
+                    .copied()
                     .filter(|id| types.accepts(id, ty))
                     .collect();
                 if let [callee] = matching.as_slice() {
-                    if **callee != call.caller_id || receiver::is_self_recursion(call) {
+                    if *callee != call.caller_id || receiver::is_self_recursion(call) {
                         resolved_edges.push(ResolvedEdge {
                             caller: call.caller_id.clone(),
                             callee: callee.to_string(),
@@ -1534,6 +1544,40 @@ mod tests {
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].caller, resolved[0].callee);
+    }
+
+    #[test]
+    fn a_method_call_never_resolves_to_a_free_function_nor_a_plain_call_to_a_method() {
+        use okf_tree_sitter::CallForm;
+        let mut clone_fn = make_concept("functions/testutils/clone", "fn clone(dest: &Path)");
+        clone_fn.name = "clone".to_string();
+        let mut get_fn = make_concept("functions/get", "fn get()");
+        get_fn.name = "get".to_string();
+        let mut get_method = make_concept("functions/Foo/get", "fn get(&self)");
+        get_method.kind = ConceptKind::Method;
+        get_method.name = "get".to_string();
+        let concepts = vec![clone_fn, get_fn, get_method];
+        let symbol_table = build_symbol_table(&concepts);
+        let types = receiver::TypeIndex::new(std::iter::empty(), &concepts);
+        let with_form = |name: &str, form: CallForm| {
+            let mut c = call("functions/caller", name);
+            c.0.form = form;
+            c
+        };
+        let calls = vec![
+            with_form("clone", CallForm::Method),
+            with_form("get", CallForm::Plain),
+            with_form("get", CallForm::Method),
+            with_form("get", CallForm::Path),
+        ];
+
+        let (resolved, ambiguous) = split_ambiguous_calls(&calls, &symbol_table, &types, true);
+
+        let callees: Vec<&str> = resolved.iter().map(|e| e.callee.as_str()).collect();
+        // `x.clone()` has no candidate; `get()` and `x.get()` each have one;
+        // `Foo::get()`/`module::get()` could be either, so stays ambiguous.
+        assert_eq!(callees, ["functions/get", "functions/Foo/get"]);
+        assert_eq!(ambiguous, vec![3]);
     }
 
     #[test]

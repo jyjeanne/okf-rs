@@ -16,7 +16,7 @@ Skills and conventions that make a coding agent (Claude Code, OpenCode) query th
 | `.claude/settings.json` | Allow rules for the read-only `okf-rs` and `git` commands the agents use |
 | `.opencode/agents/` | The same three agents for OpenCode, with `permissions` rules (V2 schema) |
 
-**What the graph does not see.** `okf-rs diff`, `impact`, `review`, and `generate --check-fresh` compare signatures, call edges, and line ranges. An edit inside a function body that changes no call is "no concept-level change" to them, so the skills take edited concepts from `git diff` hunks. The Rust extractor also reads no calls inside macro arguments (`format!(.., run(x))`, `assert_eq!(run(x), ..)`), so a caller or test that reaches a function only through a macro is missing from `plan-change`.
+**What the graph does not see.** `okf-rs diff`, `impact`, `review`, and `generate --check-fresh` compare signatures, call edges, and line ranges. An edit inside a function body that changes no call is "no concept-level change" to them, so the skills take edited concepts from `git diff` hunks. The Rust extractor reads calls inside `name!(..)`/`name![..]` macro arguments (so `assert_eq!(run(x), ..)` makes the test a caller of `run`), but not inside brace-delimited macros (`select! { .. }`); a caller or test that reaches a function only through one of those is missing from `plan-change`.
 
 **Tested with:** Claude Code 2.1.326 — every agent and skill run in a real headless session on 2026-11-17 (spec §6.5 lists what each session showed). OpenCode — the files follow the V2 documentation (`permissions`, `shell`, `steps`) but have not been run in an OpenCode session yet.
 
