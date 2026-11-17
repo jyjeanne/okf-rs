@@ -1928,11 +1928,14 @@ fn standalone_binary_reports_a_clear_error_when_no_bundle_exists_yet() {
 
 /// Writes the small Rust project `graph plan-change`'s golden test runs
 /// against: `login` (public) calls `authenticate` (public), which calls
-/// `verify_password`; `test_login` (an inline test, matched by
-/// `symbol_pattern`) and `handle_callback` (another module) call `login`;
-/// `tests/login.rs`'s `login_flow` (matched by `path_segment`) calls it
-/// too. Written from the test rather than checked in, so this repo's own
-/// bundle never picks up the fixture's `Cargo.toml` as a package.
+/// `verify_password`; `test_login` (matched by `symbol_pattern`),
+/// `handle_callback` (another module), and
+/// `tests::login_accepts_a_known_user` (a `#[test]` in a `#[cfg(test)]`
+/// module, matched by `tag` through the Rust extractor's test tag) call
+/// `login`; `tests/login.rs`'s `login_flow` (matched by `path_segment`)
+/// calls it too. Written from the test rather than checked in, so this
+/// repo's own bundle never picks up the fixture's `Cargo.toml` as a
+/// package.
 fn write_plan_change_fixture(project: &Path) {
     let files = [
         (
@@ -1942,7 +1945,7 @@ fn write_plan_change_fixture(project: &Path) {
         ("src/lib.rs", "pub mod auth;\npub mod oauth;\n"),
         (
             "src/auth.rs",
-            "pub fn authenticate(user: &str) -> bool {\n    verify_password(user)\n}\n\nfn verify_password(user: &str) -> bool {\n    !user.is_empty()\n}\n\npub fn login(user: &str) -> bool {\n    authenticate(user)\n}\n\nfn test_login() {\n    login(\"alice\");\n}\n",
+            "pub fn authenticate(user: &str) -> bool {\n    verify_password(user)\n}\n\nfn verify_password(user: &str) -> bool {\n    !user.is_empty()\n}\n\npub fn login(user: &str) -> bool {\n    authenticate(user)\n}\n\nfn test_login() {\n    login(\"alice\");\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn login_accepts_a_known_user() {\n        let ok = super::login(\"carol\");\n        assert!(ok);\n    }\n}\n",
         ),
         (
             "src/oauth.rs",

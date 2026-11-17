@@ -356,12 +356,18 @@ fn unknown_id_error(concepts: &[Concept], id: &str) -> Error {
     anyhow!(message)
 }
 
-/// The three test-detection rules of spec §4.1.5, in reporting order.
+/// The tag an extractor puts on test code (`okf_tree_sitter`'s Rust
+/// extractor tags `#[test]`-style functions and everything inside a
+/// `#[cfg(test)]` module with it).
+const TEST_TAG: &str = "test";
+
+/// The four test-detection rules of spec §4.1.5, in reporting order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum TestRule {
     PathSegment,
     NamePattern,
     SymbolPattern,
+    Tag,
 }
 
 impl TestRule {
@@ -370,6 +376,7 @@ impl TestRule {
             TestRule::PathSegment => "path_segment",
             TestRule::NamePattern => "name_pattern",
             TestRule::SymbolPattern => "symbol_pattern",
+            TestRule::Tag => "tag",
         }
     }
 }
@@ -398,6 +405,9 @@ fn test_rules(concept: &Concept) -> Vec<TestRule> {
     }
     if matches_test_symbol(concept) {
         rules.push(TestRule::SymbolPattern);
+    }
+    if concept.tags.iter().any(|tag| tag == TEST_TAG) {
+        rules.push(TestRule::Tag);
     }
     rules
 }
@@ -448,7 +458,7 @@ fn test_limits(matched: &BTreeSet<TestRule>) -> Vec<String> {
     vec![
         first,
         "tests reached only through mocks, dynamic dispatch, or separate binaries are not Calls edges and are not listed".to_string(),
-        "test functions declared inline in source files (e.g. Rust #[cfg(test)] modules) are recognized only if their name or file matches a rule".to_string(),
+        "test functions declared inline in source files are recognized only when the extractor tags them (Rust: #[test]-style attributes and #[cfg(test)] modules) or their name or file matches a rule".to_string(),
     ]
 }
 
@@ -561,17 +571,21 @@ fn recommended_inspection(plan: &PlanChange, graph: &okf_graph::Graph<'_>) -> Ve
     if let [only] = plan.direct_callers.as_slice() {
         push(&mut out, only, "sole direct caller");
     }
+    // Rules 3 and 4 skip test concepts: they already have their own
+    // `tests` field, and on a well-tested codebase they would otherwise
+    // fill every slot and crowd out the production callers.
+    let is_test = |id: &String| plan.tests.binary_search(id).is_ok();
     // Rule 3: indirect callers in another module (owning modules compared
     // as optional values: both absent counts as the same module).
     let target_module = plan.target.module.as_deref();
-    for caller in &plan.indirect_callers {
+    for caller in plan.indirect_callers.iter().filter(|c| !is_test(c)) {
         let module = graph.owning_module(caller).map(|m| m.id.as_str());
         if module != target_module {
             push(&mut out, caller, "indirect caller in another module");
         }
     }
     // Rule 4: remaining direct callers.
-    for caller in &plan.direct_callers {
+    for caller in plan.direct_callers.iter().filter(|c| !is_test(c)) {
         push(&mut out, caller, "direct caller");
     }
     out
@@ -859,6 +873,71 @@ mod tests {
             p.limits[0],
             "tests: heuristic (no affected concept matched a test rule)"
         );
+    }
+
+    #[test]
+    fn tests_are_not_recommended_for_inspection_by_rules_3_and_4() {
+        // `t` has two direct callers (so rule 2 doesn't apply): a test and
+        // a production function; another-module callers of `prod` are one
+        // test and one production function.
+        let mut concepts = vec![
+            module("modules/a", "src/a.rs"),
+            module("modules/b", "src/b.rs"),
+            func("functions/t", "src/a.rs", false),
+            func("functions/prod", "src/a.rs", false),
+            func("functions/unit", "src/a.rs", false),
+            func("functions/remote_prod", "src/b.rs", false),
+            func("functions/remote_test", "src/b.rs", false),
+        ];
+        concepts[4].tags.push("test".to_string());
+        concepts[6].tags.push("test".to_string());
+        call(&mut concepts, "functions/prod", "functions/t");
+        call(&mut concepts, "functions/unit", "functions/t");
+        call(&mut concepts, "functions/remote_prod", "functions/prod");
+        call(&mut concepts, "functions/remote_test", "functions/prod");
+        let p = plan(&concepts, "functions/t");
+        assert_eq!(p.tests, vec!["functions/remote_test", "functions/unit"]);
+        assert_eq!(
+            p.recommended_inspection,
+            vec![
+                Inspection {
+                    reference: "functions/remote_prod".into(),
+                    reason: "indirect caller in another module"
+                },
+                Inspection {
+                    reference: "functions/prod".into(),
+                    reason: "direct caller"
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sole_direct_caller_is_recommended_even_when_it_is_a_test() {
+        let mut concepts = vec![
+            func("functions/t", "src/t.rs", false),
+            func("functions/only_test", "src/t.rs", false),
+        ];
+        concepts[1].tags.push("test".to_string());
+        call(&mut concepts, "functions/only_test", "functions/t");
+        let p = plan(&concepts, "functions/t");
+        assert_eq!(p.recommended_inspection[0].reason, "sole direct caller");
+    }
+
+    #[test]
+    fn a_concept_tagged_test_is_recognized_by_the_tag_rule() {
+        // An inline Rust unit test: ordinary name, ordinary file, but the
+        // extractor tagged it.
+        let mut concepts = vec![
+            func("functions/t", "src/lib.rs", false),
+            func("functions/parses_input", "src/lib.rs", false),
+        ];
+        concepts[1].tags.push("test".to_string());
+        call(&mut concepts, "functions/parses_input", "functions/t");
+        let p = plan(&concepts, "functions/t");
+        assert_eq!(p.tests, vec!["functions/parses_input"]);
+        assert_eq!(p.limits[0], "tests: heuristic (rules: tag)");
+        assert!(!signal_names(&p).contains(&"no_test_reaches_target"));
     }
 
     #[test]

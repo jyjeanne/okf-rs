@@ -64,6 +64,76 @@ fn container_name<'a>(src: &'a str, function_node: Node) -> Option<Container<'a>
     }
 }
 
+/// Tag given to Rust functions and methods that are test code (see
+/// [`is_test_code`]). Consumers such as `okf_query::plan_change` read it
+/// to tell tests apart from the code they exercise — inline unit tests
+/// otherwise look like any private function in the bundle.
+pub const TEST_TAG: &str = "test";
+
+/// The `#[...]` attributes written directly before `node`, nearest first.
+/// In tree-sitter-rust, outer attributes are `attribute_item` siblings
+/// preceding the item, possibly with doc or line comments between them.
+fn preceding_attributes(node: Node) -> Vec<Node> {
+    let mut attributes = Vec::new();
+    let mut current = node.prev_sibling();
+    while let Some(sibling) = current {
+        match sibling.kind() {
+            "attribute_item" => attributes.push(sibling),
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        current = sibling.prev_sibling();
+    }
+    attributes
+}
+
+/// An attribute's text with all whitespace removed, e.g. `#[tokio::test]`.
+fn compact_attribute(src: &str, attribute: Node) -> String {
+    node_text(src, attribute)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// `#[test]`, any attribute whose path ends in `::test` (`#[tokio::test]`,
+/// `#[async_std::test]`, `#[sqlx::test]`, ...), `#[rstest]`, or
+/// `#[test_case(...)]`. Arguments are ignored.
+fn is_test_attribute(compact: &str) -> bool {
+    let inner = compact
+        .strip_prefix("#[")
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(compact);
+    let path = inner.split('(').next().unwrap_or(inner);
+    let last = path.rsplit("::").next().unwrap_or(path);
+    matches!(last, "test" | "rstest" | "test_case")
+}
+
+/// Whether `function_node` is test code: it carries a test attribute (see
+/// [`is_test_attribute`]), or it is declared, at any depth, inside a module
+/// marked exactly `#[cfg(test)]`. Compound conditions (`cfg(all(test, ..))`)
+/// and a test module kept in its own file (`#[cfg(test)] mod tests;`) are
+/// not recognized: the attribute isn't visible from the file being parsed.
+fn is_test_code(src: &str, function_node: Node) -> bool {
+    let tested = preceding_attributes(function_node)
+        .into_iter()
+        .any(|a| is_test_attribute(&compact_attribute(src, a)));
+    if tested {
+        return true;
+    }
+    let mut ancestor = function_node.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "mod_item"
+            && preceding_attributes(node)
+                .into_iter()
+                .any(|a| compact_attribute(src, a) == "#[cfg(test)]")
+        {
+            return true;
+        }
+        ancestor = node.parent();
+    }
+    false
+}
+
 fn type_signature(src: &str, def_node: Node) -> String {
     let text = node_text(src, def_node);
     text.split(['{', ';'])
@@ -209,7 +279,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                     format!("{}.{}", module, fn_name_text),
                 ),
             };
-            let concept = make_concept(
+            let mut concept = make_concept(
                 kind,
                 Language::Rust,
                 fn_name_text,
@@ -218,6 +288,9 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 Some(signature_before_body(source, def)),
                 fn_vis.is_some(),
             );
+            if is_test_code(source, def) {
+                concept.tags.push(TEST_TAG.to_string());
+            }
             function_spans.push((concept.id.clone(), def.byte_range()));
             concepts.push(concept);
         }
@@ -391,5 +464,96 @@ impl Public {
         assert!(!find("private_fn").is_public);
         assert!(find("pub_method").is_public);
         assert!(!find("priv_method").is_public);
+    }
+
+    #[test]
+    fn tags_test_functions_and_everything_inside_cfg_test_modules() {
+        let src = r#"
+pub fn production() {}
+
+#[inline]
+fn not_a_test() {}
+
+#[test]
+fn plain_test() {}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn async_test() {}
+
+#[rstest]
+fn parameterized() {}
+
+#[test]
+/// A doc comment between the attribute and the function.
+fn documented_test() {}
+
+#[cfg(test)]
+mod tests {
+    fn helper() {}
+
+    struct Fixture;
+    impl Fixture {
+        fn build() -> Self { Fixture }
+    }
+
+    mod nested {
+        fn deep_helper() {}
+    }
+}
+
+#[cfg(not(test))]
+mod real {
+    fn only_in_production() {}
+}
+"#;
+        let extraction = extract(src, "src/lib.rs").unwrap();
+        let tagged = |name: &str| {
+            extraction
+                .concepts
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no concept named {name}"))
+                .tags
+                .contains(&TEST_TAG.to_string())
+        };
+
+        for name in [
+            "plain_test",
+            "async_test",
+            "parameterized",
+            "documented_test",
+            "helper",
+            "build",
+            "deep_helper",
+        ] {
+            assert!(tagged(name), "{name} should be tagged as test code");
+        }
+        for name in ["production", "not_a_test", "only_in_production"] {
+            assert!(!tagged(name), "{name} should not be tagged");
+        }
+        // Types are never tagged, even inside a test module.
+        assert!(!tagged("Fixture"));
+    }
+
+    #[test]
+    fn test_attribute_paths() {
+        for yes in [
+            "#[test]",
+            "#[tokio::test]",
+            "#[tokio::test(flavor=\"multi_thread\")]",
+            "#[async_std::test]",
+            "#[rstest]",
+            "#[test_case(1,2)]",
+        ] {
+            assert!(is_test_attribute(yes), "{yes}");
+        }
+        for no in [
+            "#[inline]",
+            "#[cfg(test)]",
+            "#[testing]",
+            "#[derive(Debug)]",
+        ] {
+            assert!(!is_test_attribute(no), "{no}");
+        }
     }
 }

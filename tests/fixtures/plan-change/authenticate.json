@@ -11,12 +11,14 @@
     "functions/src/auth/login"
   ],
   "indirect_callers": [
+    "functions/src/auth/login_accepts_a_known_user",
     "functions/src/auth/test_login",
     "functions/src/oauth/handle_callback",
     "functions/tests/login/login_flow"
   ],
   "affected_concepts": [
     "functions/src/auth/login",
+    "functions/src/auth/login_accepts_a_known_user",
     "functions/src/auth/test_login",
     "functions/src/oauth/handle_callback",
     "functions/tests/login/login_flow"
@@ -36,6 +38,7 @@
     "modules/tests/login"
   ],
   "tests": [
+    "functions/src/auth/login_accepts_a_known_user",
     "functions/src/auth/test_login",
     "functions/tests/login/login_flow"
   ],
@@ -57,15 +60,11 @@
     {
       "ref": "functions/src/oauth/handle_callback",
       "reason": "indirect caller in another module"
-    },
-    {
-      "ref": "functions/tests/login/login_flow",
-      "reason": "indirect caller in another module"
     }
   ],
   "limits": [
-    "tests: heuristic (rules: path_segment, symbol_pattern)",
+    "tests: heuristic (rules: path_segment, symbol_pattern, tag)",
     "tests reached only through mocks, dynamic dispatch, or separate binaries are not Calls edges and are not listed",
-    "test functions declared inline in source files (e.g. Rust #[cfg(test)] modules) are recognized only if their name or file matches a rule"
+    "test functions declared inline in source files are recognized only when the extractor tags them (Rust: #[test]-style attributes and #[cfg(test)] modules) or their name or file matches a rule"
   ]
 }

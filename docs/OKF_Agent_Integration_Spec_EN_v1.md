@@ -142,31 +142,30 @@ JSON, schema-versioned, pretty-printed with two-space indentation, keys in the o
     "in_cycle": false
   },
   "direct_callers": ["functions/src/auth/login"],
-  "indirect_callers": ["functions/src/auth/test_login", "functions/src/oauth/handle_callback", "functions/tests/login/login_flow"],
-  "affected_concepts": ["functions/src/auth/login", "functions/src/auth/test_login", "functions/src/oauth/handle_callback", "functions/tests/login/login_flow"],
+  "indirect_callers": ["functions/src/auth/login_accepts_a_known_user", "functions/src/auth/test_login", "functions/src/oauth/handle_callback", "functions/tests/login/login_flow"],
+  "affected_concepts": ["functions/src/auth/login", "functions/src/auth/login_accepts_a_known_user", "functions/src/auth/test_login", "functions/src/oauth/handle_callback", "functions/tests/login/login_flow"],
   "callees": ["functions/src/auth/verify_password"],
   "public_api": ["functions/src/auth/authenticate", "functions/src/auth/login", "functions/src/oauth/handle_callback"],
   "cycles": [],
   "modules": ["modules/src/auth", "modules/src/oauth", "modules/tests/login"],
-  "tests": ["functions/src/auth/test_login", "functions/tests/login/login_flow"],
+  "tests": ["functions/src/auth/login_accepts_a_known_user", "functions/src/auth/test_login", "functions/tests/login/login_flow"],
   "risk_signals": [
     {"signal": "public_api", "detail": "target is public API"},
     {"signal": "module_boundary", "detail": "affects 2 module(s) besides the target's own"}
   ],
   "recommended_inspection": [
     {"ref": "functions/src/auth/login", "reason": "direct caller that is itself public API"},
-    {"ref": "functions/src/oauth/handle_callback", "reason": "indirect caller in another module"},
-    {"ref": "functions/tests/login/login_flow", "reason": "indirect caller in another module"}
+    {"ref": "functions/src/oauth/handle_callback", "reason": "indirect caller in another module"}
   ],
   "limits": [
-    "tests: heuristic (rules: path_segment, symbol_pattern)",
+    "tests: heuristic (rules: path_segment, symbol_pattern, tag)",
     "tests reached only through mocks, dynamic dispatch, or separate binaries are not Calls edges and are not listed",
-    "test functions declared inline in source files (e.g. Rust #[cfg(test)] modules) are recognized only if their name or file matches a rule"
+    "test functions declared inline in source files are recognized only when the extractor tags them (Rust: #[test]-style attributes and #[cfg(test)] modules) or their name or file matches a rule"
   ]
 }
 ```
 
-This is the real output for the e2e fixture (golden file `tests/fixtures/plan-change/authenticate.json`, written by `write_plan_change_fixture` in `crates/okf-cli/tests/e2e.rs`), with arrays compacted here for reading; the CLI and MCP print serde_json's pretty form, one array element per line. In the fixture, `login` (public) is the only direct caller of `authenticate`; `test_login` (an inline test, `symbol_pattern`), `handle_callback` (module `src/oauth`), and `tests/login.rs`'s `login_flow` (`path_segment`) call `login`. `login` is listed once in `recommended_inspection`, under the first rule that selects it (§4.1.6 rule 1). Modules are per source file in okf-rs, so each file is its own module.
+This is the real output for the e2e fixture (golden file `tests/fixtures/plan-change/authenticate.json`, written by `write_plan_change_fixture` in `crates/okf-cli/tests/e2e.rs`), with arrays compacted here for reading; the CLI and MCP print serde_json's pretty form, one array element per line. In the fixture, `login` (public) is the only direct caller of `authenticate`; `test_login` (`symbol_pattern`), the `#[test]` function `login_accepts_a_known_user` inside `#[cfg(test)] mod tests` (`tag`), `handle_callback` (module `src/oauth`), and `tests/login.rs`'s `login_flow` (`path_segment`) call `login`. `login` is listed once in `recommended_inspection`, under the first rule that selects it (§4.1.6 rule 1); `login_flow` is in another module but is a test, so rule 3 skips it. Modules are per source file in okf-rs, so each file is its own module.
 
 #### 4.1.4 Field definitions (deterministic)
 
@@ -197,14 +196,15 @@ The model does not record which concepts are tests. A concept is a **test concep
 - **`path_segment`** — any directory component of `location.file`, compared case-insensitively, equals `tests`, `test`, or `__tests__`.
 - **`name_pattern`** — the file basename (case-sensitive) matches one of: `test_*.*`, `*_test.*`, `*.test.*`, `*.spec.*`, or its stem ends in `Test` or `Tests` (camel-case, so `FooTest.java` and `FooTests.cs` match and `latest.rs` does not).
 - **`symbol_pattern`** — the concept's `name` (case-sensitive) starts with `test_`, or starts with `Test` followed by an uppercase letter (so Go's `TestX` matches and `Tester` does not). Applies to `Function`, `Method`, `Class`, and `Struct` concepts only.
+- **`tag`** — the concept's `tags` contain `test`. The Rust extractor (`okf_tree_sitter`) sets this tag on every function or method that carries a test attribute — `#[test]`, any attribute path ending in `::test` (`#[tokio::test]`, `#[async_std::test]`, ...), `#[rstest]`, or `#[test_case(...)]` — or that is declared, at any depth, inside a module marked exactly `#[cfg(test)]` (test helpers included). Not recognized: compound conditions such as `#[cfg(all(test, ...))]`, and a test module kept in its own file (`#[cfg(test)] mod tests;`), whose attribute isn't visible from that file. Other extractors don't set the tag yet.
 
 The target is never a test concept for this purpose. `limits` always holds three fixed entries, in this order:
 
 1. `tests: heuristic (rules: <names>)`, listing in rule order the rules that matched at least one entry of `tests`; or `tests: heuristic (no affected concept matched a test rule)` when `tests` is empty;
 2. `tests reached only through mocks, dynamic dispatch, or separate binaries are not Calls edges and are not listed`;
-3. `test functions declared inline in source files (e.g. Rust #[cfg(test)] modules) are recognized only if their name or file matches a rule`.
+3. `test functions declared inline in source files are recognized only when the extractor tags them (Rust: #[test]-style attributes and #[cfg(test)] modules) or their name or file matches a rule`.
 
-**Measured limitation (2026-11-17).** On this repository's own bundle, Rust unit tests inside `#[cfg(test)] mod tests` blocks appear as ordinary private functions (e.g. `functions/crates/okf-graph/src/callers_and_callees_and_ownership`), with no attribute, tag, or id segment marking them as tests, and their names rarely start with `test_`. Only tests under a `tests/` directory are recognized. For Rust library code `tests` will therefore usually be empty and `no_test_reaches_target` will fire even when unit tests exist. Proper test modelling (e.g. the Rust extractor tagging `#[test]` functions) is out of scope for v1.1 (§10) and is the first candidate fix if P2's recall measurement fails (D-3).
+**Measured (2026-11-17).** Before the `tag` rule, Rust unit tests inside `#[cfg(test)] mod tests` blocks appeared in the bundle as ordinary private functions with no marker, so on this repository `tests` was empty for library code, `no_test_reaches_target` fired as a false alarm, and unrecognized tests filled `recommended_inspection`. With the `tag` rule, `plan-change` on `functions/crates/okf-graph/src/Graph/transitive_callers` lists 36 tests among its 51 affected concepts; the other 15 are all production code. A bundle generated before this change keeps untagged extractions in `.okf-cache.json` until the okf-rs version changes (the cache is invalidated per version); regenerate with `--no-cache` to pick the tags up sooner.
 
 #### 4.1.6 Risk signals and inspection rules
 
@@ -224,7 +224,7 @@ The target is never a test concept for this purpose. `limits` always holds three
 
 The `detail` string for each signal is generated from the counts above, using the fixed templates in the implementation; it never contains free text.
 
-**`recommended_inspection`** is built in this order. A concept listed by an earlier rule is not repeated. Output is capped at 5 entries.
+**`recommended_inspection`** is built in this order. A concept listed by an earlier rule is not repeated. Output is capped at 5 entries. Rules 3 and 4 skip concepts listed in `tests`: tests have their own field, and on a well-tested codebase they would otherwise fill every slot and push out production callers. Rule 2 still applies to a test, since a test that is the only direct caller is the only usage there is to read.
 
 | Rule | Candidates | Reason string (fixed) |
 |---|---|---|
@@ -612,7 +612,7 @@ Defaults chosen in v1.1. Each can be changed; the reason to revisit is listed.
 |---|---|---|---|
 | D-1 | `plan-change` exposure | `graph` relation + CLI subcommand, no new MCP tool (§4.0) | Schema token cost measured to be negligible, or the relation becomes unwieldy |
 | D-2 | `plan-change` id resolution | exact id only (§4.1.2) | Users report friction; then add an explicit `--search` mode, never silent fallback |
-| D-3 | Test detection | path/name heuristic, rules in §4.1.5 | Blast-radius recall (§9.2) < 0.9 on P2 tasks |
+| D-3 | Test detection | path/name heuristic plus the extractor's `test` tag (Rust), rules in §4.1.5 | Blast-radius recall (§9.2) < 0.9 on P2 tasks; next step would be tagging in more extractors |
 | D-4 | Skill distribution | `examples/` only, not installed by `init` (§5.5) | After P2 shows a stable pack |
 | D-5 | Skill MCP naming | MCP form, CLI never in skill bodies (§4.3) | — |
 | D-6 | Protocol directive | opt-in (O-3, §15) | Adherence rate (§7.2) shows agents ignore it even when present |
@@ -643,6 +643,7 @@ Defaults chosen in v1.1. Each can be changed; the reason to revisit is listed.
 - §13: D-7 and D-8 added.
 - §15: O-2 closed; O-1 narrowed.
 - Corrections from the P1 implementation (2026-11-17): §4.1.2 CLI parameters match the other `graph` subcommands (positional `bundle`, `--project`); §4.1.3 example replaced by the real golden output; §4.1.4 `kind` is the concept kind, and self-calls are excluded from `direct_callers`/`callees`; §4.1.5 `symbol_pattern` kinds listed exactly, `limits` strings fixed, and the measured Rust inline-test limitation recorded; §4.1.6 boundary terms skip the `modules/` kind segment; §4.1.7 missing-bundle message matches `okf_query::require_bundle`; §7.1 `init` keeps the rest of `okf.toml`; O-4 closed.
+- Rust test tagging (2026-11-17, before P2): §4.1.5 adds the `tag` rule backed by the Rust extractor's `test` tag, updates the third `limits` string, and replaces the "measured limitation" note with the measured result; §4.1.6 rules 3 and 4 skip tests; §4.1.3 example regenerated; D-3 updated.
 
 ---
 
