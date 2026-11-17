@@ -50,6 +50,21 @@ Files opened per run:
 
 Correctness was graded against the ground-truth commits in the pack README: every answer names the mechanism the commit introduced (E1 fingerprint of count/size/mtime; E2 fresh render to a temp directory and byte-diff ignoring `source_revision`; E3 pairing by `(kind, target)` then `classify_provenance_change`; E4 quiet period over `$/progress` tokens; E5 Windows-1254 decoding of invalid byte runs only).
 
+### Characters read (added after the second run)
+
+The analyzer now also counts characters returned to the agent per tool, because Grep's content mode returns source lines that "files opened" doesn't see, and MCP responses cost context too. Re-analyzing the same transcripts:
+
+| Task | Baseline source chars (Read + Grep) | Treatment source chars | Treatment MCP chars |
+|---|---|---|---|
+| E1 | 22,258 | 15,846 | 6,402 |
+| E2 | 27,230 | 8,991 | 1,862 |
+| E3 | 33,239 | 13,568 | 16,209 |
+| E4 | 22,976 | 9,518 | 6,003 |
+| E5 | 29,062 | 5,024 | 6,908 |
+| **Total** | **134,765** | **52,947** (0.39) | **37,384** |
+
+Source plus MCP characters: 90,331 vs 134,765, i.e. **−33%** for the treatment on this repository. The second run, on a larger repository, went the other way: [`agent-integration-p1-jj.md`](agent-integration-p1-jj.md).
+
 ## Verdict
 
 - Skill invoked without prompting on all 5 treatment runs: **yes** (5/5, always before the first file read)
@@ -66,7 +81,7 @@ Correctness was graded against the ground-truth commits in the pack README: ever
 
 ## Options (decision needed; not taken here)
 
-1. Re-run the same protocol on a larger, less familiar repository (several hundred source files) where the 3× bar is meaningful.
+1. Re-run the same protocol on a larger, less familiar repository (several hundred source files) where the 3× bar is meaningful. **Done 2026-11-17 on Jujutsu (456 Rust files): fail, ratio 0.87** — see [`agent-integration-p1-jj.md`](agent-integration-p1-jj.md).
 2. Change the criterion for small repositories (e.g. files opened beyond the files that hold the answer, or tokens of source read), and record the change in the spec's decisions log.
 3. Accept P1 on adherence alone and gate P2 on its own criteria.
 

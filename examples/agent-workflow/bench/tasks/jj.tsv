@@ -1,0 +1,7 @@
+# Jujutsu (github.com/jj-vcs/jj) at 4351061bb, 456 Rust files. Fixed before the first run (2026-11-17).
+# Ground truth: docs/benchmarks/agent-integration-p1-jj.md.
+J1	What does jj do on Windows when replacing a file fails because another process has the target file open?
+J2	How does jj detect that a Git remote uses a different object format (SHA-1 vs. SHA-256) than the local repository?
+J3	How can a user resolve a conflict by editing the conflict markers in their own text editor, and how does jj read the result back?
+J4	How does jj limit how many backend requests are in flight when it reads or writes many trees at once?
+J5	How does jj's diff output choose the source line, such as the enclosing function's signature, that it shows as context for a hunk?

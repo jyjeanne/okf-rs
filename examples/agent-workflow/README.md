@@ -75,9 +75,20 @@ Results go in [`docs/benchmarks/agent-integration-p1.md`](../../docs/benchmarks/
 [`bench/`](bench/) runs this procedure with headless Claude Code (`claude -p`):
 
 ```sh
-examples/agent-workflow/bench/setup.sh . <commit> <empty work dir>   # copies, binaries, bundle, MCP config
-<work dir>/run-all.sh                                                # the 10 sessions, in parallel
-node <work dir>/analyze.js <work dir>                                # metrics per §9.2; answers saved for grading
+# okf-rs itself as the target:
+examples/agent-workflow/bench/setup.sh . . <commit> <empty work dir>
+<work dir>/run-all.sh tasks/okf-rs.tsv
+
+# any other git repository as the target:
+examples/agent-workflow/bench/setup.sh . <target repo> <commit> <empty work dir>
+<work dir>/run-all.sh tasks/<name>.tsv        # e.g. tasks/jj.tsv
+
+node <work dir>/analyze.js <work dir>         # metrics per §9.2; answers saved for grading
 ```
 
-`setup.sh` exports `<commit>` with `git archive` (no history for the agent to read), removes this README and the pack's `.claude/` folder from both copies, generates the bundle only in the treatment copy, and installs the skill there. Both variants get the same built-in tools (`Read`, `Grep`, `Glob`, `Skill`) and no user settings; only the treatment gets the `okf` MCP server. Grading answers against the ground-truth commits is manual.
+`setup.sh` builds okf-rs from this checkout, exports the target `<commit>` with `git archive` (no history for the agent to read), removes every `.claude/` folder from both copies (no nested skill in the baseline, no project settings or hooks from an untrusted repository), generates the bundle only in the treatment copy, and installs the skill there. Both variants get the same built-in tools (`Read`, `Grep`, `Glob`, `Skill`) and no user settings; only the treatment gets the `okf` MCP server. A tasks file is `<id><TAB><question>` per line, written before the first run. Grading answers against the ground-truth commits is manual.
+
+| Tasks file | Target | Results |
+|---|---|---|
+| `bench/tasks/okf-rs.tsv` | this repository (55 Rust files) | [`docs/benchmarks/agent-integration-p1.md`](../../docs/benchmarks/agent-integration-p1.md) |
+| `bench/tasks/jj.tsv` | [Jujutsu](https://github.com/jj-vcs/jj) at `4351061bb` (456 Rust files) | [`docs/benchmarks/agent-integration-p1-jj.md`](../../docs/benchmarks/agent-integration-p1-jj.md) |
