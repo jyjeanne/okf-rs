@@ -9,6 +9,7 @@ tasks="${1:?tasks file, e.g. tasks/okf-rs.tsv}"
 [ -f "$tasks" ] || tasks="$P/$tasks"
 : > "$P/runs/status.txt"
 while IFS=$'\t' read -r id question; do
+  question="${question%$'\r'}"   # tolerate a CRLF checkout
   case "$id" in ''|'#'*) continue ;; esac
   for v in baseline treatment; do
     "$P/run.sh" "$v" "$id" "$question" &
