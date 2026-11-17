@@ -24,7 +24,7 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "explore",
-            "description": "One-call context for a concept: signature, description, direct callers, direct callees, blast radius (every concept transitively affected if this one changes), public-API membership, and call-cycle membership. Prefer this over separate search/graph_callers/graph_callees calls when you need more than one of these facts about the same concept — it's the same total information in one round trip instead of several.",
+            "description": "One-call context for a concept: source location (file#Lstart-Lend — read exactly those lines instead of searching for the concept), signature, description, direct callers and callees (each with its location), blast radius (every concept transitively affected if this one changes), public-API membership, and call-cycle membership. Long lists are capped with exact counts (production code before tests); graph relation callers/callees/plan-change lists everything. Prefer this over separate search/graph calls when you need more than one of these facts about the same concept.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

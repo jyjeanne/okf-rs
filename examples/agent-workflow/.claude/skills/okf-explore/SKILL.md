@@ -6,7 +6,7 @@ description: >
   to explain, understand, locate, or navigate code, symbols, modules,
   call paths, or architecture.
 metadata:
-  okf_pack: "1.1"
+  okf_pack: "1.2"
 ---
 
 # OKF Exploration — graph first, source second
@@ -22,11 +22,15 @@ using this skill.
 2. MCP `search` with those terms to locate concepts and get their ids. If
    results are ambiguous or empty, MCP `search_ranked` with a descriptive
    phrase.
-3. MCP `explore` on the chosen concept id: signature, description, callers,
-   callees, blast radius, public API membership, cycle membership. ONE call.
+3. MCP `explore` on the chosen concept id: location, signature,
+   description, callers and callees (each with its location), blast
+   radius, public API membership, cycle membership. ONE call.
 4. If the question is architecture-level, MCP `graph` with relation
    `modules`, `communities`, or `path` (with `from` and `to` ids).
-5. NOW read source: only the files the results of steps 2–4 point to.
+5. NOW read source: read the line ranges the `Location` values point to
+   (`file#Lstart-Lend` → read that file from `start` for `end - start + 1`
+   lines), and only those. Do not search for a function the graph has
+   already located.
 6. Synthesize the answer. For every claim about who calls what, name the
    MCP call that showed it. Never grep the whole repository to find
    something the graph already knows.
@@ -34,5 +38,6 @@ using this skill.
 ## Anti-patterns (forbidden)
 
 - Reading files before the first `explore` call.
+- Grepping for a concept `explore` already gave a location for.
 - Guessing callers or callees from reading source.
 - Calling `explore` on more than 2–3 concepts before synthesizing.

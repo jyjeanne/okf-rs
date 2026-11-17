@@ -381,6 +381,12 @@ impl TestRule {
     }
 }
 
+/// Whether `concept` is test code under the §4.1.5 rules — the same test
+/// detection `plan-change` uses, shared with `explore`'s ordering.
+pub(crate) fn is_test_concept(concept: &Concept) -> bool {
+    !test_rules(concept).is_empty()
+}
+
 /// Which test rules `concept` matches; empty when it isn't a test.
 /// Structural concepts are never tests.
 fn test_rules(concept: &Concept) -> Vec<TestRule> {

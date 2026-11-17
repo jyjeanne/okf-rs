@@ -2,7 +2,7 @@
 
 Skills and conventions that make a coding agent (Claude Code, OpenCode) query the OKF knowledge graph before it reads source. The design and its rationale are in [`docs/OKF_Agent_Integration_Spec_EN_v1.md`](../../docs/OKF_Agent_Integration_Spec_EN_v1.md); the delivery plan is [`docs/agent-integration-plan.md`](../../docs/agent-integration-plan.md).
 
-**Pack version:** 1.1 (matches `metadata.okf_pack` in each `SKILL.md`).
+**Pack version:** 1.2 (matches `metadata.okf_pack` in each `SKILL.md`). 1.2: `okf-explore` reads the line ranges `explore` now returns instead of searching for the concept. The two benchmark runs to date used 1.1.
 
 ## What's in it
 

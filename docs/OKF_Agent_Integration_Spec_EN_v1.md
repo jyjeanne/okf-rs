@@ -246,6 +246,8 @@ The `detail` string for each signal is generated from the counts above, using th
 
 `explore` answers "what is this" (signature, description, neighbours). `plan-change` answers "what does changing it touch". An agent that needs both calls `explore` first (one call) and `plan-change` second. The two share the same graph calls; `plan-change` does not repeat `explore`'s description or signature.
 
+**`explore` output (changed 2026-11-17).** `explore` returns the concept's source location (`Location: file#Lstart-Lend`, the bundle's `resource` format) and the location of each direct caller and callee, so an agent reads exactly those lines instead of searching the file. Its lists are capped: at most 20 direct callers, 20 callees, and 10 blast-radius concepts, ordered production code first and then tests (§4.1.5 detection), each group by id. Counts stay exact, the blast-radius header says how many are tests, and a capped list ends with `+N more` naming the `graph` relation that lists everything (`callers`, `callees`, `plan-change`). Reason: in the Jujutsu benchmark (`docs/benchmarks/agent-integration-p1-jj.md`) the agent grepped for every concept `explore` had just named, and blast-radius lists of 50+ ids made up most of `explore`'s output.
+
 #### 4.1.9 Acceptance tests `[PLANNED]`
 
 - Unit tests in `okf-query` on a fixture graph: each field, each risk rule, ordering, the 5-entry cap.
@@ -303,7 +305,7 @@ description: >
   to explain, understand, locate, or navigate code, symbols, modules,
   or architecture.
 metadata:
-  okf_pack: "1.1"
+  okf_pack: "1.2"
 ---
 
 # OKF Exploration — graph first, source second
@@ -313,11 +315,13 @@ metadata:
 1. Identify candidate concepts from the user request (names, domain terms).
 2. MCP `search` with those terms — locate concepts. If results are ambiguous
    or empty, MCP `search_ranked`.
-3. MCP `explore` on the chosen concept — signature, description, callers,
-   callees, blast radius, public API membership, cycle membership. ONE call.
+3. MCP `explore` on the chosen concept — location, signature, description,
+   callers and callees (each with its location), blast radius, public API
+   membership, cycle membership. ONE call.
 4. If the question is architecture-level, MCP `graph` with relation `modules`,
    `communities`, or `path` (from, to).
-5. NOW read source: only the files referenced by steps 2–4.
+5. NOW read source: only the line ranges the `Location` values point to.
+   Do not search for a function the graph has already located.
 6. Synthesize the mental model. Never grep the whole repo to "find"
    something the graph already knows.
 
@@ -644,6 +648,7 @@ Defaults chosen in v1.1. Each can be changed; the reason to revisit is listed.
 - §15: O-2 closed; O-1 narrowed.
 - Corrections from the P1 implementation (2026-11-17): §4.1.2 CLI parameters match the other `graph` subcommands (positional `bundle`, `--project`); §4.1.3 example replaced by the real golden output; §4.1.4 `kind` is the concept kind, and self-calls are excluded from `direct_callers`/`callees`; §4.1.5 `symbol_pattern` kinds listed exactly, `limits` strings fixed, and the measured Rust inline-test limitation recorded; §4.1.6 boundary terms skip the `modules/` kind segment; §4.1.7 missing-bundle message matches `okf_query::require_bundle`; §7.1 `init` keeps the rest of `okf.toml`; O-4 closed.
 - Rust test tagging (2026-11-17, before P2): §4.1.5 adds the `tag` rule backed by the Rust extractor's `test` tag, updates the third `limits` string, and replaces the "measured limitation" note with the measured result; §4.1.6 rules 3 and 4 skip tests; §4.1.3 example regenerated; D-3 updated.
+- `explore` location and caps (2026-11-17, after the Jujutsu benchmark): §4.1.8 documents the new `explore` output (concept and neighbour locations; capped, production-first lists with exact counts); §5.3 example skill reads the returned line ranges (pack 1.2).
 
 ---
 

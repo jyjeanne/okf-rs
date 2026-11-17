@@ -175,24 +175,88 @@ fn resolve_explore_target_by_search<'a>(
         .ok_or_else(|| anyhow!("internal error: search hit `{}` not in the bundle", hit.id))
 }
 
-fn id_list(ids: &[&Concept]) -> String {
-    if ids.is_empty() {
-        "none".to_string()
+/// At most this many direct callers (and, separately, callees) are listed
+/// by [`explore`]. The count in the header is always exact; `graph`
+/// relation `callers`/`callees` lists the rest.
+const EXPLORE_MAX_NEIGHBORS: usize = 20;
+
+/// At most this many blast-radius concepts are listed by [`explore`]. On a
+/// large codebase the full list runs to dozens of ids (mostly tests) and
+/// dominated `explore`'s output in the agent benchmark
+/// (`docs/benchmarks/agent-integration-p1-jj.md`); `graph` relation
+/// `plan-change` lists them all.
+const EXPLORE_MAX_BLAST_RADIUS: usize = 10;
+
+/// `id (file#Lstart-Lend)`, or just the id when the concept has no source
+/// file (e.g. an imported document).
+fn located(concept: &Concept) -> String {
+    if concept.location.file.is_empty() {
+        concept.id.clone()
     } else {
-        ids.iter()
-            .map(|c| c.id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+        format!("{} ({})", concept.id, concept.location)
     }
 }
 
-/// One-call context for a concept: signature, description, direct
-/// callers/callees, blast radius (every concept transitively affected if
-/// this one changes — see [`okf_graph::Graph::transitive_callers`]),
-/// public-API membership, and call-cycle membership — everything an
-/// agent asking "what does this do, and what does touching it put at
-/// risk" would otherwise need several separate `search`/`graph_*` calls
-/// to assemble, in one response.
+/// `concepts` deduplicated and ordered production code first, then tests
+/// (each group by id) — the order [`explore`] lists them in, so a capped
+/// list shows the code an agent most likely needs before the tests that
+/// exercise it.
+fn production_first<'a>(concepts: &[&'a Concept]) -> Vec<&'a Concept> {
+    let mut ordered: Vec<&Concept> = concepts.to_vec();
+    ordered.sort_by(|a, b| {
+        (plan_change::is_test_concept(a), &a.id).cmp(&(plan_change::is_test_concept(b), &b.id))
+    });
+    ordered.dedup_by(|a, b| a.id == b.id);
+    ordered
+}
+
+/// The first `max` of `ordered` as a comma-separated list (with locations
+/// when `with_location`), plus `, +N more (...)` naming the `graph`
+/// relation that lists the rest; `none` when empty.
+fn capped_list(
+    ordered: &[&Concept],
+    max: usize,
+    with_location: bool,
+    full_list_relation: &str,
+) -> String {
+    if ordered.is_empty() {
+        return "none".to_string();
+    }
+    let mut text = ordered
+        .iter()
+        .take(max)
+        .map(|c| {
+            if with_location {
+                located(c)
+            } else {
+                c.id.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ordered.len() > max {
+        text.push_str(&format!(
+            ", +{} more (`graph` relation `{full_list_relation}` lists all)",
+            ordered.len() - max
+        ));
+    }
+    text
+}
+
+/// One-call context for a concept: its source location, signature,
+/// description, direct callers/callees (each with its location), blast
+/// radius (every concept transitively affected if this one changes — see
+/// [`okf_graph::Graph::transitive_callers`]), public-API membership, and
+/// call-cycle membership — everything an agent asking "what does this
+/// do, and what does touching it put at risk" would otherwise need
+/// several separate `search`/`graph_*` calls to assemble, in one
+/// response.
+///
+/// The location (`file#Lstart-Lend`) lets an agent read exactly the
+/// concept's lines instead of searching the file for it. Lists are capped
+/// (at most 20 direct callers, 20 callees, and 10 blast-radius concepts,
+/// production code before tests) with exact counts and a pointer to the
+/// `graph` relation that lists everything.
 ///
 /// `query` is resolved the same way [`resolve_explore_target`] does: an
 /// exact concept id wins; otherwise the top hit of a ranked full-text
@@ -223,11 +287,18 @@ pub fn explore_from_concepts(concepts: &[Concept], query: &str) -> Result<String
         .into_iter()
         .flatten()
         .any(|id| id == concept.id);
-    let callers = graph.callers(&concept.id);
-    let callees = graph.callees(&concept.id);
-    let blast_radius = graph.transitive_callers(&concept.id, None);
+    let callers = production_first(&graph.callers(&concept.id));
+    let callees = production_first(&graph.callees(&concept.id));
+    let blast_radius = production_first(&graph.transitive_callers(&concept.id, None));
+    let blast_radius_tests = blast_radius
+        .iter()
+        .filter(|c| plan_change::is_test_concept(c))
+        .count();
 
     let mut out = format!("{} — {}\n", concept.id, concept.frontmatter_type());
+    if !concept.location.file.is_empty() {
+        out.push_str(&format!("Location: {}\n", concept.location));
+    }
     if let Some(signature) = &concept.signature {
         out.push_str(&format!("\n{signature}\n"));
     }
@@ -237,17 +308,27 @@ pub fn explore_from_concepts(concepts: &[Concept], query: &str) -> Result<String
     out.push_str(&format!(
         "\nCallers ({}): {}\n",
         callers.len(),
-        id_list(&callers)
+        capped_list(&callers, EXPLORE_MAX_NEIGHBORS, true, "callers")
     ));
     out.push_str(&format!(
         "Callees ({}): {}\n",
         callees.len(),
-        id_list(&callees)
+        capped_list(&callees, EXPLORE_MAX_NEIGHBORS, true, "callees")
     ));
+    let tests_note = if blast_radius_tests > 0 {
+        format!(", {blast_radius_tests} of them tests")
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "Blast radius ({} concept(s) transitively depend on this): {}\n",
+        "Blast radius ({} concept(s) transitively depend on this{tests_note}): {}\n",
         blast_radius.len(),
-        id_list(&blast_radius)
+        capped_list(
+            &blast_radius,
+            EXPLORE_MAX_BLAST_RADIUS,
+            false,
+            "plan-change"
+        )
     ));
     out.push_str(&format!(
         "Public API: {}\n",
@@ -1100,6 +1181,113 @@ mod tests {
         let dir = sample_bundle();
         let err = explore(dir.path(), "no such thing anywhere").unwrap_err();
         assert!(err.to_string().contains("no concept found matching"));
+    }
+
+    #[test]
+    fn explore_reports_the_location_of_the_concept_and_its_neighbors() {
+        let dir = sample_bundle();
+        let text = explore(dir.path(), "functions/auth/decode_jwt").unwrap();
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next(),
+            Some("functions/auth/decode_jwt — Rust Function")
+        );
+        assert_eq!(lines.next(), Some("Location: src/auth.rs#L5"));
+        assert!(text.contains("Callers (1): functions/auth/verify_token (src/auth.rs#L1)"));
+    }
+
+    /// A function concept for the in-memory `explore` tests below.
+    fn function(id: &str, file: &str, test: bool) -> Concept {
+        Concept {
+            id: id.to_string(),
+            kind: ConceptKind::Function,
+            language: okf_parser::Language::Rust,
+            name: id.rsplit('/').next().unwrap().to_string(),
+            qualified_name: id.to_string(),
+            description: None,
+            location: okf_parser::Location {
+                file: file.to_string(),
+                start_line: 1,
+                end_line: 3,
+            },
+            signature: None,
+            tags: if test {
+                vec!["test".to_string()]
+            } else {
+                Vec::new()
+            },
+            is_public: false,
+            generated_at: None,
+            relationships: Vec::new(),
+        }
+    }
+
+    /// `callers` each call `target`, populating both sides of every edge.
+    fn called_by(target: &str, callers: &[(&str, bool)]) -> Vec<Concept> {
+        let mut concepts = vec![function(target, "src/t.rs", false)];
+        for &(id, test) in callers {
+            let mut caller = function(id, "src/c.rs", test);
+            caller.relationships.push(okf_parser::Relationship::new(
+                RelationKind::Calls,
+                target,
+                target,
+            ));
+            concepts[0]
+                .relationships
+                .push(okf_parser::Relationship::new(
+                    RelationKind::CalledBy,
+                    id,
+                    id,
+                ));
+            concepts.push(caller);
+        }
+        concepts
+    }
+
+    #[test]
+    fn explore_caps_long_lists_with_exact_counts_and_a_pointer_to_the_full_list() {
+        let ids: Vec<String> = (0..25).map(|i| format!("functions/c{i:02}")).collect();
+        let mut callers: Vec<(&str, bool)> = ids.iter().map(|id| (id.as_str(), false)).collect();
+        callers.extend([
+            ("functions/t_a", true),
+            ("functions/t_b", true),
+            ("functions/t_c", true),
+        ]);
+        let concepts = called_by("functions/target", &callers);
+        let text = explore_from_concepts(&concepts, "functions/target").unwrap();
+
+        let callers_line = text.lines().find(|l| l.starts_with("Callers")).unwrap();
+        assert!(callers_line.starts_with("Callers (28): functions/c00 (src/c.rs#L1-L3), "));
+        assert!(callers_line.contains("functions/c19 (src/c.rs#L1-L3)"));
+        assert!(!callers_line.contains("functions/c20"));
+        assert!(callers_line.ends_with(", +8 more (`graph` relation `callers` lists all)"));
+
+        let blast_line = text
+            .lines()
+            .find(|l| l.starts_with("Blast radius"))
+            .unwrap();
+        assert!(blast_line.starts_with(
+            "Blast radius (28 concept(s) transitively depend on this, 3 of them tests): functions/c00, "
+        ));
+        assert!(blast_line.contains("functions/c09"));
+        assert!(!blast_line.contains("functions/c10"));
+        assert!(blast_line.ends_with(", +18 more (`graph` relation `plan-change` lists all)"));
+    }
+
+    #[test]
+    fn explore_lists_production_code_before_tests() {
+        // `a_test` sorts first by id, but it's a test.
+        let concepts = called_by(
+            "functions/target",
+            &[("functions/a_test", true), ("functions/z_prod", false)],
+        );
+        let text = explore_from_concepts(&concepts, "functions/target").unwrap();
+        assert!(text.contains(
+            "Callers (2): functions/z_prod (src/c.rs#L1-L3), functions/a_test (src/c.rs#L1-L3)"
+        ));
+        assert!(text.contains(
+            "Blast radius (2 concept(s) transitively depend on this, 1 of them tests): functions/z_prod, functions/a_test"
+        ));
     }
 
     #[test]
