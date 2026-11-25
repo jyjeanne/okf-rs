@@ -307,6 +307,7 @@ mod tests {
             "patterns",
             "features",
             "plan-change",
+            "file",
         ] {
             assert!(
                 relations.contains(&expected),

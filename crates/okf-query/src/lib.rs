@@ -21,7 +21,11 @@
 //! [`coverage_report`] and [`graph_stats_report`]; [`plan_change`]
 //! returns its [`PlanChange`] struct directly, with
 //! [`PlanChange::to_json`]/[`PlanChange::to_text`] for the CLI and MCP
-//! renderings. Everywhere else, embed
+//! renderings. [`search_ranked`], [`explore`], `callers`/`callees` and
+//! the concepts of one file also have JSON forms with a versioned
+//! `schema` ([`search_ranked_json`], [`explore_json_from_concepts`],
+//! [`neighbours_json_from_concepts`], [`file_concepts_json`]), for a
+//! program reading them through `okf-mcp`. Everywhere else, embed
 //! `okf_graph::Graph`/`okf_search::SearchIndex`/`FullTextIndex` directly,
 //! which already return structured, borrowed data rather than text.
 //!
@@ -74,6 +78,13 @@ mod plan_change;
 pub use plan_change::{
     plan_change, plan_change_from_concepts, Inspection, PlanChange, PlanChangeOptions, PlanTarget,
     RiskSignal, SCHEMA as PLAN_CHANGE_SCHEMA,
+};
+
+mod structured;
+pub use structured::{
+    explore_json_from_concepts, file_concepts_from_concepts, file_concepts_json,
+    file_concepts_text, neighbours_json_from_concepts, search_ranked_json, ConceptRef, Neighbours,
+    RankedHit, SourceRange, CONCEPTS_SCHEMA, EXPLORE_SCHEMA, SEARCH_RANKED_SCHEMA,
 };
 
 /// Errors if `bundle` doesn't exist yet, with a pointer to `okf-rs

@@ -29,6 +29,7 @@ pub fn list() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "A concept id, or free text to resolve via ranked search (the top hit is used)" },
+                    "format": format_schema(),
                 },
                 "required": ["query"],
             },
@@ -52,6 +53,7 @@ pub fn list() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search text" },
+                    "format": format_schema(),
                 },
                 "required": ["query"],
             },
@@ -63,23 +65,43 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "graph",
-            "description": "Unified entry point for graph-topology and architecture queries — one tool covering what used to be a dozen-plus single-purpose graph_* tools, to keep the schema this server contributes to every session's system prompt small. Pick a `relation`:\n- callers (needs `id`): concepts that directly call `id`\n- callees (needs `id`): concepts `id` directly calls\n- path (needs `from`, `to`): shortest call path between two concept ids\n- explain (needs `from`, `to`): why a relationship exists between two concepts — the relation kind plus a human-readable reason derived from its provenance (e.g. \"resolved via Tree-sitter's unambiguous name match\", or which language server resolved it); falls back to explaining the shortest call path hop-by-hop when there's no single direct relationship\n- api: the project's public API surface (public functions, methods, and types)\n- cycles: groups of concepts that call each other in a cycle (direct or mutual recursion)\n- modules: cross-module call dependency edges\n- isolated: concepts with no Calls/CalledBy edge in either direction — candidates for dead code or unresolved calls\n- stats: concept-kind breakdown, relationship edge counts by kind, and connected components of the Calls/CalledBy graph\n- layers: each package's layer in the package dependency graph (layer 0 = depends on no other package in the bundle)\n- domains: clusters of packages that depend on each other, directly or transitively\n- communities: package communities from modularity-optimization detection — finer-grained than domains\n- patterns: design patterns (Builder, Singleton, Factory, Visitor) detected via structural/naming heuristics — a signal to review, not a guarantee\n- features: REST endpoints, database models, and event-flow participants detected via naming heuristics (e.g. a *Controller-named type, an emit_*-named function)\n- plan-change (needs an exact `id`): JSON change plan to read BEFORE editing `id` — direct and indirect callers, blast radius, public API in scope, cycle membership, modules, tests that reach it (heuristic), risk signals, and what to inspect first",
+            "description": "Unified entry point for graph-topology and architecture queries — one tool covering what used to be a dozen-plus single-purpose graph_* tools, to keep the schema this server contributes to every session's system prompt small. Pick a `relation`:\n- callers (needs `id`): concepts that directly call `id`\n- callees (needs `id`): concepts `id` directly calls\n- path (needs `from`, `to`): shortest call path between two concept ids\n- explain (needs `from`, `to`): why a relationship exists between two concepts — the relation kind plus a human-readable reason derived from its provenance (e.g. \"resolved via Tree-sitter's unambiguous name match\", or which language server resolved it); falls back to explaining the shortest call path hop-by-hop when there's no single direct relationship\n- api: the project's public API surface (public functions, methods, and types)\n- cycles: groups of concepts that call each other in a cycle (direct or mutual recursion)\n- modules: cross-module call dependency edges\n- isolated: concepts with no Calls/CalledBy edge in either direction — candidates for dead code or unresolved calls\n- stats: concept-kind breakdown, relationship edge counts by kind, and connected components of the Calls/CalledBy graph\n- layers: each package's layer in the package dependency graph (layer 0 = depends on no other package in the bundle)\n- domains: clusters of packages that depend on each other, directly or transitively\n- communities: package communities from modularity-optimization detection — finer-grained than domains\n- patterns: design patterns (Builder, Singleton, Factory, Visitor) detected via structural/naming heuristics — a signal to review, not a guarantee\n- features: REST endpoints, database models, and event-flow participants detected via naming heuristics (e.g. a *Controller-named type, an emit_*-named function)\n- plan-change (needs an exact `id`): JSON change plan to read BEFORE editing `id` — direct and indirect callers, blast radius, public API in scope, cycle membership, modules, tests that reach it (heuristic), risk signals, and what to inspect first\n- file (needs `path`): the concepts defined in one source file, with their line ranges",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "relation": {
                         "type": "string",
-                        "enum": ["callers", "callees", "path", "explain", "api", "cycles", "modules", "isolated", "stats", "layers", "domains", "communities", "patterns", "features", "plan-change"],
+                        "enum": ["callers", "callees", "path", "explain", "api", "cycles", "modules", "isolated", "stats", "layers", "domains", "communities", "patterns", "features", "plan-change", "file"],
                         "description": "Which graph query to run",
                     },
                     "id": { "type": "string", "description": "Concept id — required for relation=callers|callees|plan-change (find it with the search tool)" },
                     "from": { "type": "string", "description": "Starting concept id — required for relation=path|explain" },
                     "to": { "type": "string", "description": "Target concept id — required for relation=path|explain" },
+                    "path": { "type": "string", "description": "Source file relative to the project root — required for relation=file" },
+                    "format": format_schema(),
                 },
                 "required": ["relation"],
             },
         }),
     ]
+}
+
+/// The optional `format` argument of `search_ranked`, `explore` and
+/// `graph`: `json` returns a versioned JSON document (see `okf-query`'s
+/// `structured` module) for a program to read instead of text. One short
+/// description, since every tool schema is in every session's prompt.
+fn format_schema() -> Value {
+    json!({ "type": "string", "enum": ["text", "json"], "description": "json: a machine-readable result" })
+}
+
+/// Whether `arguments` ask for JSON: `format` absent or `text` is text,
+/// `json` is JSON, anything else is an error.
+fn wants_json(arguments: &Value) -> Result<bool> {
+    match arguments.get("format").and_then(|v| v.as_str()) {
+        None | Some("text") => Ok(false),
+        Some("json") => Ok(true),
+        Some(other) => Err(anyhow!("unknown format `{other}` — expected text or json")),
+    }
 }
 
 /// Runs `name` with `arguments` against the bundle at `bundle`, returning
@@ -121,7 +143,14 @@ pub fn call_with(
 ) -> Result<String> {
     match name {
         "search" => okf_query::search(bundle, &arg_str(arguments, "query")?),
-        "search_ranked" => okf_query::search_ranked(bundle, &arg_str(arguments, "query")?),
+        "search_ranked" => {
+            let query = arg_str(arguments, "query")?;
+            if wants_json(arguments)? {
+                okf_query::search_ranked_json(bundle, &query)
+            } else {
+                okf_query::search_ranked(bundle, &query)
+            }
+        }
         "search_semantic" => {
             let query = arg_str(arguments, "query")?;
             let limit = arguments
@@ -139,7 +168,11 @@ pub fn call_with(
             // its own clear error, even against a project that hasn't
             // been `generate`d yet -- matching every other tool here.
             let query = arg_str(arguments, "query")?;
-            okf_query::explore_from_concepts(&cache.get_or_load(bundle)?, &query)
+            if wants_json(arguments)? {
+                okf_query::explore_json_from_concepts(&cache.get_or_load(bundle)?, &query)
+            } else {
+                okf_query::explore_from_concepts(&cache.get_or_load(bundle)?, &query)
+            }
         }
         "coverage" => Ok(okf_query::coverage_from_concepts(
             &cache.get_or_load(bundle)?,
@@ -162,12 +195,34 @@ fn graph_relation(
     plan_change: &okf_query::PlanChangeOptions,
 ) -> Result<String> {
     let relation = arg_str(arguments, "relation")?;
+    let json = wants_json(arguments)?;
+    if json && !matches!(relation.as_str(), "callers" | "callees" | "file") {
+        return Err(anyhow!(
+            "format `json` is available for relation callers, callees and file; `{relation}` answers in text"
+        ));
+    }
     // Each arm validates the arguments *that relation* needs before
     // touching the bundle/cache, so a malformed request (missing `id`/
     // `from`/`to`) always gets its own clear error rather than a
     // "no bundle found" error from a project that hasn't been
     // `generate`d yet masking the real problem with the request.
     match relation.as_str() {
+        "callers" if json => {
+            let id = arg_str(arguments, "id")?;
+            okf_query::neighbours_json_from_concepts(
+                &cache.get_or_load(bundle)?,
+                &id,
+                okf_query::Neighbours::Callers,
+            )
+        }
+        "callees" if json => {
+            let id = arg_str(arguments, "id")?;
+            okf_query::neighbours_json_from_concepts(
+                &cache.get_or_load(bundle)?,
+                &id,
+                okf_query::Neighbours::Callees,
+            )
+        }
         "callers" => {
             let id = arg_str(arguments, "id")?;
             okf_query::graph_callers_from_concepts(&cache.get_or_load(bundle)?, &id)
@@ -175,6 +230,15 @@ fn graph_relation(
         "callees" => {
             let id = arg_str(arguments, "id")?;
             okf_query::graph_callees_from_concepts(&cache.get_or_load(bundle)?, &id)
+        }
+        "file" => {
+            let path = arg_str(arguments, "path")?;
+            let concepts = cache.get_or_load(bundle)?;
+            if json {
+                okf_query::file_concepts_json(&concepts, &path)
+            } else {
+                okf_query::file_concepts_text(&concepts, &path)
+            }
         }
         "path" => {
             let from = arg_str(arguments, "from")?;
@@ -208,7 +272,7 @@ fn graph_relation(
                 .map(|plan| plan.to_json())
         }
         other => Err(anyhow!(
-            "unknown relation `{other}` for the graph tool — expected one of: callers, callees, path, explain, api, cycles, modules, isolated, stats, layers, domains, communities, patterns, features, plan-change"
+            "unknown relation `{other}` for the graph tool — expected one of: callers, callees, path, explain, api, cycles, modules, isolated, stats, layers, domains, communities, patterns, features, plan-change, file"
         )),
     }
 }
@@ -602,5 +666,146 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cache.load_count_for_tests(), 1);
+    }
+
+    fn parse(text: &str) -> Value {
+        serde_json::from_str(text).expect("valid JSON")
+    }
+
+    #[test]
+    fn search_ranked_and_explore_answer_in_json_when_asked() {
+        let dir = sample_bundle();
+        let cache = cache();
+        let ranked = parse(
+            &call(
+                "search_ranked",
+                &json!({ "query": "decode_jwt", "format": "json" }),
+                dir.path(),
+                &cache,
+            )
+            .unwrap(),
+        );
+        assert_eq!(ranked["schema"], okf_query::SEARCH_RANKED_SCHEMA);
+        assert!(ranked["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["id"] == "functions/auth/decode_jwt" && h["title"] == "decode_jwt"));
+
+        let explored = parse(
+            &call(
+                "explore",
+                &json!({ "query": "functions/auth/decode_jwt", "format": "json" }),
+                dir.path(),
+                &cache,
+            )
+            .unwrap(),
+        );
+        assert_eq!(explored["schema"], okf_query::EXPLORE_SCHEMA);
+        assert_eq!(explored["callers"][0]["id"], "functions/auth/verify_token");
+        assert_eq!(explored["location"]["file"], "src/auth.rs");
+    }
+
+    #[test]
+    fn graph_callers_callees_and_file_answer_in_json_when_asked() {
+        let dir = sample_bundle();
+        let cache = cache();
+        let callers = parse(
+            &call(
+                "graph",
+                &json!({ "relation": "callers", "id": "functions/auth/decode_jwt", "format": "json" }),
+                dir.path(),
+                &cache,
+            )
+            .unwrap(),
+        );
+        assert_eq!(callers["concepts"][0]["id"], "functions/auth/verify_token");
+
+        let file = parse(
+            &call(
+                "graph",
+                &json!({ "relation": "file", "path": "src/auth.rs", "format": "json" }),
+                dir.path(),
+                &cache,
+            )
+            .unwrap(),
+        );
+        let ids: Vec<&str> = file["concepts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["functions/auth/verify_token", "functions/auth/decode_jwt"]
+        );
+
+        let text = call(
+            "graph",
+            &json!({ "relation": "file", "path": "src/auth.rs" }),
+            dir.path(),
+            &cache,
+        )
+        .unwrap();
+        assert!(
+            text.contains("functions/auth/verify_token (src/auth.rs#L1)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn graph_file_needs_a_path_even_against_a_missing_bundle() {
+        let err = call(
+            "graph",
+            &json!({ "relation": "file" }),
+            Path::new("/nonexistent"),
+            &cache(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("missing required argument `path`"));
+    }
+
+    #[test]
+    fn json_on_a_text_only_relation_and_an_unknown_format_are_clear_errors() {
+        let dir = sample_bundle();
+        let err = call(
+            "graph",
+            &json!({ "relation": "api", "format": "json" }),
+            dir.path(),
+            &cache(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("answers in text"));
+
+        let err = call(
+            "search_ranked",
+            &json!({ "query": "x", "format": "yaml" }),
+            dir.path(),
+            &cache(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown format `yaml`"));
+    }
+
+    /// A client detects the structured results from the schemas alone:
+    /// `format` on search_ranked, explore and graph, and the `file`
+    /// relation.
+    #[test]
+    fn the_schemas_advertise_json_and_the_file_relation() {
+        let tools = list();
+        for name in ["search_ranked", "explore", "graph"] {
+            let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+            assert_eq!(
+                tool["inputSchema"]["properties"]["format"]["enum"],
+                json!(["text", "json"]),
+                "{name}"
+            );
+        }
+        let graph = tools.iter().find(|t| t["name"] == "graph").unwrap();
+        assert!(graph["inputSchema"]["properties"]["relation"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("file")));
     }
 }
