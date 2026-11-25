@@ -70,7 +70,10 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             archive_ext: tar.gz
-          - os: macos-14
+          # Apple Silicon. GitHub retired the macos-14 image (jobs on it are
+          # cancelled with "configuration 'macos-14-arm64-us-default' is
+          # not supported").
+          - os: macos-15
             target: aarch64-apple-darwin
             archive_ext: tar.gz
           - os: windows-latest
