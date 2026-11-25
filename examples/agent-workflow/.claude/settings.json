@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__okf",
+      "Bash(okf-rs search *)",
+      "Bash(okf-rs graph *)",
+      "Bash(okf-rs coverage *)",
+      "Bash(okf-rs validate *)",
+      "Bash(okf-rs diff *)",
+      "Bash(okf-rs impact *)",
+      "Bash(okf-rs review *)",
+      "Bash(okf-rs generate --check-fresh)",
+      "Bash(git diff *)",
+      "Bash(git log *)"
+    ]
+  }
+}

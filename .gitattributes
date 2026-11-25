@@ -1,0 +1,5 @@
+# Shell scripts must keep LF line endings on every platform: bash fails on
+# CRLF ("$'\r': command not found") when a Windows checkout converts them.
+*.sh text eol=lf
+# Benchmark task files are read by bash with tab splitting; keep them LF too.
+*.tsv text eol=lf

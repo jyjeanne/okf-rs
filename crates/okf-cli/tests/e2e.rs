@@ -1342,6 +1342,69 @@ fn standalone_binary_check_fresh_reports_stale_after_a_source_change() {
     assert_eq!(bundle_before, bundle_after);
 }
 
+/// Renaming a function and regenerating must not leave the old concept
+/// file behind: a leftover would still be linked from nowhere (`validate`
+/// would flag it), still show up in `search`, and keep `--check-fresh`
+/// reporting the bundle stale forever, since a fresh generation never has
+/// it.
+#[test]
+fn standalone_binary_generate_removes_the_files_of_a_renamed_function() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn old_name() {}\npub fn caller() { old_name(); }\n",
+    )
+    .unwrap();
+    assert_success(&run(&project, &["generate", "."]), &["generate"]);
+    let functions = project.join("knowledge/functions");
+    let old_file = fs::read_dir(&functions)
+        .unwrap()
+        .flatten()
+        .flat_map(|module| fs::read_dir(module.path()).into_iter().flatten().flatten())
+        .map(|e| e.path())
+        .find(|p| p.file_name().is_some_and(|n| n == "old_name.md"))
+        .expect("first generate should write old_name.md");
+    let notes = project.join("knowledge/NOTES.md");
+    fs::write(&notes, "Hand-written, not okf-rs's.\n").unwrap();
+
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn new_name() {}\npub fn caller() { new_name(); }\n",
+    )
+    .unwrap();
+    let regenerate = run(&project, &["generate", "."]);
+    assert_success(&regenerate, &["generate"]);
+
+    assert!(!old_file.exists(), "{} was left behind", old_file.display());
+    assert!(old_file.with_file_name("new_name.md").exists());
+    assert!(notes.exists(), "a file okf-rs didn't write was removed");
+    // `validate` would (rightly) flag the plain note itself.
+    fs::remove_file(&notes).unwrap();
+    assert!(
+        stdout_of(&regenerate).contains("Removed 1 stale file"),
+        "unexpected output: {}",
+        stdout_of(&regenerate)
+    );
+
+    let validate = run(&project, &["validate", "knowledge"]);
+    assert_success(&validate, &["validate"]);
+    assert!(
+        stdout_of(&validate).contains("no issues found"),
+        "unexpected output: {}",
+        stdout_of(&validate)
+    );
+    let check = run(&project, &["generate", ".", "--check-fresh"]);
+    assert_success(&check, &["generate --check-fresh"]);
+    assert!(stdout_of(&check).contains("Up to date"));
+}
+
 /// `--check-fresh` needs an existing bundle to compare against -- on a
 /// project that's never been generated, it should fail with a clear
 /// message pointing at `generate`, not report every file as "stale".
@@ -1924,4 +1987,153 @@ fn standalone_binary_reports_a_clear_error_when_no_bundle_exists_yet() {
     );
     assert!(!callers.status.success());
     assert!(stderr_of(&callers).contains("okf-rs generate"));
+}
+
+/// Writes the small Rust project `graph plan-change`'s golden test runs
+/// against: `login` (public) calls `authenticate` (public), which calls
+/// `verify_password`; `test_login` (matched by `symbol_pattern`),
+/// `handle_callback` (another module), and
+/// `tests::login_accepts_a_known_user` (a `#[test]` in a `#[cfg(test)]`
+/// module, matched by `tag` through the Rust extractor's test tag) call
+/// `login`; `tests/login.rs`'s `login_flow` (matched by `path_segment`)
+/// calls it too. Written from the test rather than checked in, so this
+/// repo's own bundle never picks up the fixture's `Cargo.toml` as a
+/// package.
+fn write_plan_change_fixture(project: &Path) {
+    let files = [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"plan-change-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("src/lib.rs", "pub mod auth;\npub mod oauth;\n"),
+        (
+            "src/auth.rs",
+            "pub fn authenticate(user: &str) -> bool {\n    verify_password(user)\n}\n\nfn verify_password(user: &str) -> bool {\n    !user.is_empty()\n}\n\npub fn login(user: &str) -> bool {\n    authenticate(user)\n}\n\nfn test_login() {\n    login(\"alice\");\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn login_accepts_a_known_user() {\n        let ok = super::login(\"carol\");\n        assert!(ok);\n    }\n}\n",
+        ),
+        (
+            "src/oauth.rs",
+            "pub fn handle_callback(user: &str) -> bool {\n    crate::auth::login(user)\n}\n",
+        ),
+        (
+            "tests/login.rs",
+            "fn login_flow() {\n    plan_change_fixture::auth::login(\"bob\");\n}\n",
+        ),
+    ];
+    for (relative, content) in files {
+        let path = project.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+}
+
+/// `graph plan-change` end to end: JSON output byte-identical to the
+/// reviewed golden file (spec §4.1.9), deterministic across runs, a text
+/// rendering, `okf.toml`'s `[plan_change]` table honored, and the two
+/// error cases (unknown id with candidates, structural id).
+#[test]
+fn graph_plan_change_matches_the_golden_file() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("fixture");
+    write_plan_change_fixture(&project);
+
+    let generate = run(&project, &["generate", "."]);
+    assert_success(&generate, &["generate"]);
+
+    let target = "functions/src/auth/authenticate";
+    let args = ["graph", "plan-change", target, "--project", "."];
+    let first = run(&project, &args);
+    assert_success(&first, &args);
+    // A checkout with `core.autocrlf` may hand the golden file back with
+    // CRLF line endings; the contract is the content, not the platform's
+    // line terminator.
+    let golden =
+        fs::read_to_string(repo_root().join("tests/fixtures/plan-change/authenticate.json"))
+            .unwrap()
+            .replace("\r\n", "\n");
+    assert_eq!(stdout_of(&first).replace("\r\n", "\n"), golden);
+
+    let second = run(&project, &args);
+    assert_eq!(stdout_of(&first), stdout_of(&second));
+
+    let text = run(
+        &project,
+        &[
+            "graph",
+            "plan-change",
+            target,
+            "--project",
+            ".",
+            "--format",
+            "text",
+        ],
+    );
+    assert_success(&text, &["graph plan-change --format text"]);
+    assert!(stdout_of(&text).starts_with(&format!("Change plan for {target} (Function)")));
+
+    fs::write(
+        project.join("okf.toml"),
+        "output = \"knowledge\"\n\n[plan_change]\nboundary_terms = [\"oauth\"]\nlarge_blast_radius = 2\n",
+    )
+    .unwrap();
+    let configured = run(&project, &args);
+    assert_success(&configured, &args);
+    let configured_out = stdout_of(&configured);
+    assert!(configured_out.contains("\"signal\": \"auth_boundary\""));
+    assert!(configured_out.contains("module(s) matching a boundary term: modules/src/oauth"));
+    assert!(configured_out.contains("(threshold 2)"));
+
+    // Right symbol, wrong path: rejected rather than guessed, with the
+    // real id offered as a candidate.
+    let unknown = run(
+        &project,
+        &[
+            "graph",
+            "plan-change",
+            "functions/auth/authenticate",
+            "--project",
+            ".",
+        ],
+    );
+    assert!(!unknown.status.success());
+    let unknown_err = stderr_of(&unknown);
+    assert!(unknown_err.contains("no concept with id `functions/auth/authenticate`"));
+    assert!(unknown_err.contains(target));
+
+    let structural = run(
+        &project,
+        &["graph", "plan-change", "modules/src/auth", "--project", "."],
+    );
+    assert!(!structural.status.success());
+    assert!(stderr_of(&structural).contains("is a Module concept"));
+}
+
+/// `[agents] protocol = true` adds the OKF development-protocol directive
+/// to the generated `AGENTS.md` section, and survives repeated `init` runs
+/// (`init` rewrites only `okf.toml`'s `output` line). Without the flag the
+/// directive is absent.
+#[test]
+fn init_writes_the_protocol_directive_only_when_opted_in() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("fixture");
+    write_plan_change_fixture(&project);
+
+    let plain = run(&project, &["init", "."]);
+    assert_success(&plain, &["init"]);
+    let agents = fs::read_to_string(project.join("AGENTS.md")).unwrap();
+    assert!(!agents.contains("OKF development protocol"));
+
+    fs::write(
+        project.join("okf.toml"),
+        "output = \"knowledge\"\n\n[agents]\nprotocol = true\n",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let opted_in = run(&project, &["init", "."]);
+        assert_success(&opted_in, &["init"]);
+    }
+    let agents = fs::read_to_string(project.join("AGENTS.md")).unwrap();
+    assert_eq!(agents.matches("OKF development protocol").count(), 1);
+    assert!(agents.contains("okf-rs graph plan-change <id>"));
+    let config = fs::read_to_string(project.join("okf.toml")).unwrap();
+    assert!(config.contains("[agents]\nprotocol = true"));
 }

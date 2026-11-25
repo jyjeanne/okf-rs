@@ -1,0 +1,7 @@
+# Structural questions on Jujutsu (github.com/jj-vcs/jj) at 4351061bb. P1 gate since the 2026-11-17 re-scope (spec D-9).
+# Fixed, with ground truth, before the first run: docs/benchmarks/agent-integration-p1-structural.md.
+S1	List every function in jj that calls `persist_temp_file` directly.
+S2	List every function in jj that calls `Store::concurrency()`.
+S3	Which `jj` commands can end up calling `parse_object_format_mismatch`, and through which call chain does each one reach it?
+S4	What chain of function calls leads from the command handler of `jj resolve` to `edit_conflict_markers_in_text_editor`?
+S5	When jj snapshots the working copy, which functions call each other recursively to walk the directory tree, and which function starts that recursion?

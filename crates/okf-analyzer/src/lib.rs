@@ -15,12 +15,20 @@
 //! definition that specific call site resolves to — real type/scope
 //! resolution Tree-sitter's own name-matching has no way to approximate.
 //!
+//! Between the two, Rust method calls are also resolved by the type of
+//! their receiver, traced from the syntax alone (see the `receiver`
+//! module): `store.concurrency()` resolves to `Store::concurrency` even
+//! when other types define a `concurrency` method too, and a name-only
+//! edge from a call on a standard-library or third-party type is dropped.
+//! Those edges carry resolver `tree-sitter-receiver`.
+//!
 //! Per-file extraction (the expensive tree-sitter parse) can be skipped
 //! for files that haven't changed since a previous run — see
 //! [`analyze_with_cache`] and [`AnalysisCache`].
 
 mod cache;
 mod lsp;
+mod receiver;
 
 pub use cache::AnalysisCache;
 pub use lsp::{CrateWarmup, ProbeSkips};
@@ -143,6 +151,7 @@ pub fn analyze_with_cache_lsp_warmed(
     let mut concepts = detect_packages(project)?;
 
     let mut calls: Vec<(CallCandidate, Language, String)> = Vec::new();
+    let mut type_facts: Vec<okf_tree_sitter::TypeFacts> = Vec::new();
     let mut stats = IncrementalStats::default();
     let mut fresh_cache = AnalysisCache::default();
     // Only populated when `use_lsp` is set, so a plain `generate` doesn't
@@ -212,6 +221,7 @@ pub fn analyze_with_cache_lsp_warmed(
             calls.push((call, result.language, result.relative_path.clone()));
         }
         concepts.extend(result.extraction.concepts);
+        type_facts.push(result.extraction.types);
         if let Some(source) = result.source {
             file_sources.insert(result.relative_path, source);
         }
@@ -230,8 +240,9 @@ pub fn analyze_with_cache_lsp_warmed(
     link_modules_to_packages(&mut concepts);
 
     let symbol_table = build_symbol_table(&concepts);
+    let types = receiver::TypeIndex::new(&type_facts, &concepts);
     let (mut resolved_edges, ambiguous_indices) =
-        split_ambiguous_calls(&calls, &symbol_table, use_lsp);
+        split_ambiguous_calls(&calls, &symbol_table, &types, use_lsp);
     let ambiguous: Vec<&(CallCandidate, Language, String)> =
         ambiguous_indices.iter().map(|&i| &calls[i]).collect();
 
@@ -309,6 +320,7 @@ pub fn analyze_with_cache_lsp_warmed(
 pub fn probe_cold_crates(project: &Project) -> Result<(Vec<lsp::CrateProbeResult>, ProbeSkips)> {
     let mut concepts = detect_packages(project)?;
     let mut calls: Vec<(CallCandidate, Language, String)> = Vec::new();
+    let mut type_facts: Vec<okf_tree_sitter::TypeFacts> = Vec::new();
     let mut file_sources: HashMap<String, String> = HashMap::new();
 
     // Same per-file rayon extraction shape as `analyze_with_cache_lsp_warmed`,
@@ -339,6 +351,7 @@ pub fn probe_cold_crates(project: &Project) -> Result<(Vec<lsp::CrateProbeResult
             calls.push((call, result.language, result.relative_path.clone()));
         }
         concepts.extend(result.extraction.concepts);
+        type_facts.push(result.extraction.types);
         if let Some(source) = result.source {
             file_sources.insert(result.relative_path, source);
         }
@@ -348,11 +361,13 @@ pub fn probe_cold_crates(project: &Project) -> Result<(Vec<lsp::CrateProbeResult
     link_modules_to_packages(&mut concepts);
 
     let symbol_table = build_symbol_table(&concepts);
+    let types = receiver::TypeIndex::new(&type_facts, &concepts);
     // The probe only ever cares about the ambiguous half of this split --
     // `resolved_edges` here is Tree-sitter's own unambiguous resolution,
     // irrelevant to a probe that never writes a bundle or resolves
     // anything for real.
-    let (_resolved_edges, ambiguous_indices) = split_ambiguous_calls(&calls, &symbol_table, true);
+    let (_resolved_edges, ambiguous_indices) =
+        split_ambiguous_calls(&calls, &symbol_table, &types, true);
     let ambiguous: Vec<&(CallCandidate, Language, String)> =
         ambiguous_indices.iter().map(|&i| &calls[i]).collect();
 
@@ -394,25 +409,75 @@ fn build_symbol_table(concepts: &[Concept]) -> HashMap<&str, Vec<&str>> {
 /// between them, so a future change to the rule (e.g. also considering
 /// arity) could update one and silently miss the other. A `/code-review`
 /// finding.
+///
+/// Receiver types (see the `receiver` module) refine both halves: an
+/// ambiguous call whose receiver resolves to a type owning exactly one of
+/// the candidates is resolved here, with resolver
+/// [`receiver::RESOLVER`] (never sent to `--lsp`); a call whose receiver
+/// is a type the project doesn't define gets no edge at all, whether its
+/// name is unique or not.
 fn split_ambiguous_calls(
     calls: &[(CallCandidate, Language, String)],
     symbol_table: &HashMap<&str, Vec<&str>>,
+    types: &receiver::TypeIndex,
     include_ambiguous: bool,
 ) -> (Vec<ResolvedEdge>, Vec<usize>) {
     let mut resolved_edges = Vec::new();
     let mut ambiguous_indices = Vec::new();
     for (i, (call, _, _)) in calls.iter().enumerate() {
-        let Some(candidates) = symbol_table.get(call.callee_name.as_str()) else {
+        let Some(named) = symbol_table.get(call.callee_name.as_str()) else {
             continue;
         };
+        // `x.f()` can't call a free function, nor `f()` a method.
+        let candidates: Vec<&str> = named
+            .iter()
+            .copied()
+            .filter(|id| types.form_allows(call.form, id))
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        let receiver_type = call.receiver.as_ref().and_then(|hint| types.resolve(hint));
+        if receiver_type
+            .as_deref()
+            .is_some_and(|ty| types.is_external(ty))
+        {
+            // A method of a standard-library or third-party type: no
+            // project concept is the callee, however the name matches.
+            // (A project extension trait implemented for that type only by
+            // a blanket or empty impl is missed: telling whether an impl
+            // applies to the receiver needs impl facts the extractor
+            // doesn't record. Keeping every project-trait method instead
+            // drew `vec.is_empty()` to an unrelated project impl.)
+            continue;
+        }
         if candidates.len() != 1 {
+            if let Some(ty) = receiver_type.as_deref() {
+                let matching: Vec<&str> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|id| types.accepts(id, ty))
+                    .collect();
+                if let [callee] = matching.as_slice() {
+                    if *callee != call.caller_id || receiver::is_self_recursion(call) {
+                        resolved_edges.push(ResolvedEdge {
+                            caller: call.caller_id.clone(),
+                            callee: callee.to_string(),
+                            resolved_by: receiver::RESOLVER.to_string(),
+                            confidence: Confidence::Semantic,
+                            resolver_version: None,
+                        });
+                    }
+                    continue;
+                }
+            }
             if include_ambiguous {
                 ambiguous_indices.push(i);
             }
             continue;
         }
         let callee_id = candidates[0].to_string();
-        if callee_id != call.caller_id {
+        if callee_id != call.caller_id || receiver::is_self_recursion(call) {
             resolved_edges.push(ResolvedEdge {
                 caller: call.caller_id.clone(),
                 callee: callee_id,
@@ -1375,6 +1440,8 @@ mod tests {
             CallCandidate {
                 caller_id: caller_id.to_string(),
                 callee_name: callee_name.to_string(),
+                receiver: None,
+                form: Default::default(),
                 call_site: okf_tree_sitter::CallSite {
                     line: 0,
                     character: 0,
@@ -1418,7 +1485,8 @@ mod tests {
         let symbol_table = build_symbol_table(&concepts);
 
         let calls = vec![call("functions/a", "unique"), call("functions/a", "dup")];
-        let (resolved, ambiguous) = split_ambiguous_calls(&calls, &symbol_table, true);
+        let (resolved, ambiguous) =
+            split_ambiguous_calls(&calls, &symbol_table, &receiver::TypeIndex::default(), true);
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].callee, "functions/unique");
@@ -1435,24 +1503,86 @@ mod tests {
         let symbol_table = build_symbol_table(&concepts);
         let calls = vec![call("functions/other", "dup")];
 
-        let (resolved, ambiguous) = split_ambiguous_calls(&calls, &symbol_table, false);
+        let (resolved, ambiguous) = split_ambiguous_calls(
+            &calls,
+            &symbol_table,
+            &receiver::TypeIndex::default(),
+            false,
+        );
 
         assert!(resolved.is_empty());
         assert!(ambiguous.is_empty());
     }
 
     #[test]
-    fn split_ambiguous_calls_does_not_resolve_a_call_to_itself() {
+    fn split_ambiguous_calls_does_not_resolve_a_call_to_itself_of_unknown_form() {
+        // Languages whose extractor records no call form keep the earlier
+        // rule: never a self-edge from a name match.
         let mut recursive = make_concept("functions/recursive", "fn recursive()");
         recursive.name = "recursive".to_string();
         let concepts = vec![recursive];
         let symbol_table = build_symbol_table(&concepts);
         let calls = vec![call("functions/recursive", "recursive")];
 
-        let (resolved, ambiguous) = split_ambiguous_calls(&calls, &symbol_table, true);
+        let (resolved, ambiguous) =
+            split_ambiguous_calls(&calls, &symbol_table, &receiver::TypeIndex::default(), true);
 
         assert!(resolved.is_empty());
         assert!(ambiguous.is_empty());
+    }
+
+    #[test]
+    fn split_ambiguous_calls_records_a_plain_recursive_call() {
+        let mut recursive = make_concept("functions/recursive", "fn recursive()");
+        recursive.name = "recursive".to_string();
+        let concepts = vec![recursive];
+        let symbol_table = build_symbol_table(&concepts);
+        let mut plain = call("functions/recursive", "recursive");
+        plain.0.form = okf_tree_sitter::CallForm::Plain;
+
+        let (resolved, _) = split_ambiguous_calls(
+            &[plain],
+            &symbol_table,
+            &receiver::TypeIndex::default(),
+            true,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].caller, resolved[0].callee);
+    }
+
+    #[test]
+    fn a_method_call_never_resolves_to_a_free_function_nor_a_plain_call_to_a_method() {
+        use okf_tree_sitter::CallForm;
+        let mut clone_fn = make_concept("functions/testutils/clone", "fn clone(dest: &Path)");
+        clone_fn.name = "clone".to_string();
+        let mut get_fn = make_concept("functions/get", "fn get()");
+        get_fn.name = "get".to_string();
+        let mut get_method = make_concept("functions/Foo/get", "fn get(&self)");
+        get_method.kind = ConceptKind::Method;
+        get_method.name = "get".to_string();
+        let concepts = vec![clone_fn, get_fn, get_method];
+        let symbol_table = build_symbol_table(&concepts);
+        let types = receiver::TypeIndex::new(std::iter::empty(), &concepts);
+        let with_form = |name: &str, form: CallForm| {
+            let mut c = call("functions/caller", name);
+            c.0.form = form;
+            c
+        };
+        let calls = vec![
+            with_form("clone", CallForm::Method),
+            with_form("get", CallForm::Plain),
+            with_form("get", CallForm::Method),
+            with_form("get", CallForm::Path),
+        ];
+
+        let (resolved, ambiguous) = split_ambiguous_calls(&calls, &symbol_table, &types, true);
+
+        let callees: Vec<&str> = resolved.iter().map(|e| e.callee.as_str()).collect();
+        // `x.clone()` has no candidate; `get()` and `x.get()` each have one;
+        // `Foo::get()`/`module::get()` could be either, so stays ambiguous.
+        assert_eq!(callees, ["functions/get", "functions/Foo/get"]);
+        assert_eq!(ambiguous, vec![3]);
     }
 
     #[test]

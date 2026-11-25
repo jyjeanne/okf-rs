@@ -15,6 +15,7 @@ okf-core.workspace = true
 okf-parser.workspace = true
 okf-graph.workspace = true
 okf-query.workspace = true
+okf-search.workspace = true
 okf-enrich.workspace = true
 anyhow.workspace = true
 serde.workspace = true

@@ -15,6 +15,12 @@ pub struct Config {
     /// defaults); only present once a project has actually opted into a
     /// non-default `[diff]` policy.
     pub diff: DiffPolicy,
+    /// `okf-rs graph plan-change`'s risk-rule settings — see
+    /// [`PlanChangeConfig`]. Optional `[plan_change]` table.
+    pub plan_change: PlanChangeConfig,
+    /// What `okf-rs init` writes into the agent entry-point files — see
+    /// [`AgentsConfig`]. Optional `[agents]` table.
+    pub agents: AgentsConfig,
 }
 
 impl Default for Config {
@@ -22,8 +28,44 @@ impl Default for Config {
         Config {
             output: PathBuf::from("knowledge"),
             diff: DiffPolicy::default(),
+            plan_change: PlanChangeConfig::default(),
+            agents: AgentsConfig::default(),
         }
     }
+}
+
+/// `okf.toml`'s optional `[plan_change]` table: the project-level knobs of
+/// `plan-change`'s risk rules (`okf_query::PlanChangeOptions` mirrors
+/// these; this crate doesn't depend on `okf-query`, so the CLI and MCP
+/// server copy the values across). Defaults apply to any key the table
+/// omits, or if the table itself is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanChangeConfig {
+    /// `large_blast_radius` fires at this many affected concepts or more.
+    /// Default 10; must be at least 1.
+    pub large_blast_radius: usize,
+    /// Module-path segments that mark a sensitive boundary (e.g.
+    /// `["auth", "payment"]`) for the `auth_boundary` rule. Default empty.
+    pub boundary_terms: Vec<String>,
+}
+
+impl Default for PlanChangeConfig {
+    fn default() -> Self {
+        PlanChangeConfig {
+            large_blast_radius: 10,
+            boundary_terms: Vec::new(),
+        }
+    }
+}
+
+/// `okf.toml`'s optional `[agents]` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AgentsConfig {
+    /// Whether `okf-rs init` adds the OKF development-protocol directive
+    /// to the generated `AGENTS.md` section. Default `false` (opt-in): a
+    /// project that doesn't use the agent skill pack shouldn't receive an
+    /// instruction it can't follow.
+    pub protocol: bool,
 }
 
 /// `okf-rs diff --ci`'s configurable policy: how a resolver-level or
@@ -134,7 +176,76 @@ pub fn load(project_root: &Path) -> Config {
         }
     };
     let diff = parse_diff_policy(&path, value.get("diff"));
-    Config { output, diff }
+    let plan_change = parse_plan_change(&path, value.get("plan_change"));
+    let agents = parse_agents(&path, value.get("agents"));
+    Config {
+        output,
+        diff,
+        plan_change,
+        agents,
+    }
+}
+
+/// Parses the optional `[plan_change]` table, the same "a bad value warns
+/// and keeps that one key's default" way [`parse_diff_policy`] does.
+fn parse_plan_change(config_path: &Path, table: Option<&toml::Value>) -> PlanChangeConfig {
+    let mut config = PlanChangeConfig::default();
+    let Some(table) = table else {
+        return config;
+    };
+
+    if let Some(raw) = table.get("large_blast_radius") {
+        match raw.as_integer().and_then(|n| usize::try_from(n).ok()) {
+            Some(n) if n >= 1 => config.large_blast_radius = n,
+            _ => eprintln!(
+                "warning: {} has an invalid `plan_change.large_blast_radius` value `{raw}` \
+                 (expected a positive integer); using the default {}",
+                config_path.display(),
+                config.large_blast_radius
+            ),
+        }
+    }
+    if let Some(raw) = table.get("boundary_terms") {
+        match raw.as_array() {
+            Some(items) => {
+                for item in items {
+                    match item.as_str() {
+                        Some(term) => config.boundary_terms.push(term.to_string()),
+                        None => eprintln!(
+                            "warning: {} has a non-string entry `{item}` in \
+                             `plan_change.boundary_terms`; skipping it",
+                            config_path.display()
+                        ),
+                    }
+                }
+            }
+            None => eprintln!(
+                "warning: {} has an invalid `plan_change.boundary_terms` value `{raw}` \
+                 (expected an array of strings); using the default []",
+                config_path.display()
+            ),
+        }
+    }
+    config
+}
+
+/// Parses the optional `[agents]` table.
+fn parse_agents(config_path: &Path, table: Option<&toml::Value>) -> AgentsConfig {
+    let mut config = AgentsConfig::default();
+    let Some(table) = table else {
+        return config;
+    };
+    if let Some(raw) = table.get("protocol") {
+        match raw.as_bool() {
+            Some(protocol) => config.protocol = protocol,
+            None => eprintln!(
+                "warning: {} has an invalid `agents.protocol` value `{raw}` \
+                 (expected true or false); using the default false",
+                config_path.display()
+            ),
+        }
+    }
+    config
 }
 
 /// Parses an `okf.toml`'s optional `[diff]` table into a [`DiffPolicy`],
@@ -172,14 +283,60 @@ fn parse_diff_policy(config_path: &Path, table: Option<&toml::Value>) -> DiffPol
     policy
 }
 
+/// Writes `okf.toml`'s `output` key for `okf-rs init`. A new file gets the
+/// default one-key config. An existing file keeps everything else it
+/// holds — comments, `[diff]`, `[plan_change]`, `[agents]` — and only its
+/// top-level `output` line is replaced (or added, if it had none): re-running
+/// `init` must never silently discard a project's other settings.
 pub fn write_default(project_root: &Path, output: &Path) -> Result<PathBuf> {
     let path = project_root.join(CONFIG_FILE);
-    let content = format!(
-        "# okf-rs project configuration\noutput = \"{}\"\n",
-        output.display()
-    );
+    // Rendered by the TOML serializer, not spliced into quotes: a Windows
+    // path (`docs\kb`) or a `"` would otherwise make the whole file invalid
+    // TOML, and every setting in it unreadable.
+    let output_value = toml::Value::String(output.display().to_string());
+    let output_line = format!("output = {output_value}");
+    let content = match fs::read_to_string(&path) {
+        Ok(existing) => with_output_line(&existing, &output_line),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("# okf-rs project configuration\n{output_line}\n")
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
     fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
+}
+
+/// `existing` with its top-level `output = ...` line replaced by
+/// `output_line`, or with `output_line` inserted before the first table
+/// header if there is none (top-level keys must precede every `[table]`).
+/// Only lines before the first table header are considered, so an
+/// `output` key inside some table is never touched.
+fn with_output_line(existing: &str, output_line: &str) -> String {
+    // Keep the file's own line ending: a CRLF checkout stays CRLF.
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+    let first_table = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+    let is_output_key = |line: &str| {
+        line.trim_start()
+            .strip_prefix("output")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    };
+    match lines[..first_table].iter().position(|l| is_output_key(l)) {
+        Some(i) => lines[i] = output_line.to_string(),
+        None => lines.insert(first_table, output_line.to_string()),
+    }
+    let mut content = lines.join(newline);
+    content.push_str(newline);
+    content
 }
 
 /// Resolves a bundle directory the way every okf-rs command does: an
@@ -253,6 +410,106 @@ mod tests {
         // The bad value doesn't take down the whole table.
         assert_eq!(config.diff.resolver_changes, PolicyAction::Warn);
         assert_eq!(config.diff.confidence_changes, PolicyAction::Fail);
+    }
+
+    #[test]
+    fn plan_change_and_agents_tables_default_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "output = \"kb\"\n");
+        let config = load(dir.path());
+        assert_eq!(config.plan_change, PlanChangeConfig::default());
+        assert_eq!(config.plan_change.large_blast_radius, 10);
+        assert!(config.plan_change.boundary_terms.is_empty());
+        assert!(!config.agents.protocol);
+    }
+
+    #[test]
+    fn reads_plan_change_and_agents_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "output = \"kb\"\n\n[plan_change]\nlarge_blast_radius = 25\nboundary_terms = [\"auth\", \"payment\"]\n\n[agents]\nprotocol = true\n",
+        );
+        let config = load(dir.path());
+        assert_eq!(config.plan_change.large_blast_radius, 25);
+        assert_eq!(config.plan_change.boundary_terms, vec!["auth", "payment"]);
+        assert!(config.agents.protocol);
+    }
+
+    #[test]
+    fn invalid_plan_change_and_agents_values_keep_their_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "output = \"kb\"\n\n[plan_change]\nlarge_blast_radius = 0\nboundary_terms = [\"auth\", 3]\n\n[agents]\nprotocol = \"yes\"\n",
+        );
+        let config = load(dir.path());
+        // 0 would make the rule fire on every plan; rejected.
+        assert_eq!(config.plan_change.large_blast_radius, 10);
+        // The bad entry is skipped, the good one kept.
+        assert_eq!(config.plan_change.boundary_terms, vec!["auth"]);
+        assert!(!config.agents.protocol);
+    }
+
+    #[test]
+    fn write_default_creates_a_new_config() {
+        let dir = tempfile::tempdir().unwrap();
+        write_default(dir.path(), Path::new("kb")).unwrap();
+        let content = fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert_eq!(content, "# okf-rs project configuration\noutput = \"kb\"\n");
+    }
+
+    #[test]
+    fn write_default_keeps_every_other_setting_of_an_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "# my comment\noutput = \"old\"\n\n[diff]\nresolver_changes = \"fail\"\n\n[agents]\nprotocol = true\n",
+        );
+        write_default(dir.path(), Path::new("new")).unwrap();
+        let content = fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert_eq!(
+            content,
+            "# my comment\noutput = \"new\"\n\n[diff]\nresolver_changes = \"fail\"\n\n[agents]\nprotocol = true\n"
+        );
+        let config = load(dir.path());
+        assert_eq!(config.output, PathBuf::from("new"));
+        assert_eq!(config.diff.resolver_changes, PolicyAction::Fail);
+        assert!(config.agents.protocol);
+    }
+
+    #[test]
+    fn write_default_escapes_a_windows_path_and_keeps_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "output = \"old\"\r\n\r\n[agents]\r\nprotocol = true\r\n",
+        );
+        write_default(dir.path(), Path::new(r"docs\kb")).unwrap();
+        let content = fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(
+            content.ends_with("[agents]\r\nprotocol = true\r\n"),
+            "{content:?}"
+        );
+        let config = load(dir.path());
+        assert_eq!(config.output, PathBuf::from(r"docs\kb"));
+        assert!(config.agents.protocol);
+    }
+
+    #[test]
+    fn write_default_adds_output_before_the_first_table_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "[agents]\nprotocol = true\noutput = \"not-top-level\"\n",
+        );
+        write_default(dir.path(), Path::new("kb")).unwrap();
+        let content = fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert_eq!(
+            content,
+            "output = \"kb\"\n[agents]\nprotocol = true\noutput = \"not-top-level\"\n"
+        );
+        assert_eq!(load(dir.path()).output, PathBuf::from("kb"));
     }
 
     #[test]

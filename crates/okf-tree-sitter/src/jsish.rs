@@ -193,6 +193,8 @@ pub fn extract(
     for (range, callee_name, call_site) in raw_calls {
         if let Some(caller_id) = smallest_containing(&function_spans, range.start) {
             calls.push(CallCandidate {
+                receiver: None,
+                form: Default::default(),
                 caller_id: caller_id.to_string(),
                 callee_name,
                 call_site,
@@ -203,6 +205,7 @@ pub fn extract(
     let mut all = vec![module_concept];
     all.extend(concepts);
     Ok(FileExtraction {
+        types: Default::default(),
         concepts: all,
         calls,
     })

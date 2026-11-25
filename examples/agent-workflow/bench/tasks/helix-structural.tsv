@@ -1,0 +1,7 @@
+# Held-out structural questions on Helix (github.com/helix-editor/helix) at 49986e66. Chosen and answered by grep
+# and code reading only, before any okf-rs command ran on Helix. Ground truth: docs/benchmarks/agent-integration-p1-heldout.md.
+H1	List every function in Helix that calls `rope_is_line_ending` directly.
+H2	List every function in Helix that calls `View::ensure_cursor_in_view`.
+H3	Which typable commands (`:` commands) in Helix can end up calling `Editor::close_document`, and through which call chain does each one reach it?
+H4	What chain of function calls leads from the `goto_definition` command to `jump_to_position`?
+H5	When Helix elaborates a parsed snippet, which functions call each other recursively, and which function starts that recursion?

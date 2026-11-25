@@ -2,9 +2,14 @@ use crate::common::{
     import_relationship, location, lsp_position, make_concept, module_concept, module_path,
     node_text, signature_before_body, slugify, smallest_containing,
 };
-use crate::{CallCandidate, CallSite, FileExtraction};
+use crate::rust_types::{normalize_type, resolve_type_text, self_type, HintContext};
+use crate::{
+    AliasFact, CallCandidate, CallForm, CallSite, FieldFact, FileExtraction, FunctionFact,
+    MethodFact, TypeFacts, TypeHint,
+};
 use anyhow::{Context, Result};
 use okf_parser::{Concept, ConceptKind, Language};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
@@ -14,6 +19,17 @@ const QUERY_SRC: &str = r#"
 (enum_item (visibility_modifier)? @enum.vis name: (type_identifier) @enum.name) @enum.def
 (trait_item (visibility_modifier)? @trait.vis name: (type_identifier) @trait.name) @trait.def
 (function_item (visibility_modifier)? @fn.vis name: (identifier) @fn.name) @fn.def
+(call_expression function: (identifier) @call.name) @call.def
+(call_expression function: (field_expression field: (field_identifier) @call.name)) @call.def
+(call_expression function: (scoped_identifier name: (identifier) @call.name)) @call.def
+(function_signature_item name: (identifier) @sig.name) @sig.def
+(field_declaration name: (field_identifier) @field.name type: (_) @field.type) @field.def
+(type_item name: (type_identifier) @alias.name type: (_) @alias.type) @alias.def
+"#;
+
+/// The call patterns of [`QUERY_SRC`] alone, for the re-parse of macro
+/// arguments in [`macro_calls`].
+const CALL_QUERY_SRC: &str = r#"
 (call_expression function: (identifier) @call.name) @call.def
 (call_expression function: (field_expression field: (field_identifier) @call.name)) @call.def
 (call_expression function: (scoped_identifier name: (identifier) @call.name)) @call.def
@@ -64,6 +80,346 @@ fn container_name<'a>(src: &'a str, function_node: Node) -> Option<Container<'a>
     }
 }
 
+/// Tag given to Rust functions and methods that are test code (see
+/// [`is_test_code`]). Consumers such as `okf_query::plan_change` read it
+/// to tell tests apart from the code they exercise — inline unit tests
+/// otherwise look like any private function in the bundle.
+pub const TEST_TAG: &str = "test";
+
+/// The `#[...]` attributes written directly before `node`, nearest first.
+/// In tree-sitter-rust, outer attributes are `attribute_item` siblings
+/// preceding the item, possibly with doc or line comments between them.
+fn preceding_attributes(node: Node) -> Vec<Node> {
+    let mut attributes = Vec::new();
+    let mut current = node.prev_sibling();
+    while let Some(sibling) = current {
+        match sibling.kind() {
+            "attribute_item" => attributes.push(sibling),
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        current = sibling.prev_sibling();
+    }
+    attributes
+}
+
+/// An attribute's text with all whitespace removed, e.g. `#[tokio::test]`.
+fn compact_attribute(src: &str, attribute: Node) -> String {
+    node_text(src, attribute)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// `#[test]`, any attribute whose path ends in `::test` (`#[tokio::test]`,
+/// `#[async_std::test]`, `#[sqlx::test]`, ...), `#[rstest]`, or
+/// `#[test_case(...)]`. Arguments are ignored.
+fn is_test_attribute(compact: &str) -> bool {
+    let inner = compact
+        .strip_prefix("#[")
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(compact);
+    let path = inner.split('(').next().unwrap_or(inner);
+    let last = path.rsplit("::").next().unwrap_or(path);
+    matches!(last, "test" | "rstest" | "test_case")
+}
+
+/// Whether `function_node` is test code: it carries a test attribute (see
+/// [`is_test_attribute`]), or it is declared, at any depth, inside a module
+/// marked exactly `#[cfg(test)]`. Compound conditions (`cfg(all(test, ..))`)
+/// and a test module kept in its own file (`#[cfg(test)] mod tests;`) are
+/// not recognized: the attribute isn't visible from the file being parsed.
+fn is_test_code(src: &str, function_node: Node) -> bool {
+    let tested = preceding_attributes(function_node)
+        .into_iter()
+        .any(|a| is_test_attribute(&compact_attribute(src, a)));
+    if tested {
+        return true;
+    }
+    let mut ancestor = function_node.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "mod_item"
+            && preceding_attributes(node)
+                .into_iter()
+                .any(|a| compact_attribute(src, a) == "#[cfg(test)]")
+        {
+            return true;
+        }
+        ancestor = node.parent();
+    }
+    false
+}
+
+/// The [`CallForm`] of the call whose callee name is `call_name`. Only the
+/// `Self*` forms and an unshadowed plain call let `okf-analyzer` record a
+/// function calling itself as recursion: `self.inner.f()` inside `f` is
+/// usually delegation to a wrapped value of another type, however its type
+/// is named.
+fn call_form(src: &str, call_name: Node, imports: &mut LocalImports) -> CallForm {
+    let Some(parent) = call_name.parent() else {
+        return CallForm::Plain;
+    };
+    match parent.kind() {
+        "field_expression" => match parent.child_by_field_name("value") {
+            Some(value) if value.kind() == "self" => CallForm::SelfMethod,
+            _ => CallForm::Method,
+        },
+        "scoped_identifier" => {
+            let path = parent
+                .child_by_field_name("path")
+                .map(|p| node_text(src, p).trim())
+                .unwrap_or("");
+            let own_type = self_type(src, parent);
+            if path == "Self" || (!path.contains("::") && own_type.as_deref() == Some(path)) {
+                CallForm::SelfPath
+            } else {
+                CallForm::Path
+            }
+        }
+        _ => {
+            if imports.imported_in_enclosing_function(src, call_name, node_text(src, call_name)) {
+                CallForm::Path
+            } else {
+                CallForm::Plain
+            }
+        }
+    }
+}
+
+/// The names `use` declarations inside each function body bring into
+/// scope, collected once per function for [`call_form`] — rescanning the
+/// body for every plain call in it is quadratic on a large function.
+#[derive(Default)]
+struct LocalImports {
+    by_function: HashMap<usize, HashSet<String>>,
+}
+
+impl LocalImports {
+    /// Whether a `use` declaration inside the function enclosing `node`
+    /// imports `name` (e.g. `use std::os::unix::fs::symlink;` inside a test
+    /// named `symlink`), making a plain `name(..)` call refer to the import.
+    fn imported_in_enclosing_function(&mut self, src: &str, node: Node, name: &str) -> bool {
+        let mut current = node.parent();
+        while let Some(n) = current {
+            if n.kind() == "function_item" {
+                return self
+                    .by_function
+                    .entry(n.id())
+                    .or_insert_with(|| local_import_names(src, n))
+                    .contains(name);
+            }
+            current = n.parent();
+        }
+        false
+    }
+}
+
+/// Every name the `use` declarations in `function`'s body (outside nested
+/// functions) import: a path's last segment (`use a::b::c;` → `c`), an
+/// alias (`use a::b as c;` → `c`), and each item of a use list. A glob
+/// (`use a::*;`) names nothing.
+fn local_import_names(src: &str, function: Node) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Some(body) = function.child_by_field_name("body") else {
+        return names;
+    };
+    let mut stack = vec![body];
+    while let Some(item) = stack.pop() {
+        if item.kind() == "use_declaration" {
+            if let Some(argument) = item.child_by_field_name("argument") {
+                use_tree_names(src, argument, &mut names);
+            }
+            continue;
+        }
+        let mut cursor = item.walk();
+        for child in item.named_children(&mut cursor) {
+            if child.kind() != "function_item" {
+                stack.push(child);
+            }
+        }
+    }
+    names
+}
+
+fn use_tree_names(src: &str, node: Node, names: &mut HashSet<String>) {
+    match node.kind() {
+        "identifier" => {
+            names.insert(node_text(src, node).to_string());
+        }
+        "scoped_identifier" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                names.insert(node_text(src, name).to_string());
+            }
+        }
+        "use_as_clause" => {
+            if let Some(alias) = node.child_by_field_name("alias") {
+                names.insert(node_text(src, alias).to_string());
+            }
+        }
+        "scoped_use_list" => {
+            if let Some(list) = node.child_by_field_name("list") {
+                use_tree_names(src, list, names);
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                use_tree_names(src, child, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A macro invocation whose arguments can be read as an expression list:
+/// `name!(..)` or `name![..]`, at any nesting depth. Tree-sitter keeps a
+/// macro's arguments as a flat token tree, so the calls in
+/// `format!("{}", run(x))` or `assert_eq!(f(), 2)` are invisible to the call
+/// patterns until the invocation is rewritten (see [`macro_calls`]).
+struct MacroArgs {
+    /// Byte range of the macro's name, which is not a call.
+    name: Range<usize>,
+    bang: usize,
+    open: usize,
+    close: usize,
+}
+
+/// Every `name!(..)`/`name![..]` invocation under `node`, including ones
+/// nested inside another invocation's arguments (which tree-sitter leaves
+/// as `identifier`, `!`, token-tree siblings rather than an invocation
+/// node). Brace-delimited invocations (`quote! { .. }`, `select! { .. }`)
+/// are skipped: their contents are usually items or a DSL, not expressions.
+fn collect_macro_args(node: Node, out: &mut Vec<MacroArgs>) {
+    if node.kind() == "macro_invocation" {
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        if let [.., name, bang, tree] = children.as_slice() {
+            push_macro_args(*name, *bang, *tree, out);
+        }
+        return;
+    }
+    if node.kind() == "token_tree" {
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        // The token tree of a `name!(..)` found here is the invocation's
+        // arguments: `push_macro_args` reads it (or skips a brace-delimited
+        // one), so the loop must not walk it a second time — each nesting
+        // level would otherwise double the work and the entries.
+        let mut consumed = None;
+        for (i, child) in children.iter().enumerate() {
+            if let [name, bang, tree] = &children[i..children.len().min(i + 3)] {
+                if name.kind() == "identifier" && bang.kind() == "!" && tree.kind() == "token_tree"
+                {
+                    push_macro_args(*name, *bang, *tree, out);
+                    consumed = Some(i + 2);
+                }
+            }
+            if consumed != Some(i) && matches!(child.kind(), "token_tree" | "macro_invocation") {
+                collect_macro_args(*child, out);
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_macro_args(child, out);
+    }
+}
+
+fn push_macro_args(name: Node, bang: Node, tree: Node, out: &mut Vec<MacroArgs>) {
+    if bang.kind() != "!" || tree.kind() != "token_tree" {
+        return;
+    }
+    // `std::format!`: the call-like name is the last segment.
+    let name = if name.kind() == "scoped_identifier" {
+        name.child_by_field_name("name").unwrap_or(name)
+    } else {
+        name
+    };
+    let last = u32::try_from(tree.child_count().saturating_sub(1)).unwrap_or(0);
+    let (Some(open), Some(close)) = (tree.child(0), tree.child(last)) else {
+        return;
+    };
+    if !matches!((open.kind(), close.kind()), ("(", ")") | ("[", "]")) {
+        return;
+    }
+    out.push(MacroArgs {
+        name: name.byte_range(),
+        bang: bang.start_byte(),
+        open: open.start_byte(),
+        close: close.start_byte(),
+    });
+    // The arguments may themselves hold nested invocations.
+    collect_macro_args(tree, out);
+}
+
+/// The calls written inside macro arguments, as
+/// `(name range, callee name, call site, receiver, form)` like the calls
+/// from the main query. `source` is re-parsed once with every invocation
+/// from [`collect_macro_args`] rewritten in place — `name!(a, b)` becomes
+/// `name (a, b)` and `name![a, b]` becomes `name (a, b)` — which keeps every
+/// byte offset (so locations, call sites, and enclosing functions are
+/// exact) and turns the arguments into ordinary expressions. Only calls
+/// inside a rewritten argument list are returned, never the macro names.
+#[allow(clippy::type_complexity)]
+fn macro_calls(
+    source: &str,
+    root: Node,
+    ts_lang: &tree_sitter::Language,
+) -> Result<Vec<(Range<usize>, String, CallSite, Option<TypeHint>, CallForm)>> {
+    let mut invocations = Vec::new();
+    collect_macro_args(root, &mut invocations);
+    if invocations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut bytes = source.as_bytes().to_vec();
+    for m in &invocations {
+        bytes[m.bang] = b' ';
+        bytes[m.open] = b'(';
+        bytes[m.close] = b')';
+    }
+    // Only ASCII bytes were replaced by ASCII bytes.
+    let rewritten = String::from_utf8(bytes).context("macro rewrite broke UTF-8")?;
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(ts_lang)
+        .context("failed to load Rust grammar")?;
+    let tree = parser
+        .parse(&rewritten, None)
+        .context("failed to parse rewritten Rust source")?;
+    let query = Query::new(ts_lang, CALL_QUERY_SRC).context("invalid Rust call query")?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), rewritten.as_bytes());
+    let mut hints = HintContext::new(&rewritten);
+    let mut imports = LocalImports::default();
+    let mut calls = Vec::new();
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if query.capture_names()[cap.index as usize] != "call.name" {
+                continue;
+            }
+            let node = cap.node;
+            let start = node.start_byte();
+            let inside = invocations
+                .iter()
+                .any(|m| m.open < start && start < m.close);
+            let is_macro_name = invocations.iter().any(|m| m.name == node.byte_range());
+            if !inside || is_macro_name {
+                continue;
+            }
+            calls.push((
+                node.byte_range(),
+                node_text(&rewritten, node).to_string(),
+                lsp_position(&rewritten, node),
+                hints.receiver_hint(node),
+                call_form(&rewritten, node, &mut imports),
+            ));
+        }
+    }
+    Ok(calls)
+}
+
 fn type_signature(src: &str, def_node: Node) -> String {
     let text = node_text(src, def_node);
     text.split(['{', ';'])
@@ -93,7 +449,12 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
 
     let mut concepts: Vec<Concept> = Vec::new();
     let mut function_spans: Vec<(String, Range<usize>)> = Vec::new();
-    let mut raw_calls: Vec<(Range<usize>, String, CallSite)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut raw_calls: Vec<(Range<usize>, String, CallSite, Option<TypeHint>, CallForm)> =
+        Vec::new();
+    let mut types = TypeFacts::default();
+    let mut hints = HintContext::new(source);
+    let mut imports = LocalImports::default();
 
     while let Some(m) = matches.next() {
         let mut import_node = None;
@@ -110,6 +471,14 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         let mut fn_name = None;
         let mut fn_vis = None;
         let mut call_name = None;
+        let mut sig_def = None;
+        let mut sig_name = None;
+        let mut field_def = None;
+        let mut field_name = None;
+        let mut field_type = None;
+        let mut alias_def = None;
+        let mut alias_name = None;
+        let mut alias_type = None;
 
         for cap in m.captures {
             let cap_name = query.capture_names()[cap.index as usize];
@@ -128,6 +497,14 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 "fn.name" => fn_name = Some(cap.node),
                 "fn.vis" => fn_vis = Some(cap.node),
                 "call.name" => call_name = Some(cap.node),
+                "sig.def" => sig_def = Some(cap.node),
+                "sig.name" => sig_name = Some(cap.node),
+                "field.def" => field_def = Some(cap.node),
+                "field.name" => field_name = Some(cap.node),
+                "field.type" => field_type = Some(cap.node),
+                "alias.def" => alias_def = Some(cap.node),
+                "alias.name" => alias_name = Some(cap.node),
+                "alias.type" => alias_type = Some(cap.node),
                 _ => {}
             }
         }
@@ -183,7 +560,8 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
 
         if let (Some(def), Some(name)) = (fn_def, fn_name) {
             let fn_name_text = node_text(source, name);
-            let (kind, qualified) = match container_name(source, def) {
+            let container = container_name(source, def);
+            let (kind, qualified) = match &container {
                 Some(Container {
                     type_name,
                     trait_name: Some(trait_name),
@@ -209,7 +587,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                     format!("{}.{}", module, fn_name_text),
                 ),
             };
-            let concept = make_concept(
+            let mut concept = make_concept(
                 kind,
                 Language::Rust,
                 fn_name_text,
@@ -218,26 +596,101 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
                 Some(signature_before_body(source, def)),
                 fn_vis.is_some(),
             );
+            if is_test_code(source, def) {
+                concept.tags.push(TEST_TAG.to_string());
+            }
+            let returns = def
+                .child_by_field_name("return_type")
+                .and_then(|r| resolve_type_text(source, def, node_text(source, r)));
+            match &container {
+                Some(c) => {
+                    if let Some(owner) = normalize_type(c.type_name) {
+                        types.methods.push(MethodFact {
+                            concept_id: Some(concept.id.clone()),
+                            owner,
+                            trait_name: c.trait_name.and_then(normalize_type),
+                            name: fn_name_text.to_string(),
+                            returns,
+                        });
+                    }
+                }
+                None => types.functions.push(FunctionFact {
+                    name: fn_name_text.to_string(),
+                    returns,
+                }),
+            }
             function_spans.push((concept.id.clone(), def.byte_range()));
             concepts.push(concept);
         }
 
+        // A trait method declared without a body: no concept, but its
+        // return type is what a call on a `dyn Trait`/`impl Trait`
+        // receiver evaluates to.
+        if let (Some(def), Some(name)) = (sig_def, sig_name) {
+            if let Some(owner) = self_type(source, def) {
+                types.methods.push(MethodFact {
+                    concept_id: None,
+                    owner,
+                    trait_name: None,
+                    name: node_text(source, name).to_string(),
+                    returns: def
+                        .child_by_field_name("return_type")
+                        .and_then(|r| resolve_type_text(source, def, node_text(source, r))),
+                });
+            }
+        }
+
+        if let (Some(def), Some(name), Some(ty)) = (field_def, field_name, field_type) {
+            let owner = def
+                .parent()
+                .and_then(|list| list.parent())
+                .filter(|s| s.kind() == "struct_item")
+                .and_then(|s| s.child_by_field_name("name"));
+            if let (Some(owner), Some(ty)) =
+                (owner, resolve_type_text(source, def, node_text(source, ty)))
+            {
+                types.fields.push(FieldFact {
+                    owner: node_text(source, owner).to_string(),
+                    field: node_text(source, name).to_string(),
+                    ty,
+                });
+            }
+        }
+
+        // An associated type (`type Item = ...;` inside an impl or trait)
+        // is not a project-wide alias.
+        if let (Some(def), Some(name), Some(ty)) = (alias_def, alias_name, alias_type) {
+            if def.parent().is_none_or(|p| p.kind() != "declaration_list") {
+                types.aliases.push(AliasFact {
+                    name: node_text(source, name).to_string(),
+                    target: resolve_type_text(source, def, node_text(source, ty)),
+                });
+            }
+        }
+
         if let Some(node) = call_name {
+            let form = call_form(source, node, &mut imports);
             raw_calls.push((
                 node.byte_range(),
                 node_text(source, node).to_string(),
                 lsp_position(source, node),
+                hints.receiver_hint(node),
+                form,
             ));
         }
     }
 
+    raw_calls.extend(macro_calls(source, tree.root_node(), &ts_lang)?);
+
     let mut calls = Vec::new();
-    for (range, callee_name, call_site) in raw_calls {
+    for (range, callee_name, call_site, receiver, form) in raw_calls {
         if let Some(caller_id) = smallest_containing(&function_spans, range.start) {
             calls.push(CallCandidate {
                 caller_id: caller_id.to_string(),
                 callee_name,
                 call_site,
+                receiver,
+                form,
             });
         }
     }
@@ -247,6 +700,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
     Ok(FileExtraction {
         concepts: all,
         calls,
+        types,
     })
 }
 
@@ -391,5 +845,442 @@ impl Public {
         assert!(!find("private_fn").is_public);
         assert!(find("pub_method").is_public);
         assert!(!find("priv_method").is_public);
+    }
+
+    #[test]
+    fn tags_test_functions_and_everything_inside_cfg_test_modules() {
+        let src = r#"
+pub fn production() {}
+
+#[inline]
+fn not_a_test() {}
+
+#[test]
+fn plain_test() {}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn async_test() {}
+
+#[rstest]
+fn parameterized() {}
+
+#[test]
+/// A doc comment between the attribute and the function.
+fn documented_test() {}
+
+#[cfg(test)]
+mod tests {
+    fn helper() {}
+
+    struct Fixture;
+    impl Fixture {
+        fn build() -> Self { Fixture }
+    }
+
+    mod nested {
+        fn deep_helper() {}
+    }
+}
+
+#[cfg(not(test))]
+mod real {
+    fn only_in_production() {}
+}
+"#;
+        let extraction = extract(src, "src/lib.rs").unwrap();
+        let tagged = |name: &str| {
+            extraction
+                .concepts
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no concept named {name}"))
+                .tags
+                .contains(&TEST_TAG.to_string())
+        };
+
+        for name in [
+            "plain_test",
+            "async_test",
+            "parameterized",
+            "documented_test",
+            "helper",
+            "build",
+            "deep_helper",
+        ] {
+            assert!(tagged(name), "{name} should be tagged as test code");
+        }
+        for name in ["production", "not_a_test", "only_in_production"] {
+            assert!(!tagged(name), "{name} should not be tagged");
+        }
+        // Types are never tagged, even inside a test module.
+        assert!(!tagged("Fixture"));
+    }
+
+    #[test]
+    fn test_attribute_paths() {
+        for yes in [
+            "#[test]",
+            "#[tokio::test]",
+            "#[tokio::test(flavor=\"multi_thread\")]",
+            "#[async_std::test]",
+            "#[rstest]",
+            "#[test_case(1,2)]",
+        ] {
+            assert!(is_test_attribute(yes), "{yes}");
+        }
+        for no in [
+            "#[inline]",
+            "#[cfg(test)]",
+            "#[testing]",
+            "#[derive(Debug)]",
+        ] {
+            assert!(!is_test_attribute(no), "{no}");
+        }
+    }
+
+    /// The receiver hint recorded for the call to `callee` inside the
+    /// function or method named `caller`.
+    fn hint_for(extraction: &FileExtraction, caller: &str, callee: &str) -> Option<TypeHint> {
+        extraction
+            .calls
+            .iter()
+            .find(|c| c.caller_id.ends_with(&format!("/{caller}")) && c.callee_name == callee)
+            .unwrap_or_else(|| panic!("no call {caller} -> {callee}"))
+            .receiver
+            .clone()
+    }
+
+    fn named(name: &str) -> TypeHint {
+        TypeHint::Named(name.to_string())
+    }
+
+    #[test]
+    fn receiver_hints_follow_parameters_lets_fields_and_chains() {
+        let src = r#"
+struct Holder { store: Arc<Store> }
+impl Holder {
+    fn store(&self) -> &Arc<Store> { &self.store }
+    fn via_field(&self) { self.store.concurrency(); }
+    fn via_method(&self) { self.store().concurrency(); }
+    fn via_self_path() -> Self { Self::new() }
+}
+fn param(store: &Arc<Store>) { store.concurrency(); }
+fn typed_let() { let s: Store = make(); s.concurrency(); }
+fn ctor() -> Result<()> { let mut f = GitFetch::new(1)?; f.fetch(); Ok(()) }
+fn chained(repo: &dyn Repo) { repo.store().concurrency(); }
+fn literal() { Store { x: 1 }.concurrency(); }
+fn shadowed(x: Old) { let x = New::default(); x.go(); }
+fn closure_param() { let f = |store| store.concurrency(); }
+fn generic<R: Repo>(repo: &R) { repo.store(); }
+fn unbounded<T>(t: T) { t.store(); }
+fn module_path() { git::push_updates(); }
+fn assoc(item: Self::Item) { item.go(); }
+"#;
+        let x = extract(src, "src/lib.rs").unwrap();
+        assert_eq!(
+            hint_for(&x, "via_field", "concurrency"),
+            Some(TypeHint::Field {
+                base: Box::new(named("Holder")),
+                field: "store".into()
+            })
+        );
+        assert_eq!(
+            hint_for(&x, "via_method", "concurrency"),
+            Some(TypeHint::MethodReturn {
+                base: Box::new(named("Holder")),
+                method: "store".into()
+            })
+        );
+        assert_eq!(hint_for(&x, "via_self_path", "new"), Some(named("Holder")));
+        assert_eq!(hint_for(&x, "param", "concurrency"), Some(named("Store")));
+        assert_eq!(
+            hint_for(&x, "typed_let", "concurrency"),
+            Some(named("Store"))
+        );
+        assert_eq!(
+            hint_for(&x, "ctor", "fetch"),
+            Some(TypeHint::FnReturn {
+                owner: Some("GitFetch".into()),
+                function: "new".into()
+            })
+        );
+        assert_eq!(
+            hint_for(&x, "chained", "concurrency"),
+            Some(TypeHint::MethodReturn {
+                base: Box::new(named("Repo")),
+                method: "store".into()
+            })
+        );
+        assert_eq!(hint_for(&x, "literal", "concurrency"), Some(named("Store")));
+        // The nearest preceding `let` wins over the parameter it shadows.
+        assert_eq!(
+            hint_for(&x, "shadowed", "go"),
+            Some(TypeHint::FnReturn {
+                owner: Some("New".into()),
+                function: "default".into()
+            })
+        );
+        // Unknowable receivers get no hint rather than a guess.
+        assert_eq!(hint_for(&x, "closure_param", "concurrency"), None);
+        assert_eq!(hint_for(&x, "generic", "store"), Some(named("Repo")));
+        assert_eq!(hint_for(&x, "unbounded", "store"), None);
+        assert_eq!(hint_for(&x, "module_path", "push_updates"), None);
+        assert_eq!(hint_for(&x, "assoc", "go"), None);
+        // A plain function call has no receiver at all.
+        assert_eq!(hint_for(&x, "typed_let", "make"), None);
+    }
+
+    #[test]
+    fn receiver_hints_respect_shadowing_and_scope() {
+        let src = r#"
+fn rebind(name: &Name) { let name = name.normalize(); name.len(); }
+fn if_let(x: Outer) { if let Some(x) = x.child() { x.go(); } else { x.other(); } }
+fn while_let(x: Outer) { while let Some(x) = x.next_one() { x.step(); } }
+fn chained(p: Outer) { if let Some(p) = p.parent() && let Some(q) = p.sibling() { q.visit(); } }
+fn arm(x: Outer) { match x.child() { Some(x) if x.ready() => x.run(), _ => {} } }
+fn destructured(store: &Store) { let (store, n) = make(); store.load(); }
+fn block_scoped(store: &Store) { { let store = Other::new(); } store.save(); }
+fn multi_bound<T: Send + Clone + Repo>(t: &T) { t.fetch(); }
+fn multi_where<T>(t: &T) where T: Sync + Repo { t.pull(); }
+impl Walker { fn assoc(it: &mut Self::Iter) { it.advance(); } }
+fn awaited(c: &Client) { c.load().await.finish(); }
+impl Client { fn load(&self) -> impl Future<Output = Store> { todo!() } }
+"#;
+        let x = extract(src, "src/lib.rs").unwrap();
+        // `name` in `name.normalize()` is still the parameter.
+        assert_eq!(hint_for(&x, "rebind", "normalize"), Some(named("Name")));
+        assert!(matches!(
+            hint_for(&x, "rebind", "len"),
+            Some(TypeHint::MethodReturn { .. })
+        ));
+        // The scrutinee is the outer binding; the body's `x` is the pattern's.
+        assert_eq!(hint_for(&x, "if_let", "child"), Some(named("Outer")));
+        assert_eq!(hint_for(&x, "if_let", "go"), None);
+        assert_eq!(hint_for(&x, "if_let", "other"), Some(named("Outer")));
+        assert_eq!(hint_for(&x, "while_let", "step"), None);
+        assert_eq!(hint_for(&x, "chained", "sibling"), None);
+        assert_eq!(hint_for(&x, "arm", "ready"), None);
+        assert_eq!(hint_for(&x, "arm", "run"), None);
+        assert_eq!(hint_for(&x, "destructured", "load"), None);
+        // A `let` inside an inner block that has ended doesn't apply.
+        assert_eq!(hint_for(&x, "block_scoped", "save"), Some(named("Store")));
+        // Marker traits are skipped when picking a generic's trait.
+        assert_eq!(hint_for(&x, "multi_bound", "fetch"), Some(named("Repo")));
+        assert_eq!(hint_for(&x, "multi_where", "pull"), Some(named("Repo")));
+        // `&mut Self::Iter` is an associated type, not a type named `Iter`.
+        assert_eq!(hint_for(&x, "assoc", "advance"), None);
+        // `impl Future<..>` has no traced type, so the awaited value has none
+        // either (no method-return fact is recorded for `load`).
+        let load = x.types.methods.iter().find(|m| m.name == "load").unwrap();
+        assert_eq!(load.returns, None);
+    }
+
+    #[test]
+    fn records_fields_methods_trait_signatures_and_aliases_as_type_facts() {
+        let src = r#"
+type Shared = Arc<Store>;
+struct Tree { store: Arc<Store>, name: String }
+trait Repo {
+    type Item;
+    fn store(&self) -> &Arc<Store>;
+    fn base(&self) -> Self { todo!() }
+}
+impl Tree {
+    fn new() -> Result<Self, Error> { todo!() }
+}
+impl Repo for Tree {
+    type Item = u8;
+    fn store(&self) -> &Arc<Store> { &self.store }
+}
+fn make() -> Option<Box<Store>> { None }
+"#;
+        let x = extract(src, "src/lib.rs").unwrap();
+        let t = &x.types;
+        assert!(t.fields.contains(&FieldFact {
+            owner: "Tree".into(),
+            field: "store".into(),
+            ty: "Store".into()
+        }));
+        let method = |owner: &str, name: &str| {
+            t.methods
+                .iter()
+                .find(|m| m.owner == owner && m.name == name)
+                .unwrap_or_else(|| panic!("no fact for {owner}::{name}"))
+        };
+        assert_eq!(method("Tree", "new").returns.as_deref(), Some("Tree"));
+        assert_eq!(method("Tree", "store").trait_name.as_deref(), Some("Repo"));
+        assert!(method("Tree", "store").concept_id.is_some());
+        // A bodiless trait signature: return type only, no concept.
+        let signature = method("Repo", "store");
+        assert_eq!(signature.returns.as_deref(), Some("Store"));
+        assert!(signature.concept_id.is_none());
+        // `Self` in a trait default method is the trait.
+        assert_eq!(method("Repo", "base").returns.as_deref(), Some("Repo"));
+        assert_eq!(
+            t.functions,
+            vec![FunctionFact {
+                name: "make".into(),
+                returns: Some("Store".into())
+            }]
+        );
+        // Associated types are not project-wide aliases.
+        assert_eq!(
+            t.aliases,
+            vec![AliasFact {
+                name: "Shared".into(),
+                target: Some("Store".into())
+            }]
+        );
+    }
+}
+
+#[cfg(test)]
+mod macro_call_tests {
+    use super::*;
+
+    fn calls_of(src: &str) -> Vec<(String, String, CallForm)> {
+        let extraction = extract(src, "src/lib.rs").unwrap();
+        let mut calls: Vec<_> = extraction
+            .calls
+            .iter()
+            .map(|c| {
+                let caller = c.caller_id.rsplit('/').next().unwrap().to_string();
+                (caller, c.callee_name.clone(), c.form)
+            })
+            .collect();
+        calls.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        calls
+    }
+
+    #[test]
+    fn reads_calls_inside_macro_arguments() {
+        let src = r#"
+pub fn report(path: &str) -> String {
+    format!("{} items", run(path))
+}
+fn values() -> Vec<usize> {
+    vec![one(), two()]
+}
+#[test]
+fn run_counts() {
+    assert_eq!(run("a"), 2);
+}
+"#;
+        let calls = calls_of(src);
+        let names: Vec<_> = calls
+            .iter()
+            .map(|(c, n, _)| (c.as_str(), n.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("report", "run"),
+                ("run_counts", "run"),
+                ("values", "one"),
+                ("values", "two"),
+            ],
+            "macro names (format, vec, assert_eq) must not be calls"
+        );
+        assert!(calls.iter().all(|(_, _, form)| *form == CallForm::Plain));
+    }
+
+    #[test]
+    fn reads_calls_in_nested_and_scoped_macros() {
+        let src = r#"
+fn check() {
+    assert_eq!(std::format!("{}", helper(1)), "2");
+    assert!(matches!(parse(), Some(_)));
+}
+"#;
+        let names: Vec<_> = calls_of(src).into_iter().map(|(_, n, _)| n).collect();
+        // `Some(_)` reads as a constructor call, exactly as `Some(x)` does in
+        // ordinary code; no concept has that name, so it never resolves.
+        assert_eq!(names, ["Some", "helper", "parse"]);
+    }
+
+    #[test]
+    fn macro_method_calls_keep_their_receiver_type() {
+        let src = r#"
+pub struct Store { items: Vec<String> }
+impl Store {
+    fn count(&self) -> usize { self.items.len() }
+    fn show(&self) { println!("{}", self.count()); }
+    fn other(store: &Store) { println!("{}", store.count()); }
+}
+"#;
+        let extraction = extract(src, "src/lib.rs").unwrap();
+        let in_macros: Vec<_> = extraction
+            .calls
+            .iter()
+            .filter(|c| c.callee_name == "count")
+            .map(|c| {
+                (
+                    c.caller_id.rsplit('/').next().unwrap(),
+                    c.form,
+                    c.receiver.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            in_macros,
+            [
+                (
+                    "show",
+                    CallForm::SelfMethod,
+                    Some(TypeHint::Named("Store".into()))
+                ),
+                (
+                    "other",
+                    CallForm::Method,
+                    Some(TypeHint::Named("Store".into()))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn macro_call_sites_point_into_the_original_source() {
+        let src = "fn report() -> String {\n    format!(\"{}\", run(1))\n}\n";
+        let extraction = extract(src, "src/lib.rs").unwrap();
+        let call = extraction
+            .calls
+            .iter()
+            .find(|c| c.callee_name == "run")
+            .unwrap();
+        // `run` starts at line 1 (0-based), column 18.
+        assert_eq!((call.call_site.line, call.call_site.character), (1, 18));
+    }
+
+    #[test]
+    fn brace_delimited_macros_are_not_read() {
+        let src = "fn f() { my_dsl! { g() } }\n";
+        assert!(calls_of(src).is_empty());
+    }
+
+    #[test]
+    fn nested_macro_arguments_are_collected_once_per_invocation() {
+        let src = "fn f() { assert!(a!(b!(c!(d!(e!(g())))))); }\n";
+        let tree = {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            parser.parse(src, None).unwrap()
+        };
+        let mut invocations = Vec::new();
+        collect_macro_args(tree.root_node(), &mut invocations);
+        // assert, a, b, c, d, e: one entry each, not 2^depth.
+        assert_eq!(invocations.len(), 6);
+        assert_eq!(calls_of(src), [("f".into(), "g".into(), CallForm::Plain)]);
+    }
+
+    #[test]
+    fn a_local_use_only_shadows_the_names_it_imports() {
+        let src = "fn parse(n: u8) { use crate::parse::Parser; if n > 0 { parse(n - 1) } }\n\
+                   fn symlink() { use std::os::unix::fs::{self, symlink as link}; link(); symlink(); }\n";
+        let calls = calls_of(src);
+        assert!(calls.contains(&("parse".into(), "parse".into(), CallForm::Plain)));
+        assert!(calls.contains(&("symlink".into(), "link".into(), CallForm::Path)));
+        assert!(calls.contains(&("symlink".into(), "symlink".into(), CallForm::Plain)));
     }
 }

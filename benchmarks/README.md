@@ -25,6 +25,9 @@ applied to the resolver-version-comparison use case, not a second tool.
 | [`mcp-tool-selection/`](mcp-tool-selection/) | Whether a model picks the right `relation` inside the consolidated `graph` tool as reliably as it picked the right specialized tool name pre-consolidation — selection accuracy, final-answer accuracy, and the loud-failure/detectable-wrong/silent-wrong cost breakdown | Yes — a real OpenAI-compatible endpoint |
 | [`mcp-session-cost/`](mcp-session-cost/) | The fixed per-session token cost of registering `okf-mcp`'s tool schemas against the tokens saved per structural query, and the resulting break-even point | No — fully offline |
 | [`resolver-stability/`](resolver-stability/) | How much of a diff's relationship-level churn between two resolver versions (or any two independently generated bundles) is resolver-only metadata vs. a genuine structural rewire | Only to *run* it against a real resolver-version pair — the classifier itself is offline |
+| Agent exploration A/B ([okf-rs results](../docs/benchmarks/agent-integration-p1.md), [Jujutsu results](../docs/benchmarks/agent-integration-p1-jj.md)) | Whether the `okf` MCP server plus the `okf-explore` skill reduce what a coding agent reads to answer "how does X work" questions, against a grep-only baseline: files opened, characters read, tokens, cost, skill adherence | Yes — headless Claude Code (`claude -p`) |
+
+The agent exploration A/B is the one exception to "no separate scripts": it drives a real coding agent, so its harness is a set of shell/Node scripts in [`examples/agent-workflow/bench/`](../examples/agent-workflow/bench/) rather than crate code, and grading answers against ground-truth commits is manual.
 
 ## Design rationale
 

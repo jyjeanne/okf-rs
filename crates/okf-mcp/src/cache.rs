@@ -94,6 +94,10 @@ fn fingerprint(bundle: &Path) -> Fingerprint {
 struct CachedBundle {
     fingerprint: Fingerprint,
     concepts: Arc<Vec<Concept>>,
+    /// The full-text index of `concepts`, built on first use: building it
+    /// was most of a `search_ranked` call's time on a large bundle. Dropped
+    /// with the entry when the fingerprint changes.
+    full_text: Option<Arc<okf_search::FullTextIndex>>,
 }
 
 /// One instance lives for the lifetime of an `okf-mcp` server process
@@ -110,6 +114,8 @@ pub struct BundleCache {
     /// to prove a cache hit really did skip the parse, not just that the
     /// two calls happened to agree on the result.
     loads: AtomicUsize,
+    /// How many full-text indexes were built, for the same reason.
+    full_text_builds: AtomicUsize,
 }
 
 impl BundleCache {
@@ -141,9 +147,37 @@ impl BundleCache {
             CachedBundle {
                 fingerprint: fp,
                 concepts: Arc::clone(&concepts),
+                full_text: None,
             },
         );
         Ok(concepts)
+    }
+
+    /// The full-text (`search_ranked`) index of `bundle`'s current
+    /// concepts, reused while the bundle is unchanged, like the concepts
+    /// themselves.
+    pub fn full_text_index(&self, bundle: &Path) -> Result<Arc<okf_search::FullTextIndex>> {
+        let concepts = self.get_or_load(bundle)?;
+        {
+            let entries = self.entries.lock().unwrap();
+            if let Some(index) = entries
+                .get(bundle)
+                .filter(|entry| Arc::ptr_eq(&entry.concepts, &concepts))
+                .and_then(|entry| entry.full_text.clone())
+            {
+                return Ok(index);
+            }
+        }
+        let index = Arc::new(okf_search::FullTextIndex::build_from_concepts(&concepts)?);
+        self.full_text_builds.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(entry) = entries
+            .get_mut(bundle)
+            .filter(|entry| Arc::ptr_eq(&entry.concepts, &concepts))
+        {
+            entry.full_text = Some(Arc::clone(&index));
+        }
+        Ok(index)
     }
 
     /// How many real (non-cached) parses this cache has performed —
@@ -153,6 +187,13 @@ impl BundleCache {
     #[cfg(test)]
     pub(crate) fn load_count_for_tests(&self) -> usize {
         self.loads.load(Ordering::Relaxed)
+    }
+
+    /// How many full-text indexes this cache has built — `#[cfg(test)]`
+    /// only, like [`Self::load_count_for_tests`].
+    #[cfg(test)]
+    pub(crate) fn full_text_builds_for_tests(&self) -> usize {
+        self.full_text_builds.load(Ordering::Relaxed)
     }
 }
 
@@ -265,6 +306,28 @@ mod tests {
         write(dir.path(), "notes.txt", "scratch notes, not a concept");
         cache.get_or_load(dir.path()).unwrap();
         assert_eq!(cache.load_count_for_tests(), 1);
+    }
+
+    #[test]
+    fn the_full_text_index_is_reused_until_the_bundle_changes() {
+        let dir = sample_bundle();
+        let cache = BundleCache::new();
+        cache.full_text_index(dir.path()).unwrap();
+        cache.full_text_index(dir.path()).unwrap();
+        assert_eq!(cache.full_text_builds_for_tests(), 1);
+
+        write(
+            dir.path(),
+            "functions/g.md",
+            "---\ntype: Rust Function\ntitle: g\nresource: src/lib.rs#L2\n---\n\nbody\n",
+        );
+        let index = cache.full_text_index(dir.path()).unwrap();
+        assert_eq!(cache.full_text_builds_for_tests(), 2);
+        assert!(index
+            .search("g", 5)
+            .unwrap()
+            .iter()
+            .any(|h| h.id == "functions/g"));
     }
 
     #[test]

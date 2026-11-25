@@ -1,0 +1,6 @@
+# Self-benchmark tasks (P1, first run 2026-11-17). Ground truth: examples/agent-workflow/README.md.
+E1	How does the MCP server avoid re-parsing the bundle on every tool call, and when does it re-read it?
+E2	How does `okf-rs generate --check-fresh` decide that the bundle on disk is stale?
+E3	How does `okf-rs diff --ci` tell a resolver-only relationship change from a source-level one?
+E4	How does okf-rs decide that a language server is ready to answer queries?
+E5	What happens when a source file is not valid UTF-8?
