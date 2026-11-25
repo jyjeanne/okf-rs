@@ -83,8 +83,9 @@ pub use plan_change::{
 mod structured;
 pub use structured::{
     explore_json_from_concepts, file_concepts_from_concepts, file_concepts_json,
-    file_concepts_text, neighbours_json_from_concepts, search_ranked_json, ConceptRef, Neighbours,
-    RankedHit, SourceRange, CONCEPTS_SCHEMA, EXPLORE_SCHEMA, SEARCH_RANKED_SCHEMA,
+    file_concepts_text, neighbours_json_from_concepts, search_ranked_json,
+    search_ranked_json_from_index, ConceptRef, Neighbours, RankedHit, SourceRange, CONCEPTS_SCHEMA,
+    EXPLORE_SCHEMA, SEARCH_RANKED_SCHEMA,
 };
 
 /// Errors if `bundle` doesn't exist yet, with a pointer to `okf-rs
@@ -149,6 +150,14 @@ pub fn search(bundle: &Path, query: &str) -> Result<String> {
 pub fn search_ranked(bundle: &Path, query: &str) -> Result<String> {
     require_bundle(bundle)?;
     let index = okf_search::FullTextIndex::build(bundle)?;
+    search_ranked_from_index(&index, query)
+}
+
+/// Same as [`search_ranked`], against an index already built (for
+/// example with `FullTextIndex::build_from_concepts`) — building it is most
+/// of the cost on a large bundle, so a long-lived caller keeps one per
+/// bundle version.
+pub fn search_ranked_from_index(index: &okf_search::FullTextIndex, query: &str) -> Result<String> {
     let hits = index.search(query, 25)?;
     if hits.is_empty() {
         return Ok(format!("No matches for `{query}`"));

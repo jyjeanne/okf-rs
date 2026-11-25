@@ -18,8 +18,8 @@
 //! every time — see that module's docs for the freshness guarantee this
 //! still makes: a `generate` run between two calls is always picked up,
 //! without needing a restart, the same as before the cache existed.
-//! `search`/`search_ranked` build their own index straight from the
-//! bundle path and aren't cached.
+//! `search_ranked` reuses the same cache's full-text index; `search` builds
+//! its own exact index straight from the bundle path and isn't cached.
 //!
 //! `--benchmark` skips the stdio JSON-RPC loop entirely and instead
 //! prints a one-shot local session-level cost report to stdout, then

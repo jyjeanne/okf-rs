@@ -1114,6 +1114,7 @@ dependencies = [
  "okf-graph",
  "okf-parser",
  "okf-query",
+ "okf-search",
  "serde",
  "serde_json",
  "tempfile",

@@ -115,8 +115,9 @@ fn wants_json(arguments: &Value) -> Result<bool> {
 /// parse when the bundle hasn't changed since — see the `cache` module)
 /// and runs the matching `okf_query::*_from_concepts` query against
 /// them, rather than each tool re-reading the bundle from scratch.
-/// `search`/`search_ranked` are the exception: they build their own
-/// index (exact/BM25) straight from `bundle` and aren't cached here.
+/// `search_ranked` also reuses the cache's full-text index, built once per
+/// bundle version. `search` is the exception: it builds its own exact
+/// index straight from `bundle` and isn't cached here.
 ///
 /// Uses the default `plan-change` thresholds; the server itself calls
 /// [`call_with`] with the project's `[plan_change]` config instead. The
@@ -145,10 +146,12 @@ pub fn call_with(
         "search" => okf_query::search(bundle, &arg_str(arguments, "query")?),
         "search_ranked" => {
             let query = arg_str(arguments, "query")?;
-            if wants_json(arguments)? {
-                okf_query::search_ranked_json(bundle, &query)
+            let json = wants_json(arguments)?;
+            let index = cache.full_text_index(bundle)?;
+            if json {
+                okf_query::search_ranked_json_from_index(&index, &query)
             } else {
-                okf_query::search_ranked(bundle, &query)
+                okf_query::search_ranked_from_index(&index, &query)
             }
         }
         "search_semantic" => {

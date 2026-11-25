@@ -95,6 +95,15 @@ struct SearchRankedDocument<'a> {
 pub fn search_ranked_json(bundle: &Path, query: &str) -> Result<String> {
     require_bundle(bundle)?;
     let index = okf_search::FullTextIndex::build(bundle)?;
+    search_ranked_json_from_index(&index, query)
+}
+
+/// Same as [`search_ranked_json`], against an index already built — see
+/// [`crate::search_ranked_from_index`].
+pub fn search_ranked_json_from_index(
+    index: &okf_search::FullTextIndex,
+    query: &str,
+) -> Result<String> {
     let hits = index
         .search(query, 25)?
         .into_iter()
