@@ -24,7 +24,7 @@
 | P2.1 skills | Done — `okf-impact`, `okf-refactor`, `okf-graph-validation` (pack 1.4) | `examples/agent-workflow/.claude/skills/` |
 | P2.2 agents | Done for Claude Code, verified in real sessions (architect: question and refactor plan; reviewer; developer under `--agent`, both protocol steps). OpenCode files follow the V2 docs, not run (OpenCode not installed). Findings: `Bash(<pattern>)` in a subagent's `tools` doesn't limit the shell, so read-only Bash comes from `.claude/settings.json` allow rules; O-5 answered from docs; O-6 closed (`diff` = `impact` = `review` worktree mechanism) | `examples/agent-workflow/.claude/agents/`, `.opencode/agents/`, spec §6.3, §6.5 |
 | Prerequisite: macro calls, call forms | Done — Rust calls inside `name!(..)`/`name![..]` arguments are extracted; method calls no longer resolve to free functions (nor plain calls to methods). Spot checks: 10/10 removed edges false, 24/26 added edges correct (spec §14) | `crates/okf-tree-sitter/src/rust.rs`, `crates/okf-analyzer/src/{lib,receiver}.rs` |
-| P2.3 measurement | Not started. `diff`/`impact` don't see body-only edits, so `A` can't come from `impact` alone: needs a decision before pre-registration | — |
+| P2.3 measurement | `A` redefined by D-12 (owner, 2026-11-25): `diff`/`impact` don't see body-only edits, so `A` comes from the reference commit's `git diff`. Pre-registration in progress | `docs/benchmarks/agent-integration-p2.md` |
 
 **Unplanned fix in P1.5.** `okf-rs init` overwrote `okf.toml` with only its `output` line, dropping `[diff]` and (now) `[agents]` on every re-run, which would have made the opt-in directive disappear. `config::write_default` now replaces only the top-level `output` line of an existing file.
 
@@ -179,7 +179,7 @@ Written from spec §6.5 (verified 2026-11-17). Two formats:
 ### P2.3 — Modification measurement
 
 - 3 modification tasks, replayed from this repository's merged commits (spec §9.3), reverted in a scratch worktree.
-- Procedure per task: run `plan-change` on the target before any edit and record `P` = target ∪ `affected_concepts`; also record the `tests` field and the `limits` field; implement; run the tests. Compute `A` from the **reference** commit, not from the agent's edit: the `added`, `changed` and `removed` ids of `okf-rs impact` between the pre- and post-commit refs, plus the concepts directly called by tests that fail on the unmodified code. Recall = |P ∩ A| / |A| (spec §9.2). Count unpredicted broken tests separately.
+- Procedure per task: run `plan-change` on the target before any edit and record `P` = target ∪ `affected_concepts`; also record the `tests` field and the `limits` field; implement; run the tests. Compute `A` from the **reference** commit, not from the agent's edit (D-12): the existing functions whose lines the commit's `git diff` changes, mapped by a text-only helper and checked by reading, plus the existing functions directly called by tests that fail on the unmodified code; the `impact`-based `A` is a secondary number. Recall = |P ∩ A| / |A| (spec §9.2). Count unpredicted broken tests separately.
 - Record blast-radius recall, unpredicted broken tests, and adherence (OKF-DP-001/003).
 
 **Exit criterion (spec §9.1):** recall ≥ 0.9 and 0 unpredicted broken tests across the 3 tasks. If recall < 0.9, the test heuristic (spec D-3) is the first suspect: fix it and re-measure before changing anything else.
