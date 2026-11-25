@@ -290,7 +290,11 @@ fn parse_diff_policy(config_path: &Path, table: Option<&toml::Value>) -> DiffPol
 /// `init` must never silently discard a project's other settings.
 pub fn write_default(project_root: &Path, output: &Path) -> Result<PathBuf> {
     let path = project_root.join(CONFIG_FILE);
-    let output_line = format!("output = \"{}\"", output.display());
+    // Rendered by the TOML serializer, not spliced into quotes: a Windows
+    // path (`docs\kb`) or a `"` would otherwise make the whole file invalid
+    // TOML, and every setting in it unreadable.
+    let output_value = toml::Value::String(output.display().to_string());
+    let output_line = format!("output = {output_value}");
     let content = match fs::read_to_string(&path) {
         Ok(existing) => with_output_line(&existing, &output_line),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -310,6 +314,12 @@ pub fn write_default(project_root: &Path, output: &Path) -> Result<PathBuf> {
 /// Only lines before the first table header are considered, so an
 /// `output` key inside some table is never touched.
 fn with_output_line(existing: &str, output_line: &str) -> String {
+    // Keep the file's own line ending: a CRLF checkout stays CRLF.
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
     let first_table = lines
         .iter()
@@ -324,8 +334,8 @@ fn with_output_line(existing: &str, output_line: &str) -> String {
         Some(i) => lines[i] = output_line.to_string(),
         None => lines.insert(first_table, output_line.to_string()),
     }
-    let mut content = lines.join("\n");
-    content.push('\n');
+    let mut content = lines.join(newline);
+    content.push_str(newline);
     content
 }
 
@@ -465,6 +475,24 @@ mod tests {
         let config = load(dir.path());
         assert_eq!(config.output, PathBuf::from("new"));
         assert_eq!(config.diff.resolver_changes, PolicyAction::Fail);
+        assert!(config.agents.protocol);
+    }
+
+    #[test]
+    fn write_default_escapes_a_windows_path_and_keeps_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "output = \"old\"\r\n\r\n[agents]\r\nprotocol = true\r\n",
+        );
+        write_default(dir.path(), Path::new(r"docs\kb")).unwrap();
+        let content = fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(
+            content.ends_with("[agents]\r\nprotocol = true\r\n"),
+            "{content:?}"
+        );
+        let config = load(dir.path());
+        assert_eq!(config.output, PathBuf::from(r"docs\kb"));
         assert!(config.agents.protocol);
     }
 

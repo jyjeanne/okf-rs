@@ -11,11 +11,12 @@
 //!   to the receiver's type (its own method, a trait method it implements,
 //!   or a default method of a trait it implements), that candidate is the
 //!   callee. The edge is recorded with resolver [`RESOLVER`].
-//! - **Unique name, receiver of a type the project doesn't define** (a
-//!   standard-library or third-party type): the call can't reach a project
-//!   method, so the name-only edge is dropped instead of drawn. A project
-//!   trait implemented for such a type makes it a project-known type, so
-//!   that case is kept.
+//! - **Receiver of a type the project doesn't define** (a standard-library
+//!   or third-party type): the call can't reach a project inherent method
+//!   or free function, so those candidates are dropped instead of drawn.
+//!   Methods of project traits stay candidates — an extension trait
+//!   implemented for such a type (directly, or by a blanket `impl<T> ..
+//!   for T`) is reachable from it.
 //!
 //! Everything else keeps today's behavior. Type names are bare (no module
 //! path), so two project types sharing a name pool their facts; a lookup
@@ -76,6 +77,8 @@ pub(crate) struct TypeIndex {
     aliases: HashMap<String, BTreeSet<String>>,
     /// Every type name the project defines or implements methods for.
     project_types: HashSet<String>,
+    /// Every trait (or interface) the project declares.
+    project_traits: HashSet<String>,
     /// Function and method concept id → its kind, for [`TypeIndex::form_allows`].
     callable_kinds: HashMap<String, ConceptKind>,
 }
@@ -103,6 +106,9 @@ impl TypeIndex {
                     | ConceptKind::Interface
             ) {
                 index.project_types.insert(concept.name.clone());
+            }
+            if matches!(concept.kind, ConceptKind::Trait | ConceptKind::Interface) {
+                index.project_traits.insert(concept.name.clone());
             }
         }
         for facts in facts {
@@ -232,6 +238,22 @@ impl TypeIndex {
     /// methods are never project concepts.
     pub(crate) fn is_external(&self, ty: &str) -> bool {
         !self.project_types.contains(ty)
+    }
+
+    /// Whether a call on a receiver of an external type (see
+    /// [`TypeIndex::is_external`]) can still reach callable `callee`: only
+    /// through a project trait — a method of an `impl ProjectTrait for ..`
+    /// (blanket `for T`, for `str`, an `Option<T>`, ...) or the trait's own
+    /// default method. An inherent method, a free function, or the
+    /// project's impl of a standard or third-party trait (`Display::fmt`)
+    /// can't be. A method with no type facts (its impl's type isn't
+    /// nameable, e.g. `impl ProjectTrait for [u8]`) is kept.
+    pub(crate) fn reachable_from_external(&self, callee: &str) -> bool {
+        match self.owner_of.get(callee) {
+            Some((_, Some(trait_name))) => self.project_traits.contains(trait_name),
+            Some((owner, None)) => self.project_traits.contains(owner),
+            None => self.callable_kinds.get(callee) != Some(&ConceptKind::Function),
+        }
     }
 
     /// Whether a call written in `form` can name the concept `id` at all.
@@ -403,6 +425,50 @@ pub fn real(ws: &RunWorkspace) { ws.persist(); }
         // Unique by name and consistent with the receiver: still the plain
         // name-match provenance.
         assert_eq!(real[0].resolved_by, "tree-sitter");
+    }
+
+    #[test]
+    fn an_extension_trait_method_called_on_an_external_type_keeps_its_edge() {
+        let source = r#"
+pub trait Pretty { fn pretty(&self) -> String; }
+impl<T: std::fmt::Display> Pretty for T { fn pretty(&self) -> String { String::new() } }
+pub trait Shout { fn shout(&self) {} }
+impl Shout for String {}
+pub struct Wrapper;
+impl std::fmt::Display for Wrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) }
+}
+pub fn blanket(s: String) { s.pretty(); }
+pub fn defaulted(s: String) { s.shout(); }
+pub fn delegating(n: u8, f: &mut std::fmt::Formatter) { n.fmt(f); }
+pub fn generic<T: Send + Clone + Pretty>(t: &T) { t.pretty(); }
+"#;
+        let targets = |caller| {
+            calls_of(source, caller)
+                .into_iter()
+                .map(|r| r.target)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(targets("blanket"), ["functions/src/T/pretty/pretty"]);
+        assert_eq!(targets("defaulted"), ["functions/src/Shout/shout"]);
+        // The project's `Display::fmt` is no extension trait: a `u8`
+        // receiver can't reach it.
+        assert!(targets("delegating").is_empty());
+        assert_eq!(targets("generic"), ["functions/src/T/pretty/pretty"]);
+    }
+
+    #[test]
+    fn a_rebinding_let_types_the_receiver_as_the_earlier_binding() {
+        // `name.normalize()` is called on the parameter, not on the
+        // `String` the `let` is about to bind.
+        let source = r#"
+pub struct Name;
+impl Name { pub fn normalize(&self) -> String { String::new() } }
+pub fn caller(name: &Name) { let name = name.normalize(); }
+"#;
+        let calls = calls_of(source, "caller");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].target, "functions/src/Name/normalize");
     }
 
     #[test]

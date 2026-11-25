@@ -94,15 +94,52 @@ fn format_schema() -> Value {
     json!({ "type": "string", "enum": ["text", "json"], "description": "json: a machine-readable result" })
 }
 
-/// Whether `arguments` ask for JSON: `format` absent or `text` is text,
-/// `json` is JSON, anything else is an error.
-fn wants_json(arguments: &Value) -> Result<bool> {
-    match arguments.get("format").and_then(|v| v.as_str()) {
-        None | Some("text") => Ok(false),
-        Some("json") => Ok(true),
-        Some(other) => Err(anyhow!("unknown format `{other}` — expected text or json")),
+/// The `format` a call asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    /// No `format` argument: each tool's own default.
+    Default,
+    Text,
+    Json,
+}
+
+/// The `format` argument of `arguments`: absent (or `null`), `text`, or
+/// `json`; anything else — another string, a non-string — is an error.
+fn format_of(arguments: &Value) -> Result<Format> {
+    match arguments.get("format") {
+        None | Some(Value::Null) => Ok(Format::Default),
+        Some(Value::String(s)) if s == "text" => Ok(Format::Text),
+        Some(Value::String(s)) if s == "json" => Ok(Format::Json),
+        Some(Value::String(other)) => {
+            Err(anyhow!("unknown format `{other}` — expected text or json"))
+        }
+        Some(other) => Err(anyhow!(
+            "format must be the string text or json, not {other}"
+        )),
     }
 }
+
+/// Whether `arguments` ask for JSON (see [`format_of`]); text is every
+/// tool's default but `plan-change`'s.
+fn wants_json(arguments: &Value) -> Result<bool> {
+    Ok(format_of(arguments)? == Format::Json)
+}
+
+/// `graph` relations with a text answer only.
+const TEXT_ONLY_RELATIONS: &[&str] = &[
+    "path",
+    "explain",
+    "api",
+    "cycles",
+    "modules",
+    "isolated",
+    "stats",
+    "layers",
+    "domains",
+    "communities",
+    "patterns",
+    "features",
+];
 
 /// Runs `name` with `arguments` against the bundle at `bundle`, returning
 /// the text to surface to the model. Errors here become a tool-level
@@ -149,7 +186,8 @@ pub fn call_with(
             let json = wants_json(arguments)?;
             let index = cache.full_text_index(bundle)?;
             if json {
-                okf_query::search_ranked_json_from_index(&index, &query)
+                let concepts = cache.get_or_load(bundle)?;
+                okf_query::search_ranked_json_from_index(&index, &concepts, &query)
             } else {
                 okf_query::search_ranked_from_index(&index, &query)
             }
@@ -198,10 +236,11 @@ fn graph_relation(
     plan_change: &okf_query::PlanChangeOptions,
 ) -> Result<String> {
     let relation = arg_str(arguments, "relation")?;
-    let json = wants_json(arguments)?;
-    if json && !matches!(relation.as_str(), "callers" | "callees" | "file") {
+    let format = format_of(arguments)?;
+    let json = format == Format::Json;
+    if json && TEXT_ONLY_RELATIONS.contains(&relation.as_str()) {
         return Err(anyhow!(
-            "format `json` is available for relation callers, callees and file; `{relation}` answers in text"
+            "format `json` is available for relation callers, callees, file and plan-change; `{relation}` answers in text"
         ));
     }
     // Each arm validates the arguments *that relation* needs before
@@ -270,9 +309,14 @@ fn graph_relation(
             &cache.get_or_load(bundle)?,
         )),
         "plan-change" => {
+            // JSON by default (spec §4.1); `format: "text"` asks for the
+            // human-readable rendering instead.
             let id = arg_str(arguments, "id")?;
             okf_query::plan_change_from_concepts(&cache.get_or_load(bundle)?, &id, plan_change)
-                .map(|plan| plan.to_json())
+                .map(|plan| match format {
+                    Format::Text => plan.to_text(),
+                    Format::Default | Format::Json => plan.to_json(),
+                })
         }
         other => Err(anyhow!(
             "unknown relation `{other}` for the graph tool — expected one of: callers, callees, path, explain, api, cycles, modules, isolated, stats, layers, domains, communities, patterns, features, plan-change, file"
@@ -789,6 +833,71 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown format `yaml`"));
+    }
+
+    #[test]
+    fn plan_change_accepts_json_and_text_formats() {
+        let dir = sample_bundle();
+        let cache = cache();
+        let args = |format: &str| json!({ "relation": "plan-change", "id": "functions/auth/decode_jwt", "format": format });
+        let as_json = parse(&call("graph", &args("json"), dir.path(), &cache).unwrap());
+        assert_eq!(as_json["schema"], okf_query::PLAN_CHANGE_SCHEMA);
+        let as_text = call("graph", &args("text"), dir.path(), &cache).unwrap();
+        assert!(
+            as_text.starts_with("Change plan for functions/auth/decode_jwt"),
+            "{as_text}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_relation_with_json_reports_the_relation_and_a_bad_format_type_is_rejected() {
+        let dir = sample_bundle();
+        let err = call(
+            "graph",
+            &json!({ "relation": "bogus", "format": "json" }),
+            dir.path(),
+            &cache(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown relation `bogus`"),
+            "{err}"
+        );
+
+        let err = call(
+            "explore",
+            &json!({ "query": "functions/auth/decode_jwt", "format": true }),
+            dir.path(),
+            &cache(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("format must be"), "{err}");
+    }
+
+    #[test]
+    fn search_ranked_json_titles_are_concept_names_not_split_words() {
+        let dir = sample_bundle();
+        write(
+            dir.path(),
+            "classes/auth/GitBackend.md",
+            "---\ntype: Rust Struct\ntitle: GitBackend\nresource: src/auth.rs#L9\n---\n\nbody\n",
+        );
+        let ranked = parse(
+            &call(
+                "search_ranked",
+                &json!({ "query": "GitBackend", "format": "json" }),
+                dir.path(),
+                &cache(),
+            )
+            .unwrap(),
+        );
+        let hit = ranked["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["id"] == "classes/auth/GitBackend")
+            .expect("the struct is a hit");
+        assert_eq!(hit["title"], "GitBackend");
     }
 
     /// A client detects the structured results from the schemas alone:

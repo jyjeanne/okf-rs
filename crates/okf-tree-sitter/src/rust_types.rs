@@ -39,14 +39,88 @@ const WRAPPERS: &[&str] = &[
     "RefMut",
 ];
 
+/// Marker and derive-style standard traits, which say nothing about the
+/// project methods a value has: skipped when picking the trait that a
+/// multi-bound generic (`T: Send + Repo`) or trait object
+/// (`dyn Send + Repo`) stands for, so the receiver is typed `Repo` rather
+/// than taken for the external type `Send`.
+const MARKER_TRAITS: &[&str] = &[
+    "Send",
+    "Sync",
+    "Sized",
+    "Unpin",
+    "Copy",
+    "Clone",
+    "Debug",
+    "Display",
+    "Default",
+    "PartialEq",
+    "Eq",
+    "PartialOrd",
+    "Ord",
+    "Hash",
+    "UnwindSafe",
+    "RefUnwindSafe",
+];
+
+/// Future types: `.await` on one yields its `Output`, which the type as
+/// written doesn't name in a form traced here. They get no type at all, so
+/// a call on the awaited value keeps name-only resolution instead of being
+/// taken for a call on the external `Future`.
+const FUTURES: &[&str] = &["Future", "BoxFuture", "LocalBoxFuture"];
+
 /// Reduces a type as written to the bare name of the type a method call on
 /// it would reach: references, lifetimes, `mut`, `dyn`/`impl` and wrapper
 /// types removed, generics dropped, last path segment kept. `None` for
-/// tuples, slices, arrays, function pointers, and `_`.
+/// tuples, slices, arrays, function pointers, futures, and `_`.
 ///
 /// `&'a mut Arc<crate::store::Store>` → `Store`; `Result<Self, E>` →
 /// `Self`; `dyn Repo + Send` → `Repo`; `(A, B)` → `None`.
 pub(crate) fn normalize_type(text: &str) -> Option<String> {
+    let path = reached_path(text)?;
+    let last = path.rsplit("::").next()?.trim();
+    let first = last.chars().next()?;
+    if !(first.is_alphabetic() || first == '_') {
+        return None;
+    }
+    Some(last.to_string())
+}
+
+/// The path of the type a method call on `text` reaches, before
+/// [`normalize_type`] keeps only its last segment:
+/// `&Arc<crate::store::Store>` → `crate::store::Store`,
+/// `Option<&mut Self::Item>` → `Self::Item`. `None` where
+/// [`normalize_type`] gives `None`.
+fn reached_path(text: &str) -> Option<String> {
+    let t = strip_type_prefixes(text);
+    if t.is_empty() || t.starts_with(['(', '[', '_', '!', '*']) || t.starts_with("fn(") {
+        return None;
+    }
+    let (head, args) = match t.find('<') {
+        Some(open) => {
+            let close = t.rfind('>')?;
+            (&t[..open], (close > open).then(|| &t[open + 1..close]))
+        }
+        None => (t, None),
+    };
+    let head = pick_trait(head.split('+'))?;
+    let last = head.rsplit("::").next()?.trim();
+    // Only a wrapper *with* type arguments is unwrapped: a plain struct
+    // that happens to be named `SearchResult` stays itself.
+    if WRAPPERS.contains(&last) || last.ends_with("Result") {
+        if let Some(args) = args {
+            return reached_path(first_type_argument(args)?);
+        }
+    }
+    if FUTURES.contains(&last) {
+        return None;
+    }
+    Some(head.to_string())
+}
+
+/// `text` without its leading references, lifetimes, `mut`, `dyn` and
+/// `impl`: `&'a mut dyn Repo` → `Repo`.
+fn strip_type_prefixes(text: &str) -> &str {
     let mut t = text.trim();
     loop {
         let before = t;
@@ -64,33 +138,28 @@ pub(crate) fn normalize_type(text: &str) -> Option<String> {
             }
         }
         if t == before {
-            break;
+            return t;
         }
     }
-    if t.is_empty() || t.starts_with(['(', '[', '_', '!', '*']) || t.starts_with("fn(") {
-        return None;
-    }
-    let (head, args) = match t.find('<') {
-        Some(open) => {
-            let close = t.rfind('>')?;
-            (&t[..open], (close > open).then(|| &t[open + 1..close]))
-        }
-        None => (t, None),
+}
+
+/// Of the `+`-separated parts of a bound list or trait object, the first
+/// that is neither a lifetime nor a [`MARKER_TRAITS`] entry — or the first
+/// part at all when every part is one.
+fn pick_trait<'a>(parts: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let parts: Vec<&str> = parts
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && !p.starts_with('\''))
+        .collect();
+    let is_marker = |p: &&str| {
+        let last = p.rsplit("::").next().unwrap_or(p).trim();
+        MARKER_TRAITS.contains(&last)
     };
-    let head = head.split('+').next()?.trim();
-    let last = head.rsplit("::").next()?.trim();
-    // Only a wrapper *with* type arguments is unwrapped: a plain struct
-    // that happens to be named `SearchResult` stays itself.
-    if WRAPPERS.contains(&last) || last.ends_with("Result") {
-        if let Some(args) = args {
-            return normalize_type(first_type_argument(args)?);
-        }
-    }
-    let first = last.chars().next()?;
-    if !(first.is_alphabetic() || first == '_') {
-        return None;
-    }
-    Some(last.to_string())
+    parts
+        .iter()
+        .find(|p| !is_marker(p))
+        .or(parts.first())
+        .copied()
 }
 
 /// The first comma-separated argument of a generic argument list, at the
@@ -176,15 +245,21 @@ fn generics_in_scope(src: &str, node: Node) -> Generics {
     generics
 }
 
-/// The first trait in a `trait_bounds` node, skipping lifetimes and
-/// `?Sized`-style relaxations.
+/// The trait a `trait_bounds` node stands for: its first trait that isn't
+/// a [`MARKER_TRAITS`] entry (`T: Send + Repo` → `Repo`), else its first
+/// trait, skipping lifetimes and `?Sized`-style relaxations.
 fn first_bound(src: &str, bounds: Node) -> Option<String> {
     let mut cursor = bounds.walk();
-    let found = bounds
+    let traits: Vec<String> = bounds
         .named_children(&mut cursor)
         .filter(|b| !matches!(b.kind(), "lifetime" | "removed_trait_bound"))
-        .find_map(|b| normalize_type(node_text(src, b)));
-    found
+        .filter_map(|b| normalize_type(node_text(src, b)))
+        .collect();
+    traits
+        .iter()
+        .find(|t| !MARKER_TRAITS.contains(&t.as_str()))
+        .or(traits.first())
+        .cloned()
 }
 
 /// The type `Self` means at `node`: the nearest enclosing `impl` block's
@@ -210,13 +285,11 @@ pub(crate) fn self_type(src: &str, node: Node) -> Option<String> {
 pub(crate) fn resolve_type_text(src: &str, node: Node, text: &str) -> Option<String> {
     let name = normalize_type(text)?;
     let generics = generics_in_scope(src, node);
-    // An associated type (`Self::Item`, `T::Output`) depends on an impl
-    // this file may not show: unknown, not a type named `Item`.
-    let path = text
-        .trim_start_matches(['&', ' '])
-        .split('<')
-        .next()
-        .unwrap_or("");
+    // An associated type (`Self::Item`, `&mut T::Output`,
+    // `Option<Self::Item>`) depends on an impl this file may not show:
+    // unknown, not a type named `Item`. Checked on the path the type
+    // reaches, after references, `mut` and wrappers are stripped.
+    let path = reached_path(text)?;
     let segments: Vec<&str> = path.split("::").map(str::trim).collect();
     if segments.len() > 1 && (segments[0] == "Self" || generics.contains_key(segments[0])) {
         return None;
@@ -235,7 +308,7 @@ pub(crate) fn resolve_type_text(src: &str, node: Node, text: &str) -> Option<Str
 /// scanned once however many calls it contains.
 pub(crate) struct HintContext<'s, 't> {
     src: &'s str,
-    lets: HashMap<usize, Vec<(String, Node<'t>)>>,
+    lets: HashMap<usize, Vec<(String, Node<'t>, bool)>>,
 }
 
 /// Recursion bound for nested receiver expressions and `let` chains.
@@ -356,36 +429,26 @@ impl<'s, 't> HintContext<'s, 't> {
         }
     }
 
-    /// The hint for identifier `ident`: the nearest `let` of that name
-    /// before `before` in the enclosing function (its annotation, else its
-    /// value), else a parameter of that name. `None` when a closure
-    /// parameter or `for` binding shadows it, since those carry no type.
+    /// The hint for identifier `ident`: the nearest `let` of that name in
+    /// scope at `before` in the enclosing function (its annotation, else
+    /// its value), else a parameter of that name. `None` when a binding
+    /// that carries no traced type shadows it: a closure parameter, a `for`
+    /// binding, an `if let`/`while let`/`match` pattern, or a destructuring
+    /// `let`.
     fn binding_hint(&mut self, ident: Node<'t>, before: usize, depth: usize) -> Option<TypeHint> {
         let name = node_text(self.src, ident);
         let mut function = None;
+        let mut prev = ident;
         let mut current = ident.parent();
         while let Some(n) = current {
-            match n.kind() {
-                "closure_expression" => {
-                    if let Some(params) = n.child_by_field_name("parameters") {
-                        if binds(self.src, params, name) {
-                            return None;
-                        }
-                    }
-                }
-                "for_expression" => {
-                    if let Some(pattern) = n.child_by_field_name("pattern") {
-                        if binds(self.src, pattern, name) {
-                            return None;
-                        }
-                    }
-                }
-                "function_item" => {
-                    function = Some(n);
-                    break;
-                }
-                _ => {}
+            if n.kind() == "function_item" {
+                function = Some(n);
+                break;
             }
+            if shadows(self.src, n, prev, name) {
+                return None;
+            }
+            prev = n;
             current = n.parent();
         }
         let function = function?;
@@ -394,12 +457,25 @@ impl<'s, 't> HintContext<'s, 't> {
             .lets
             .entry(function.id())
             .or_insert_with(|| collect_lets(self.src, function));
+        // A `let` is in scope once its statement has ended (so the `x` in
+        // `let x = x.f();` is still the earlier `x`), and only inside the
+        // block that holds it.
         let binding = lets
             .iter()
-            .filter(|(n, node)| n == name && node.start_byte() < before)
-            .max_by_key(|(_, node)| node.start_byte())
-            .map(|(_, node)| *node);
-        if let Some(binding) = binding {
+            .filter(|(n, node, _)| {
+                n == name
+                    && node.end_byte() <= before
+                    && node.parent().is_some_and(|block| {
+                        block.start_byte() <= before && before < block.end_byte()
+                    })
+            })
+            .max_by_key(|(_, node, _)| node.start_byte())
+            .map(|(_, node, simple)| (*node, *simple));
+        if let Some((binding, simple)) = binding {
+            if !simple {
+                // `let (a, b) = ...`: the part's type isn't traced.
+                return None;
+            }
             if let Some(ty) = binding.child_by_field_name("type") {
                 return resolve_type_text(self.src, binding, node_text(self.src, ty))
                     .map(TypeHint::Named);
@@ -431,9 +507,11 @@ impl<'s, 't> HintContext<'s, 't> {
     }
 }
 
-/// Every `let <name> ...` in `function`'s body, outside nested functions,
-/// with a plain identifier pattern.
-fn collect_lets<'t>(src: &str, function: Node<'t>) -> Vec<(String, Node<'t>)> {
+/// Every name a `let` in `function`'s body (outside nested functions)
+/// binds, with its `let_declaration` and whether the pattern is a plain
+/// identifier (`x`, `mut x`) — only those carry a traceable type; a
+/// destructuring `let (a, b) = ..` still shadows `a` and `b`.
+fn collect_lets<'t>(src: &str, function: Node<'t>) -> Vec<(String, Node<'t>, bool)> {
     let mut lets = Vec::new();
     let Some(body) = function.child_by_field_name("body") else {
         return lets;
@@ -441,11 +519,15 @@ fn collect_lets<'t>(src: &str, function: Node<'t>) -> Vec<(String, Node<'t>)> {
     let mut stack = vec![body];
     while let Some(node) = stack.pop() {
         if node.kind() == "let_declaration" {
-            if let Some(name) = node
-                .child_by_field_name("pattern")
-                .and_then(|p| pattern_name(src, p))
-            {
-                lets.push((name.to_string(), node));
+            if let Some(pattern) = node.child_by_field_name("pattern") {
+                match pattern_name(src, pattern) {
+                    Some(name) => lets.push((name.to_string(), node, true)),
+                    None => {
+                        let mut names = Vec::new();
+                        bound_names(src, pattern, &mut names);
+                        lets.extend(names.into_iter().map(|name| (name, node, false)));
+                    }
+                }
             }
         }
         let mut cursor = node.walk();
@@ -470,7 +552,7 @@ fn pattern_name<'s>(src: &'s str, pattern: Node) -> Option<&'s str> {
 /// Whether `node` (a closure's parameters, a `for` pattern) binds `name`
 /// anywhere inside it.
 fn binds(src: &str, node: Node, name: &str) -> bool {
-    if node.kind() == "identifier" && node_text(src, node) == name {
+    if is_binding_name(node) && node_text(src, node) == name {
         return true;
     }
     let mut cursor = node.walk();
@@ -478,6 +560,89 @@ fn binds(src: &str, node: Node, name: &str) -> bool {
         .named_children(&mut cursor)
         .any(|c| binds(src, c, name));
     found
+}
+
+/// Every name a pattern may bind (an over-approximation: a tuple-struct
+/// pattern's type name is included too, which only ever makes a lookup
+/// more conservative).
+fn bound_names(src: &str, node: Node, out: &mut Vec<String>) {
+    if is_binding_name(node) {
+        out.push(node_text(src, node).to_string());
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        bound_names(src, child, out);
+    }
+}
+
+fn is_binding_name(node: Node) -> bool {
+    matches!(node.kind(), "identifier" | "shorthand_field_identifier")
+}
+
+/// Whether ancestor `n` of an identifier — reached from its child `prev` —
+/// binds `name` in a pattern whose type isn't traced: a closure parameter,
+/// a `for` binding, an `if let`/`while let` pattern seen from the body it
+/// guards (or from a later `let` of the same chain), or a `match` arm's
+/// pattern seen from the arm's guard or body.
+fn shadows(src: &str, n: Node, prev: Node, name: &str) -> bool {
+    let is_field = |field: &str| {
+        n.child_by_field_name(field)
+            .is_some_and(|child| child.id() == prev.id())
+    };
+    let condition_binds = || {
+        n.child_by_field_name("condition")
+            .is_some_and(|condition| let_patterns_bind(src, condition, None, name))
+    };
+    match n.kind() {
+        "closure_expression" => n
+            .child_by_field_name("parameters")
+            .is_some_and(|params| binds(src, params, name)),
+        "for_expression" => n
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| binds(src, pattern, name)),
+        "if_expression" => is_field("consequence") && condition_binds(),
+        "while_expression" => is_field("body") && condition_binds(),
+        "let_chain" => let_patterns_bind(src, n, Some(prev), name),
+        "match_arm" => n.child_by_field_name("pattern").is_some_and(|pattern| {
+            // The guard (`Some(x) if x.ok()`) sits inside the pattern node
+            // but binds nothing itself.
+            let guard = pattern.child_by_field_name("condition").map(|g| g.id());
+            let mut cursor = pattern.walk();
+            let found = pattern
+                .named_children(&mut cursor)
+                .filter(|child| Some(child.id()) != guard)
+                .any(|child| binds(src, child, name));
+            found || (pattern.named_child_count() == 0 && binds(src, pattern, name))
+        }),
+        _ => false,
+    }
+}
+
+/// Whether a `let_condition`, or one of the `let_condition`s of a
+/// `let_chain` before `stop` (all of them when `stop` is `None`), binds
+/// `name`.
+fn let_patterns_bind(src: &str, node: Node, stop: Option<Node>, name: &str) -> bool {
+    let pattern_binds = |condition: Node| {
+        condition
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| binds(src, pattern, name))
+    };
+    match node.kind() {
+        "let_condition" => pattern_binds(node),
+        "let_chain" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if stop.is_some_and(|s| s.id() == child.id()) {
+                    break;
+                }
+                if child.kind() == "let_condition" && pattern_binds(child) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -498,7 +663,12 @@ mod tests {
             ("io::Result<File>", Some("File")),
             ("Box<dyn Backend>", Some("Backend")),
             ("dyn Repo + Send", Some("Repo")),
+            ("dyn Send + Repo", Some("Repo")),
+            ("Box<dyn Send + Sync + 'static + Repo>", Some("Repo")),
             ("impl Iterator<Item = u8>", Some("Iterator")),
+            ("impl Future<Output = Store>", None),
+            ("Pin<Box<dyn Future<Output = Store> + Send>>", None),
+            ("BoxFuture<'_, Store>", None),
             ("HashMap<K, V>", Some("HashMap")),
             ("SearchResult", Some("SearchResult")),
             ("Result<HashMap<K, V>, E>", Some("HashMap")),

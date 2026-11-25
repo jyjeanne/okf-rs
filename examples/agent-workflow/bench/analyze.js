@@ -64,6 +64,12 @@ for (const t of taskIds) {
       }
       if (m.type === "result") result = m;
     }
+    if (!result) {
+      // A run killed by run.sh's timeout (or crashed) never writes a result
+      // message: report it with zero usage rather than abort the analysis.
+      console.warn(`warning: ${id} has no result message (timed out or crashed)`);
+      result = {};
+    }
     const indexed = calls.map((c, i) => ({ c, i }));
     const reads = indexed.filter(({ c }) => c.name === "Read");
     const isBundle = ({ c }) => rel(c.input.file_path).startsWith("knowledge/");

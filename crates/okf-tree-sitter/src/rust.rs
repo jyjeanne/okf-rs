@@ -9,6 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use okf_parser::{Concept, ConceptKind, Language};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
@@ -154,7 +155,7 @@ fn is_test_code(src: &str, function_node: Node) -> bool {
 /// function calling itself as recursion: `self.inner.f()` inside `f` is
 /// usually delegation to a wrapped value of another type, however its type
 /// is named.
-fn call_form(src: &str, call_name: Node) -> CallForm {
+fn call_form(src: &str, call_name: Node, imports: &mut LocalImports) -> CallForm {
     let Some(parent) = call_name.parent() else {
         return CallForm::Plain;
     };
@@ -176,7 +177,7 @@ fn call_form(src: &str, call_name: Node) -> CallForm {
             }
         }
         _ => {
-            if imported_in_enclosing_function(src, call_name, node_text(src, call_name)) {
+            if imports.imported_in_enclosing_function(src, call_name, node_text(src, call_name)) {
                 CallForm::Path
             } else {
                 CallForm::Plain
@@ -185,39 +186,89 @@ fn call_form(src: &str, call_name: Node) -> CallForm {
     }
 }
 
-/// Whether a `use` declaration inside the function enclosing `node`
-/// mentions `name` (e.g. `use std::os::unix::fs::symlink;` inside a test
-/// named `symlink`), making a plain `name(..)` call refer to the import.
-fn imported_in_enclosing_function(src: &str, node: Node, name: &str) -> bool {
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if n.kind() == "function_item" {
-            let Some(body) = n.child_by_field_name("body") else {
-                return false;
-            };
-            let mut stack = vec![body];
-            while let Some(item) = stack.pop() {
-                if item.kind() == "use_declaration" {
-                    let text = node_text(src, item);
-                    let mentions = text
-                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                        .any(|word| word == name);
-                    if mentions {
-                        return true;
-                    }
-                }
-                let mut cursor = item.walk();
-                for child in item.named_children(&mut cursor) {
-                    if child.kind() != "function_item" {
-                        stack.push(child);
-                    }
-                }
+/// The names `use` declarations inside each function body bring into
+/// scope, collected once per function for [`call_form`] — rescanning the
+/// body for every plain call in it is quadratic on a large function.
+#[derive(Default)]
+struct LocalImports {
+    by_function: HashMap<usize, HashSet<String>>,
+}
+
+impl LocalImports {
+    /// Whether a `use` declaration inside the function enclosing `node`
+    /// imports `name` (e.g. `use std::os::unix::fs::symlink;` inside a test
+    /// named `symlink`), making a plain `name(..)` call refer to the import.
+    fn imported_in_enclosing_function(&mut self, src: &str, node: Node, name: &str) -> bool {
+        let mut current = node.parent();
+        while let Some(n) = current {
+            if n.kind() == "function_item" {
+                return self
+                    .by_function
+                    .entry(n.id())
+                    .or_insert_with(|| local_import_names(src, n))
+                    .contains(name);
             }
-            return false;
+            current = n.parent();
         }
-        current = n.parent();
+        false
     }
-    false
+}
+
+/// Every name the `use` declarations in `function`'s body (outside nested
+/// functions) import: a path's last segment (`use a::b::c;` → `c`), an
+/// alias (`use a::b as c;` → `c`), and each item of a use list. A glob
+/// (`use a::*;`) names nothing.
+fn local_import_names(src: &str, function: Node) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Some(body) = function.child_by_field_name("body") else {
+        return names;
+    };
+    let mut stack = vec![body];
+    while let Some(item) = stack.pop() {
+        if item.kind() == "use_declaration" {
+            if let Some(argument) = item.child_by_field_name("argument") {
+                use_tree_names(src, argument, &mut names);
+            }
+            continue;
+        }
+        let mut cursor = item.walk();
+        for child in item.named_children(&mut cursor) {
+            if child.kind() != "function_item" {
+                stack.push(child);
+            }
+        }
+    }
+    names
+}
+
+fn use_tree_names(src: &str, node: Node, names: &mut HashSet<String>) {
+    match node.kind() {
+        "identifier" => {
+            names.insert(node_text(src, node).to_string());
+        }
+        "scoped_identifier" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                names.insert(node_text(src, name).to_string());
+            }
+        }
+        "use_as_clause" => {
+            if let Some(alias) = node.child_by_field_name("alias") {
+                names.insert(node_text(src, alias).to_string());
+            }
+        }
+        "scoped_use_list" => {
+            if let Some(list) = node.child_by_field_name("list") {
+                use_tree_names(src, list, names);
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                use_tree_names(src, child, names);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// A macro invocation whose arguments can be read as an expression list:
@@ -250,14 +301,21 @@ fn collect_macro_args(node: Node, out: &mut Vec<MacroArgs>) {
     if node.kind() == "token_tree" {
         let mut cursor = node.walk();
         let children: Vec<Node> = node.children(&mut cursor).collect();
+        // The token tree of a `name!(..)` found here is the invocation's
+        // arguments: `push_macro_args` reads it (or skips a brace-delimited
+        // one), so the loop must not walk it a second time — each nesting
+        // level would otherwise double the work and the entries.
+        let mut consumed = None;
         for (i, child) in children.iter().enumerate() {
-            if matches!(child.kind(), "token_tree" | "macro_invocation") {
-                collect_macro_args(*child, out);
-            }
             if let [name, bang, tree] = &children[i..children.len().min(i + 3)] {
-                if name.kind() == "identifier" && bang.kind() == "!" {
+                if name.kind() == "identifier" && bang.kind() == "!" && tree.kind() == "token_tree"
+                {
                     push_macro_args(*name, *bang, *tree, out);
+                    consumed = Some(i + 2);
                 }
+            }
+            if consumed != Some(i) && matches!(child.kind(), "token_tree" | "macro_invocation") {
+                collect_macro_args(*child, out);
             }
         }
         return;
@@ -334,6 +392,7 @@ fn macro_calls(
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), rewritten.as_bytes());
     let mut hints = HintContext::new(&rewritten);
+    let mut imports = LocalImports::default();
     let mut calls = Vec::new();
     while let Some(m) = matches.next() {
         for cap in m.captures {
@@ -354,7 +413,7 @@ fn macro_calls(
                 node_text(&rewritten, node).to_string(),
                 lsp_position(&rewritten, node),
                 hints.receiver_hint(node),
-                call_form(&rewritten, node),
+                call_form(&rewritten, node, &mut imports),
             ));
         }
     }
@@ -395,6 +454,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         Vec::new();
     let mut types = TypeFacts::default();
     let mut hints = HintContext::new(source);
+    let mut imports = LocalImports::default();
 
     while let Some(m) = matches.next() {
         let mut import_node = None;
@@ -609,7 +669,7 @@ pub fn extract(source: &str, relative_path: &str) -> Result<FileExtraction> {
         }
 
         if let Some(node) = call_name {
-            let form = call_form(source, node);
+            let form = call_form(source, node, &mut imports);
             raw_calls.push((
                 node.byte_range(),
                 node_text(source, node).to_string(),
@@ -971,6 +1031,51 @@ fn assoc(item: Self::Item) { item.go(); }
     }
 
     #[test]
+    fn receiver_hints_respect_shadowing_and_scope() {
+        let src = r#"
+fn rebind(name: &Name) { let name = name.normalize(); name.len(); }
+fn if_let(x: Outer) { if let Some(x) = x.child() { x.go(); } else { x.other(); } }
+fn while_let(x: Outer) { while let Some(x) = x.next_one() { x.step(); } }
+fn chained(p: Outer) { if let Some(p) = p.parent() && let Some(q) = p.sibling() { q.visit(); } }
+fn arm(x: Outer) { match x.child() { Some(x) if x.ready() => x.run(), _ => {} } }
+fn destructured(store: &Store) { let (store, n) = make(); store.load(); }
+fn block_scoped(store: &Store) { { let store = Other::new(); } store.save(); }
+fn multi_bound<T: Send + Clone + Repo>(t: &T) { t.fetch(); }
+fn multi_where<T>(t: &T) where T: Sync + Repo { t.pull(); }
+impl Walker { fn assoc(it: &mut Self::Iter) { it.advance(); } }
+fn awaited(c: &Client) { c.load().await.finish(); }
+impl Client { fn load(&self) -> impl Future<Output = Store> { todo!() } }
+"#;
+        let x = extract(src, "src/lib.rs").unwrap();
+        // `name` in `name.normalize()` is still the parameter.
+        assert_eq!(hint_for(&x, "rebind", "normalize"), Some(named("Name")));
+        assert!(matches!(
+            hint_for(&x, "rebind", "len"),
+            Some(TypeHint::MethodReturn { .. })
+        ));
+        // The scrutinee is the outer binding; the body's `x` is the pattern's.
+        assert_eq!(hint_for(&x, "if_let", "child"), Some(named("Outer")));
+        assert_eq!(hint_for(&x, "if_let", "go"), None);
+        assert_eq!(hint_for(&x, "if_let", "other"), Some(named("Outer")));
+        assert_eq!(hint_for(&x, "while_let", "step"), None);
+        assert_eq!(hint_for(&x, "chained", "sibling"), None);
+        assert_eq!(hint_for(&x, "arm", "ready"), None);
+        assert_eq!(hint_for(&x, "arm", "run"), None);
+        assert_eq!(hint_for(&x, "destructured", "load"), None);
+        // A `let` inside an inner block that has ended doesn't apply.
+        assert_eq!(hint_for(&x, "block_scoped", "save"), Some(named("Store")));
+        // Marker traits are skipped when picking a generic's trait.
+        assert_eq!(hint_for(&x, "multi_bound", "fetch"), Some(named("Repo")));
+        assert_eq!(hint_for(&x, "multi_where", "pull"), Some(named("Repo")));
+        // `&mut Self::Iter` is an associated type, not a type named `Iter`.
+        assert_eq!(hint_for(&x, "assoc", "advance"), None);
+        // `impl Future<..>` has no traced type, so the awaited value has none
+        // either (no method-return fact is recorded for `load`).
+        let load = x.types.methods.iter().find(|m| m.name == "load").unwrap();
+        assert_eq!(load.returns, None);
+    }
+
+    #[test]
     fn records_fields_methods_trait_signatures_and_aliases_as_type_facts() {
         let src = r#"
 type Shared = Arc<Store>;
@@ -1150,5 +1255,32 @@ impl Store {
     fn brace_delimited_macros_are_not_read() {
         let src = "fn f() { my_dsl! { g() } }\n";
         assert!(calls_of(src).is_empty());
+    }
+
+    #[test]
+    fn nested_macro_arguments_are_collected_once_per_invocation() {
+        let src = "fn f() { assert!(a!(b!(c!(d!(e!(g())))))); }\n";
+        let tree = {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            parser.parse(src, None).unwrap()
+        };
+        let mut invocations = Vec::new();
+        collect_macro_args(tree.root_node(), &mut invocations);
+        // assert, a, b, c, d, e: one entry each, not 2^depth.
+        assert_eq!(invocations.len(), 6);
+        assert_eq!(calls_of(src), [("f".into(), "g".into(), CallForm::Plain)]);
+    }
+
+    #[test]
+    fn a_local_use_only_shadows_the_names_it_imports() {
+        let src = "fn parse(n: u8) { use crate::parse::Parser; if n > 0 { parse(n - 1) } }\n\
+                   fn symlink() { use std::os::unix::fs::{self, symlink as link}; link(); symlink(); }\n";
+        let calls = calls_of(src);
+        assert!(calls.contains(&("parse".into(), "parse".into(), CallForm::Plain)));
+        assert!(calls.contains(&("symlink".into(), "link".into(), CallForm::Path)));
+        assert!(calls.contains(&("symlink".into(), "symlink".into(), CallForm::Plain)));
     }
 }

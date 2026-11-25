@@ -12,6 +12,7 @@ use crate::{production_first, require_bundle, require_concept};
 use anyhow::{anyhow, Result};
 use okf_parser::Concept;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Schema name of [`search_ranked_json`]'s document.
@@ -94,22 +95,32 @@ struct SearchRankedDocument<'a> {
 /// empty list, not an error.
 pub fn search_ranked_json(bundle: &Path, query: &str) -> Result<String> {
     require_bundle(bundle)?;
-    let index = okf_search::FullTextIndex::build(bundle)?;
-    search_ranked_json_from_index(&index, query)
+    let concepts = crate::load_concepts(bundle)?;
+    let index = okf_search::FullTextIndex::build_from_concepts(&concepts)?;
+    search_ranked_json_from_index(&index, &concepts, query)
 }
 
-/// Same as [`search_ranked_json`], against an index already built — see
-/// [`crate::search_ranked_from_index`].
+/// Same as [`search_ranked_json`], against an index already built from
+/// `concepts` — see [`crate::search_ranked_from_index`]. `concepts` supplies
+/// each hit's `title`: the index stores the name split into words for
+/// matching (`GitBackend` as `Git Backend`), not the name itself.
 pub fn search_ranked_json_from_index(
     index: &okf_search::FullTextIndex,
+    concepts: &[Concept],
     query: &str,
 ) -> Result<String> {
+    let names: HashMap<&str, &str> = concepts
+        .iter()
+        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect();
     let hits = index
         .search(query, 25)?
         .into_iter()
         .map(|hit| RankedHit {
+            title: names
+                .get(hit.id.as_str())
+                .map_or(hit.title, |name| name.to_string()),
             id: hit.id,
-            title: hit.title,
             concept_type: hit.concept_type,
             score: hit.score,
         })

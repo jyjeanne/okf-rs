@@ -208,7 +208,23 @@ pub(crate) fn resolve_ambiguous_calls(
             })
         });
         // A definition inside the caller itself is recursion the language
-        // server has confirmed, so it is recorded like any other edge.
+        // server has confirmed, so it is recorded like any other edge —
+        // provided the call site really lies inside that concept. Overloads
+        // (and cfg twins) share the id extraction recorded as `caller_id`,
+        // so a second overload calling the first would otherwise read as
+        // the first calling itself.
+        let spurious_self_call = matched.is_some_and(|callee_id| **callee_id == call.caller_id)
+            && !id_to_location
+                .get(call.caller_id.as_str())
+                .is_some_and(|loc| {
+                    let line_1_based = call.call_site.line as usize + 1;
+                    loc.file == *relative_path
+                        && line_1_based >= loc.start_line
+                        && line_1_based <= loc.end_line
+                });
+        if spurious_self_call {
+            continue;
+        }
         if let Some(callee_id) = matched {
             let resolved_by = okf_lsp::server_command(*language)
                 .map(|(name, _)| name.to_string())
