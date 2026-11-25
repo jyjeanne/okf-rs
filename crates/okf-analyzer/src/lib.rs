@@ -414,9 +414,8 @@ fn build_symbol_table(concepts: &[Concept]) -> HashMap<&str, Vec<&str>> {
 /// ambiguous call whose receiver resolves to a type owning exactly one of
 /// the candidates is resolved here, with resolver
 /// [`receiver::RESOLVER`] (never sent to `--lsp`); a call whose receiver
-/// is a type the project doesn't define keeps only project-trait methods
-/// as candidates (see [`receiver::TypeIndex::reachable_from_external`]),
-/// so a name shared with an inherent method gets no edge.
+/// is a type the project doesn't define gets no edge at all, whether its
+/// name is unique or not.
 fn split_ambiguous_calls(
     calls: &[(CallCandidate, Language, String)],
     symbol_table: &HashMap<&str, Vec<&str>>,
@@ -430,20 +429,26 @@ fn split_ambiguous_calls(
             continue;
         };
         // `x.f()` can't call a free function, nor `f()` a method.
-        let receiver_type = call.receiver.as_ref().and_then(|hint| types.resolve(hint));
-        let external_receiver = receiver_type
-            .as_deref()
-            .is_some_and(|ty| types.is_external(ty));
         let candidates: Vec<&str> = named
             .iter()
             .copied()
             .filter(|id| types.form_allows(call.form, id))
-            // A method of a standard-library or third-party type is no
-            // project concept, however the name matches; only a project
-            // trait's method (an extension trait) is reachable from it.
-            .filter(|id| !external_receiver || types.reachable_from_external(id))
             .collect();
         if candidates.is_empty() {
+            continue;
+        }
+        let receiver_type = call.receiver.as_ref().and_then(|hint| types.resolve(hint));
+        if receiver_type
+            .as_deref()
+            .is_some_and(|ty| types.is_external(ty))
+        {
+            // A method of a standard-library or third-party type: no
+            // project concept is the callee, however the name matches.
+            // (A project extension trait implemented for that type only by
+            // a blanket or empty impl is missed: telling whether an impl
+            // applies to the receiver needs impl facts the extractor
+            // doesn't record. Keeping every project-trait method instead
+            // drew `vec.is_empty()` to an unrelated project impl.)
             continue;
         }
         if candidates.len() != 1 {
